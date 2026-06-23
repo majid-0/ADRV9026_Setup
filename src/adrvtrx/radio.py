@@ -343,10 +343,20 @@ class Radio:
     # -- capture / transmit (PerformRx / PerformTx) ----------------------------
 
     def _rx_trig(self, trig: RxTrigSource):
-        return _fpga_enum(self.bridge, "adi_fpga9010_RxTollgateTrigSources_e", trig)
+        return _fpga_enum(
+            self.bridge,
+            "adi_fpga9010_RxTollgateTrigSources_e",
+            _enums.RX_TRIG_MEMBER[trig],
+            int(trig),
+        )
 
     def _tx_trig(self, trig: TxTrigSource):
-        return _fpga_enum(self.bridge, "adi_fpga9010_TxTollgateTrigSources_e", trig)
+        return _fpga_enum(
+            self.bridge,
+            "adi_fpga9010_TxTollgateTrigSources_e",
+            _enums.TX_TRIG_MEMBER[trig],
+            int(trig),
+        )
 
     def perform_rx(
         self,
@@ -393,12 +403,12 @@ def _rx_channel_member(channel: RxChannel) -> str:
     return f"ADI_ADRV9010_{channel.name}"
 
 
-def _fpga_enum(bridge, type_name: str, member):
-    """Resolve an ``adi_fpga9010_*`` enum from ``ns.FpgaTypes``; fall back to int."""
+def _fpga_enum(bridge, type_name: str, member_name: str, int_val: int):
+    """Resolve ``FpgaTypes.<type_name>.<member_name>``; fall back to the int value."""
     fpga = getattr(bridge.ns, "FpgaTypes", None)
     if fpga is None:
-        return int(member)
+        return int_val
     enum_type = getattr(fpga, type_name, None)
     if enum_type is None:
-        return int(member)
-    return getattr(enum_type, member.name)
+        return int_val
+    return getattr(enum_type, member_name)

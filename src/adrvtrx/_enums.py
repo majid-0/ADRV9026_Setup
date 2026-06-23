@@ -92,6 +92,25 @@ TX_SOF_FOR: dict[TxChannel, RxTrigSource] = {
     TxChannel.TX4: RxTrigSource.TX4_SOF,
 }
 
+#: Our trigger enums -> the DLL enum member names (Rx uses ADI_FPGA9010_*,
+#: Tx uses ADI_FPGA9010_TX_*).
+RX_TRIG_MEMBER: dict[RxTrigSource, str] = {
+    RxTrigSource.IMMEDIATE: "ADI_FPGA9010_IMM_TRIG",
+    RxTrigSource.EXTERNAL: "ADI_FPGA9010_EXT_TRIG",
+    RxTrigSource.TDD_SM: "ADI_FPGA9010_TDD_SM",
+    RxTrigSource.ARM_ACK: "ADI_FPGA9010_ARM_ACK",
+    RxTrigSource.TX1_SOF: "ADI_FPGA9010_TX1_SOF",
+    RxTrigSource.TX2_SOF: "ADI_FPGA9010_TX2_SOF",
+    RxTrigSource.TX3_SOF: "ADI_FPGA9010_TX3_SOF",
+    RxTrigSource.TX4_SOF: "ADI_FPGA9010_TX4_SOF",
+}
+TX_TRIG_MEMBER: dict[TxTrigSource, str] = {
+    TxTrigSource.IMMEDIATE: "ADI_FPGA9010_TX_IMM_TRIG",
+    TxTrigSource.EXTERNAL: "ADI_FPGA9010_TX_EXT_TRIG",
+    TxTrigSource.TDD_SM: "ADI_FPGA9010_TX_TDD_SM",
+    TxTrigSource.ARM_ACK: "ADI_FPGA9010_TX_ARM_ACK",
+}
+
 # --- PLL names: adi_adrv9010_PllName_e -> enum member name on the DLL ----------
 
 PLL_NAME = {
