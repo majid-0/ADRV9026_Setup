@@ -22,7 +22,7 @@ def test_read_profile_missing_field(tmp_path):
 
 
 def test_read_real_profile_if_present():
-    """If the TES install is present, the real StdUseCase102 profile must parse."""
+    """If the TES install is present, the configured profile must parse."""
     from adrvtrx.config import load_config
 
     cfg = load_config()

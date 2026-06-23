@@ -14,7 +14,8 @@ port = 55556
 
 [profile]
 # Relative to <install_dir>\Resources\Adi.ADRV9025.Profiles\public\, or an absolute path.
-name = "ADRV9025Init_StdUseCase102_LinkSharing.profile"
+# UseCase98_LinkSharing: Tx 491.52 MSPS, jesd204Np = 12 (full scale 2047).
+name = "ADRV9025Init_StdUseCase98_LinkSharing.profile"
 
 [clocks]
 device_clock_khz = 245760

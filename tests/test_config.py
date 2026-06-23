@@ -22,7 +22,7 @@ def test_load_bundled_default():
 def test_profile_path_resolves_under_install_dir():
     cfg = load_config()
     p = cfg.profile_path
-    assert p.name == "ADRV9025Init_StdUseCase102_LinkSharing.profile"
+    assert p.name == "ADRV9025Init_StdUseCase98_LinkSharing.profile"
     assert "Adi.ADRV9025.Profiles" in str(p)
 
 
