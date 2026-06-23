@@ -78,6 +78,10 @@ def main() -> None:
         for k, v in verify_status(radio).items():
             print(f"  {k}: {v}")
 
+        # Enable the main-Rx datapath; link-sharing carries ORx on the same framer.
+        # Without this, PerformRx returns zero-filled buffers for every channel.
+        radio.enable_rx(0x0F)
+
         # [1] Idle baseline -- power of every returned channel, no TX.
         print("\n[1] Idle channel powers (rx_init_mask = " f"0x{cfg.channels.rx_init_mask:X})")
         raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)

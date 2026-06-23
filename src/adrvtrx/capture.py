@@ -122,7 +122,7 @@ def capture(
     """
     rx_init = radio.config.channels.rx_init_mask
     order = returned_channel_order(rx_init)
-    radio.enable_rx(rx_init & 0xFF)  # wake the Rx/ORx datapath
+    radio.enable_rx(rx_init & 0x0F)  # enable main-Rx framer; ORx rides it (link-sharing)
     raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
 
     # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
