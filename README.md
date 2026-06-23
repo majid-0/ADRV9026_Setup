@@ -5,11 +5,6 @@ the Analog Devices TES DLL (`adrvtrx_dll.dll`, namespace `adrv9010_dll`). Target
 repeatable **multi-band TX + synchronized ORx capture**, crash-safe, fully
 parameterized from config.
 
-> ⚠️ **OneDrive note.** This repo lives under a OneDrive-synced folder. OneDrive can
-> corrupt `.git` during sync. Mitigate: OneDrive → Settings → *Sync and back up* →
-> *Manage backup* / *Choose folders*, and **exclude the `.git` folder** (or pause
-> sync during heavy git operations). Push to a remote for real backup.
-
 ## What it does
 
 - **Programs** the device from `config/default.toml`, reproducing the working
