@@ -16,7 +16,20 @@ import numpy as np
 from ._enums import RxChannel
 from .waveform import full_scale
 
-__all__ = ["ClipReport", "clip_report", "peak_window", "level_orx", "LevelResult"]
+__all__ = [
+    "ClipReport",
+    "clip_report",
+    "peak_window",
+    "level_orx",
+    "autolevel_orx",
+    "LevelResult",
+]
+
+# ORx gain table is only monotonic over a valid index window; below it the index
+# clamps to max gain (confirmed on the bench: ~190..255 usable, ~0.45 dB/index).
+ORX_GAIN_MIN = 190
+ORX_GAIN_MAX = 255
+ORX_DB_PER_INDEX = 0.45
 
 
 @dataclass
@@ -94,6 +107,7 @@ class LevelResult:
     final_gain_index: int
     final_dbfs: float
     iterations: int
+    reason: str = ""
 
 
 def level_orx(
@@ -127,3 +141,59 @@ def level_orx(
         radio.set_rx_gain(channel, gain)
         measured = radio.rx_dec_power_dbfs(channel)
     return LevelResult(abs(target_dbfs - measured) <= tolerance_db, gain, measured, max_iterations)
+
+
+def autolevel_orx(
+    set_gain,
+    measure_dbfs,
+    *,
+    target_dbfs: float = -14.0,
+    tolerance_db: float = 2.0,
+    gain_start: int = 220,
+    gain_min: int = ORX_GAIN_MIN,
+    gain_max: int = ORX_GAIN_MAX,
+    max_iterations: int = 12,
+    db_per_index: float = ORX_DB_PER_INDEX,
+) -> LevelResult:
+    """Closed-loop ORx leveling on a TRUSTED, caller-supplied level metric.
+
+    Unlike :func:`level_orx` (which reads ``RxDecPowerGet`` -- range-compressed and
+    not reliable for leveling), this drives off whatever ``measure_dbfs()`` returns;
+    pass the captured-IQ peak (``clip_report(...).peak_dbfs``). The caller owns the
+    capture, so this stays hardware-free and unit-testable.
+
+    * ``set_gain(index)`` applies an ORx gain-table index.
+    * ``measure_dbfs()`` returns the resulting level in dBFS.
+
+    The ORx gain table is only monotonic over ``[gain_min, gain_max]``; we clamp to
+    it. If we pin at a rail and still miss the target we stop and return
+    ``converged=False`` with a ``reason`` (e.g. "pinned at max gain -> needs more TX
+    power") rather than spinning. On non-convergence the best-seen index is restored.
+    """
+    gain = int(np.clip(gain_start, gain_min, gain_max))
+    set_gain(gain)
+    measured = measure_dbfs()
+    best_err, best_gain, best_dbfs = abs(target_dbfs - measured), gain, measured
+    for it in range(1, max_iterations + 1):
+        error = target_dbfs - measured
+        if abs(error) <= tolerance_db:
+            return LevelResult(True, gain, measured, it, "converged in window")
+        step = int(np.sign(error) * max(1, round(abs(error) / db_per_index)))
+        new_gain = int(np.clip(gain + step, gain_min, gain_max))
+        if new_gain == gain:  # at a rail and still out of window
+            rail = "max" if gain >= gain_max else "min"
+            hint = (
+                "signal too weak -> raise TX power (lower atten)"
+                if rail == "max"
+                else "signal too strong -> lower TX power / add a pad"
+            )
+            return LevelResult(False, gain, measured, it, f"pinned at {rail} gain {gain}: {hint}")
+        gain = new_gain
+        set_gain(gain)
+        measured = measure_dbfs()
+        if abs(target_dbfs - measured) < best_err:
+            best_err, best_gain, best_dbfs = abs(target_dbfs - measured), gain, measured
+    set_gain(best_gain)  # restore best-seen before giving up
+    return LevelResult(
+        best_err <= tolerance_db, best_gain, best_dbfs, max_iterations, "max iterations reached"
+    )

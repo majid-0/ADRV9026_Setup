@@ -9,7 +9,7 @@ from __future__ import annotations
 from ._enums import RxChannel, RxTrigSource, TxChannel, TxTrigSource
 from .bands import Band, make_bands, run_bands
 from .config import Config, load_config
-from .gain import ClipReport, clip_report, level_orx, peak_window
+from .gain import ClipReport, autolevel_orx, clip_report, level_orx, peak_window
 from .profile import ProfileInfo, read_profile
 from .sweep import SweepAxis, run_sweep, sweep_points
 from .waveform import load_tab_iq, normalize, prepare_tx, quantize, save_tab_iq_float
@@ -34,6 +34,7 @@ __all__ = [
     "ClipReport",
     "peak_window",
     "level_orx",
+    "autolevel_orx",
     "Band",
     "make_bands",
     "run_bands",

@@ -156,9 +156,21 @@ They override anything the docs imply.
    dBFS reference and quantization read this from the loaded profile — never hardcode.
    `pll_lock_status == 15` (0xF) means all 4 PLLs locked.
 
-7. **`RxDecPowerGet` reads ~0 / `-0.00 dBFS` unless a measurement is armed / the channel
-   is active.** Don't rely on it yet for ORx leveling — use the **captured-IQ peak**
-   (`gain.clip_report`) instead until its arming sequence is confirmed.
+7. **`RxDecPowerGet` is range-compressed — do NOT level on it.** Characterized on the
+   bench (sweep ORx gain, compare to the captured peak): DEC power tracks *direction* but
+   compresses badly (≈16 dB readback span vs the true ≈29 dB) and reads ~13 dB high near
+   the floor, so a DEC-power / hardware-AGC loop mis-levels silently. **Level on the
+   captured-IQ peak** (`gain.clip_report(...).peak_dbfs`) via `gain.autolevel_orx`.
+
+9. **ORx gain control (software "AGC").** The ORx gain table is only monotonic over index
+   **≈190..255** (~29 dB, ~0.45 dB/index); below ~185 it clamps to max gain (garbage). The
+   reachable level is also capped by TX power — at 10 dB Tx atten even max ORx gain reaches
+   only ~−17 dBFS with the LTE-ish vectors. `gain.autolevel_orx` clamps to
+   `[ORX_GAIN_MIN, ORX_GAIN_MAX]`, levels on the captured peak, and **fails loud**
+   (`converged=False` + reason) when the target is out of reach instead of spinning. The
+   `notebooks/*_sweep.ipynb` notebooks auto-level per sweep point on top of it — verified on
+   hardware (target −20 dBFS held while gain backs off as Tx power rises; too-weak points
+   correctly flagged "pinned at max gain").
 
 8. **Program sequence** (faithful to the user's working IronPython init), all in
    `radio.program()`: `ConfigFileLoad(profile)` → `InitStructGet()` + edit clocks/masks/LO
