@@ -16,7 +16,7 @@ import numpy as np
 
 from adrvtrx import RxChannel, TxChannel
 from adrvtrx._enums import is_orx
-from adrvtrx.capture import returned_channel_order
+from adrvtrx.capture import orx_slot_for, orx_slot_positions, returned_channel_order
 from adrvtrx.config import load_config
 from adrvtrx.experiment import session, verify_status
 from adrvtrx.transmit import transmit_bands
@@ -60,47 +60,41 @@ def channel_powers(raw, n_bits: int):
 ORX_FLOOR_MARGIN_DB = 10.0  # a slot must beat the idle floor by this to count as carrying the input
 
 
-def orx_readback_slots(rows, order):
-    """Readback indices of the physical ORx ADC slots that actually carry data."""
-    return [
-        idx
-        for idx, n, _d in rows
-        if idx < len(order) and order[idx] and is_orx(order[idx]) and n > 0
-    ]
-
-
 def resolve_selected_orx(rows, order, selected, floor_dbfs):
     """Label the physical ORx slots in terms of the ORx INPUT that was selected.
 
-    You enable ORx1/2/3/4; its data lands on one of the 2 ORx ADC slots. The slot
-    that rises above the idle floor is the one carrying ``selected`` -- so we name
-    it after the input you picked (e.g. ``ORX2``). Returns ``(labels, note)`` and
-    refuses to guess when zero slots (input not landing) or several slots (a spur
-    lighting everything) are hot.
+    The input->ADC-slot mapping is now confirmed (ORx1/2->ADC0, ORx3/4->ADC1), so
+    we report the KNOWN slot for ``selected`` rather than guessing by which slots
+    are hot. We flag NOT LANDING if that slot didn't beat the idle floor, and note
+    energy on the other ADC slot as crosstalk (not ambiguity). Returns ``(labels, note)``.
     """
     by_idx = {idx: d for idx, _n, d in rows}
-    slots = orx_readback_slots(rows, order)
+    slots = orx_slot_positions(order)
     labels = dict.fromkeys(slots, "ORx(off)")
-    hot = [
-        idx
-        for idx in slots
-        if np.isfinite(by_idx[idx]) and by_idx[idx] > floor_dbfs + ORX_FLOOR_MARGIN_DB
-    ]
-    if len(hot) == 1:
-        labels[hot[0]] = selected.name
-        return labels, f"{selected.name} -> readback idx {hot[0]} at {by_idx[hot[0]]:+.1f} dBFS"
-    if not hot:
-        return labels, (
-            f"{selected.name}: NOT LANDING -- no ORx slot beat the idle floor by "
-            f"{ORX_FLOOR_MARGIN_DB:.0f} dB (check cable / TX level)"
+    target = orx_slot_for(selected, order)
+    if target is None:
+        return labels, f"{selected.name}: no ORx ADC slot present in this readback"
+    labels[target] = selected.name
+    d = by_idx.get(target, float("-inf"))
+    level = f"{d:+.1f}" if np.isfinite(d) else "-inf"
+    if np.isfinite(d) and d > floor_dbfs + ORX_FLOOR_MARGIN_DB:
+        note = f"{selected.name} -> readback idx {target} at {level} dBFS"
+    else:
+        note = (
+            f"{selected.name} -> readback idx {target}: NOT LANDING "
+            f"({level} dBFS, <= floor+{ORX_FLOOR_MARGIN_DB:.0f}) -- check cable / TX level"
         )
-    for idx in hot:
-        labels[idx] = f"{selected.name}?"
-    idxs = ", ".join(str(i) for i in hot)
-    return labels, (
-        f"{selected.name}: AMBIGUOUS -- idx {idxs} all hot at ~{by_idx[hot[0]]:+.1f} dBFS "
-        f"(looks like a spur, not a clean tone)"
-    )
+    crosstalk = [
+        i
+        for i in slots
+        if i != target
+        and np.isfinite(by_idx.get(i, float("-inf")))
+        and by_idx[i] > floor_dbfs + ORX_FLOOR_MARGIN_DB
+    ]
+    if crosstalk:
+        note += " | also hot: " + ", ".join(f"idx{i} {by_idx[i]:+.1f}" for i in crosstalk)
+        note += " (crosstalk on the other ADC)"
+    return labels, note
 
 
 def print_table(rows, order, header, orx_label=None):
@@ -141,10 +135,11 @@ def main() -> None:
         print("\n[1] Idle channel powers (rx_init_mask = " f"0x{cfg.channels.rx_init_mask:X})")
         raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
         idle_rows = channel_powers(raw, info.rx_bits)
-        idle_slots = orx_readback_slots(idle_rows, order)
-        print_table(idle_rows, order, "baseline, no TX:", dict.fromkeys(idle_slots, "ORx(idle)"))
+        populated_orx = [i for i in orx_slot_positions(order) if idle_rows[i][1] > 0]
+        print_table(idle_rows, order, "baseline, no TX:", dict.fromkeys(populated_orx, "ORx(idle)"))
         idle_floor = max(
-            (d for i, _n, d in idle_rows if i in idle_slots and np.isfinite(d)), default=-100.0
+            (idle_rows[i][2] for i in populated_orx if np.isfinite(idle_rows[i][2])),
+            default=-100.0,
         )
 
         # [2] Per-input probe: select an ORx INPUT (ORx1/2/3/4), transmit its TX,

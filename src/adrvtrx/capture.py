@@ -104,6 +104,17 @@ def orx_slot_positions(order) -> list[int]:
     return [i for i, ch in enumerate(order) if ch is not None and is_orx(ch)]
 
 
+def orx_slot_for(channel: RxChannel, order) -> int | None:
+    """Readback position of the ORx ADC slot a given ORx input lands on.
+
+    ORx1/ORx2 -> ADC0 (first ORx slot), ORx3/ORx4 -> ADC1 (second). Returns
+    ``None`` if that ADC slot isn't present in this readback's order.
+    """
+    slots = orx_slot_positions(order)
+    adc = _ORX_ADC_INDEX[channel]
+    return slots[adc] if adc < len(slots) else None
+
+
 def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
     """Extract ``wanted`` channels from a PerformRx result by absolute position.
 
@@ -115,17 +126,15 @@ def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
     against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
     """
     out: dict[RxChannel, ChannelCapture] = {}
-    orx_slots = orx_slot_positions(order)
     for ch in wanted:
         if is_orx(ch):
-            adc = _ORX_ADC_INDEX[ch]
-            if adc >= len(orx_slots):
+            idx = orx_slot_for(ch, order)
+            if idx is None:
                 raise ValueError(
-                    f"{ch.name} maps to ORx ADC{adc}, but the readback exposes "
-                    f"{len(orx_slots)} ORx slot(s) for this rxInitChannelMask. "
-                    f"Enable ORx in config [channels].rx_init_mask."
+                    f"{ch.name} maps to ORx ADC{_ORX_ADC_INDEX[ch]}, but the readback "
+                    f"exposes {len(orx_slot_positions(order))} ORx slot(s) for this "
+                    f"rxInitChannelMask. Enable ORx in config [channels].rx_init_mask."
                 )
-            idx = orx_slots[adc]
         elif ch in order:
             idx = order.index(ch)
         else:

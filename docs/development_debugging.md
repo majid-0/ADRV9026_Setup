@@ -249,11 +249,14 @@ an ORx request to its ADC slot (`_ORX_ADC_INDEX`) instead of the old bit-order p
 and `capture()` enables the requested ORx **input bit** (an ORx reads zeros until enabled).
 All 8 `-m hardware` tests pass, incl. `TX2→ORx2` and `TX3→ORx3`.
 
-**Open — TX3 cleanliness.** With TX3 transmitting, every readback slot reads a uniform
-~−46.7 dBFS (`hw_smoke` flags this AMBIGUOUS), unlike TX2's clean single-slot tone. Looks
-like a TX3/LO spur, not the loopback tone landing on one ADC. The `TX3→ORx3` loopback test
-passes (slot 1 is above the floor) but the signal isn't clean — chase the spur (LO2 now at
-1.0 GHz, see [lo] in config) before trusting TX3 ORx data.
+**Resolved — TX3 was never a spur.** The "uniform −46.7 on every slot" looked like a spur
+but an FFT of the ORx capture (now reads the right slot) shows TX3→ORx3 is a **clean tone**:
+energy tracks the tone when retuned 5→10 MHz, with the same spectral concentration as TX2
+(peak/rms ≈ 146×); TX3 just has ~5 dB more DC/LO leakage (−24 vs −29 dB rel peak, harmless).
+The AMBIGUOUS flag was a `hw_smoke` heuristic artifact — it judged by "how many ORx slots
+show RMS energy," and ADC0 (idx 4) also lights from on-chip crosstalk when TX3 runs. Fixed:
+the probe now reports the **known** slot for the selected input (via `capture.orx_slot_for`)
+and labels the other ADC's energy as crosstalk, not ambiguity.
 
 Still bench-only: `RxDecPowerGet` arming, effective DAC full-scale vs Np, crash-recovery.
 
