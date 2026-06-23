@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ._enums import RX_SINGLE, RxChannel, RxTrigSource, is_orx
+from ._enums import RX_SINGLE, TX_SOF_FOR, RxChannel, RxTrigSource, TxChannel, is_orx
 from .gain import ClipReport, clip_report, peak_window
 from .waveform import samples_for_duration, save_tab_iq_float
 
@@ -115,6 +115,27 @@ def orx_slot_for(channel: RxChannel, order) -> int | None:
     return slots[adc] if adc < len(slots) else None
 
 
+def tx_for_orx(orx: RxChannel, tx_to_orx) -> TxChannel | None:
+    """The TX channel an ORx input observes, per the tx_to_orx map (e.g. ``"TX2_ORX2"``)."""
+    for entry in tx_to_orx:
+        tx_part, _, orx_part = entry.partition("_")
+        if orx_part == orx.name:
+            return TxChannel[tx_part]
+    return None
+
+
+def auto_sof_trigger(channel_mask, tx_to_orx, default=RxTrigSource.IMMEDIATE) -> RxTrigSource:
+    """SOF trigger of the lowest TX tied to any requested ORx; ``default`` if none.
+
+    Lets a capture align to its source TX's start-of-frame automatically (capture
+    ORx2 -> TX2_SOF). Falls back to ``default`` (IMMEDIATE) for non-ORx captures or
+    when no ORx in the mask maps to a TX.
+    """
+    txs = [tx_for_orx(ch, tx_to_orx) for ch in channel_list(channel_mask) if is_orx(ch)]
+    txs = sorted((t for t in txs if t is not None), key=int)
+    return TX_SOF_FOR[txs[0]] if txs else default
+
+
 def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
     """Extract ``wanted`` channels from a PerformRx result by absolute position.
 
@@ -154,7 +175,7 @@ def capture(
     channel_mask: int,
     capture_time_ms: float,
     *,
-    trig: RxTrigSource = RxTrigSource.IMMEDIATE,
+    trig: RxTrigSource | str = RxTrigSource.IMMEDIATE,
     timeout_ms: int = 1000,
     bits: int,
 ) -> CaptureResult:
@@ -163,10 +184,19 @@ def capture(
     ``PerformRx`` returns the full ``rxInitChannelMask`` set regardless of mask, so
     we capture all of it and pick out ``channel_mask``'s channels by position.
     ``bits`` is the Rx datapath width (``ProfileInfo.rx_bits``).
+
+    ``trig`` defaults to IMMEDIATE. ``trig="auto"`` would align to the start-of-frame
+    of the TX tied to the requested ORx (capture ORx2 -> TX2_SOF) via the tx_to_orx
+    map -- but on this bench TXn_SOF currently TIMES OUT (RxCaptureWait timeout): the
+    continuous PerformTx path emits no TX start-of-frame for the FPGA to gate on.
+    Keep IMMEDIATE (TX runs continuously, so the signal is always present) until SOF
+    generation is sorted out.
     """
     rx_init = radio.config.channels.rx_init_mask
     order = returned_channel_order(rx_init)
     wanted = channel_list(channel_mask)
+    if trig == "auto":
+        trig = auto_sof_trigger(channel_mask, radio.config.tx_to_orx)
     # Enable the main-Rx framer (ORx rides it in link-sharing) plus any requested
     # ORx INPUT bits -- an ORx front-end reads zeros until its enable bit is set.
     # Absolute set (preserving TX) so a prior capture's ORx enable can't leak in.
