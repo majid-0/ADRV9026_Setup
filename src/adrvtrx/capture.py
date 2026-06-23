@@ -222,6 +222,47 @@ def capture(
     return result
 
 
+def measure_delay(
+    radio,
+    channel: RxChannel,
+    reference,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    trig: RxTrigSource | str = RxTrigSource.IMMEDIATE,
+    timeout_ms: int = 2000,
+):
+    """Measure the TX->ORx delay of ``channel`` against a transmitted ``reference``.
+
+    Captures ``oversample`` x ``len(reference)`` samples (so the reference can be
+    located inside the window regardless of where the IMMEDIATE capture started),
+    then returns ``(delay_samples, delay_ns, corr)`` using :mod:`adrvtrx.align`.
+
+    ``corr`` is the normalized complex correlation at the aligned position: ~1.0
+    means the capture is a faithful copy of the reference; ``corr`` well below ~0.9
+    means it is NOT (wrong channel, TX not transmitting, or bad level). This only
+    captures -- the reference's TX must already be running. ``fs`` is the ORx rate
+    (``ProfileInfo.orx_rate_hz``).
+    """
+    from .align import estimate_and_align, estimate_delay
+
+    ref = np.asarray(reference)
+    capture_time_ms = oversample * len(ref) / float(fs) * 1e3
+    res = capture(radio, int(channel), capture_time_ms, trig=trig, timeout_ms=timeout_ms, bits=bits)
+    cap = res.channels[channel]
+    y = cap.i.astype(np.float64) + 1j * cap.q.astype(np.float64)
+
+    delay = estimate_delay(ref, y, fs)
+    xa, ya, _ = estimate_and_align(ref, y, fs)
+    m = min(len(xa), len(ya))
+    a = np.asarray(xa[:m], dtype=np.complex128)
+    b = np.asarray(ya[:m], dtype=np.complex128)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+    corr = float(np.abs(np.vdot(a, b)) / denom)
+    return delay, delay / float(fs) * 1e9, corr
+
+
 def _result_len(raw) -> int | None:
     """Length of a PerformRx result if knowable, else None (skip the check)."""
     try:

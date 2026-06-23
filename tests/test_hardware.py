@@ -134,6 +134,37 @@ def test_safe_state_clears_tx_enable(hw):
     assert radio._en_tx == 0  # TX playback stopped
 
 
+def test_measure_delay_matches_reference(hw):
+    from adrvtrx.capture import capture, measure_delay
+    from adrvtrx.gain import autolevel_orx, clip_report
+
+    radio, info = hw
+    # Band-limited reference (central ~1/4 of the band) so it fits the analog path.
+    n = 8192
+    rng = np.random.default_rng(0)
+    spec = np.zeros(n, dtype=complex)
+    bw = n // 8
+    idx = np.r_[0:bw, n - bw : n]
+    spec[idx] = rng.standard_normal(len(idx)) + 1j * rng.standard_normal(len(idx))
+    ref = np.fft.ifft(spec)
+    ref = ref / np.max(np.abs(ref))
+    transmit_bands(radio, {TxChannel.TX2: ref}, info.tx_bits, continuous=True)
+    try:
+        # Level the ORx so the capture has SNR (default programmed gain can be near floor).
+        def _pk():
+            cap = capture(radio, int(RxChannel.ORX2), 0.05, bits=info.rx_bits).channels[RxChannel.ORX2]
+            return clip_report(cap.i, cap.q, info.rx_bits).peak_dbfs
+
+        autolevel_orx(lambda g: radio.set_rx_gain(RxChannel.ORX2, g), _pk, target_dbfs=-15.0)
+        d, ns, corr = measure_delay(
+            radio, RxChannel.ORX2, ref, bits=info.rx_bits, fs=info.orx_rate_hz, oversample=2
+        )
+    finally:
+        radio.disable_tx()
+    # The loopback is coherent, so the captured ORx must match the sent reference.
+    assert corr > 0.9, f"ORx capture does not match the reference (corr {corr:.3f}, delay {d:.2f})"
+
+
 def test_status_reads_back_from_hardware(hw):
     from adrvtrx.radio import MAX_TX_ATTEN_DB
 

@@ -270,6 +270,26 @@ show RMS energy," and ADC0 (idx 4) also lights from on-chip crosstalk when TX3 r
 the probe now reports the **known** slot for the selected input (via `capture.orx_slot_for`)
 and labels the other ADC's energy as crosstalk, not ambiguity.
 
+**Triggering — SOF is NOT feasible; alignment is done in software.** Double-checked on the
+bench *and* against the CHM/sample by a focused agent. `PerformRx(trig=TXn_SOF)` always
+times out (`RxCaptureWait timeout`) because **the TX datapath has no way to emit a
+start-of-frame**: `TxTollgateTrigSources` are only IMM / EXT / TDD_SM / ARM_ACK — none
+generates the SOF pulse the Rx tollgate waits on. (The low-level `Fpga.Rx`/`Fpga.Tx` chain
+exists — `RxCaptureStart`/`RxCaptureWait` are separate — but this DLL build's `Fpga.Rx`
+exposes no sample read, and TX still can't assert SOF.) Default trigger stays **IMMEDIATE**.
+- The loopback is **coherent** (complex corr 0.997, 0 Hz CFO, no IQ inversion), so the
+  IMMEDIATE capture is a faithful copy; the only nondeterminism is the capture's start
+  phase in the looping TX.
+- **Supported alignment = software** (`adrvtrx.align`, opt-in, not enforced): capture a
+  window ≥ ~2× the reference, then `estimate_delay` / `estimate_and_align` locate the
+  reference inside it (valid-slide; the trim-to-min in the original `sampling.py` decorrelated
+  and is fixed here). `capture.measure_delay(radio, ch, ref, fs=..)` returns
+  `(delay_samples, delay_ns, corr)`; low `corr` ⇒ wrong channel / TX off / **ORx not leveled**
+  (needs SNR). `scripts/sampling.py` re-exports these.
+- If hardware-aligned TX/ORx is ever needed (DPD): `ExtDpdCaptureDataGet` with
+  `ADI_ADRV9010_EXT_DPD_CAPTURE_TDD_TXON_SYNC`, or an external trigger pin — both separate
+  paths from `PerformRx`.
+
 Still bench-only: `RxDecPowerGet` arming, effective DAC full-scale vs Np, crash-recovery.
 
 ---
