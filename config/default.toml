@@ -21,12 +21,16 @@ name = "ADRV9025Init_StdUseCase98_LinkSharing.profile"
 device_clock_khz = 245760
 # AD9528 ClockConfig(deviceClock_kHz, vcxoFreq_kHz, refAFreq_kHz, fpgaClock_kHz)
 ad9528 = [245760, 122880, 122880, 245760]
+# Two independent bands. LO select is per pair (the hardware groups 1/2 and 3/4).
+# Band A: Rx1/2 + Tx1/2 + ORx1/2 -> LO1.   Band B: Rx3/4 + Tx3/4 + ORx3/4 -> LO2.
+# Rx and Tx of a pair MUST share an LO -- the TX QEC init cal observes TX through
+# the loopback/Rx path, so a mismatched Rx LO makes TxQECInit fail to converge.
 rx12_lo = "LO1"
-rx34_lo = "LO1"
-tx12_lo = "LO2"
+rx34_lo = "LO2"
+tx12_lo = "LO1"
 tx34_lo = "LO2"
-orx12_lo = "TXLO"
-orx34_lo = "TXLO"
+orx12_lo = "TXLO"   # ORx1/2 follow Tx1/2's LO (band A)
+orx34_lo = "TXLO"   # ORx3/4 follow Tx3/4's LO (band B)
 pll1_lo_mode = "INTLO_NOOUTPUT"
 pll2_lo_mode = "INTLO_NOOUTPUT"
 ext_lo1_khz = 0
@@ -40,8 +44,8 @@ tx_enable_mode = "SPI_MODE"
 orx_enable_mode = "SPI_MODE"
 
 [lo]
-lo1_hz = 2000000000       # Rx path (rx uses LO1)
-lo2_hz = 1000000000       # Tx / ORx path (tx uses LO2, orx uses TXLO)
+lo1_hz = 1100000000       # band A center (Rx1/2, Tx1/2, ORx1/2)
+lo2_hz = 900000000        # band B center (Rx3/4, Tx3/4, ORx3/4)
 aux_hz = 0
 
 [tx_to_orx]
