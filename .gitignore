@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.nox/
+.coverage
+htmlcov/
+
+# Captured data / waveforms (large, machine-generated)
+*.iq
+captures/
+data/
+
+# Extracted vendor docs (regenerate from CHM; keep curated docs/api_notes.md)
+chm_extracted/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,69 @@
+# Default ADRV9026 / ADS9 configuration.
+# Mirrors the working StdUseCase102_LinkSharing init script (TES build 6.4.0.x,
+# namespace adrv9010_dll). Every value here was a literal in that script.
+# Copy this file and edit a few keys per experiment rather than touching code.
+
+[dll]
+install_dir = "C:\\Program Files\\Analog Devices\\ADRV9025 Transceiver Evaluation Software_x64_FULL"
+dll_relpath = "adrvtrx_dll.dll"          # joined to install_dir
+namespace   = "adrv9010_dll"             # auto-detected if blank; this build uses adrv9010_dll
+
+[board]
+ip   = "192.168.1.10"
+port = 55556
+
+[profile]
+# Relative to <install_dir>\Resources\Adi.ADRV9025.Profiles\public\, or an absolute path.
+name = "ADRV9025Init_StdUseCase102_LinkSharing.profile"
+
+[clocks]
+device_clock_khz = 245760
+# AD9528 ClockConfig(deviceClock_kHz, vcxoFreq_kHz, refAFreq_kHz, fpgaClock_kHz)
+ad9528 = [245760, 122880, 122880, 245760]
+rx12_lo = "LO1"
+rx34_lo = "LO1"
+tx12_lo = "LO2"
+tx34_lo = "LO2"
+orx12_lo = "TXLO"
+orx34_lo = "TXLO"
+pll1_lo_mode = "INTLO_NOOUTPUT"
+pll2_lo_mode = "INTLO_NOOUTPUT"
+ext_lo1_khz = 0
+ext_lo2_khz = 0
+
+[channels]
+rx_init_mask = 0x3FF      # Rx1-4 + ORx1-4 (and loopback)
+tx_init_mask = 0xF        # Tx1-4
+rx_enable_mode = "SPI_MODE"
+tx_enable_mode = "SPI_MODE"
+orx_enable_mode = "SPI_MODE"
+
+[lo]
+lo1_hz = 1800000000       # Rx path (rx uses LO1)
+lo2_hz = 2000000000       # Tx / ORx path (tx uses LO2, orx uses TXLO)
+aux_hz = 0
+
+[tx_to_orx]
+# orx1<-TX1, orx2<-TX2, orx3<-TX3, orx4<-TX4
+map = ["TX1_ORX1", "TX2_ORX2", "TX3_ORX3", "TX4_ORX4"]
+
+[init_cals]
+channel_mask = 0xF
+warm_boot = 0
+mask = [
+    "TX_BB_FILTER", "ADC_TUNER", "RX_TIA", "ORX_TIA", "LBRX_TIA",
+    "RX_DC_OFFSET", "ORX_DC_OFFSET", "LBRX_DC_OFFSET", "FLASH_CAL",
+    "INTERNAL_PATH_DELAY", "TX_LO_LEAKAGE_INTERNAL", "TX_QEC_INIT",
+    "LOOPBACK_RX_LO_DELAY", "RX_QEC_INIT", "ORX_QEC_INIT", "TX_DAC",
+]
+
+[levels]
+# Per-channel overrides allowed, e.g. tx_atten_db = { default = 30, tx1 = 20 }
+tx_atten_db   = { default = 30 }
+rx_gain_index = { default = 195 }   # applies to Rx1-4 and ORx1-4
+
+[orx_agc]
+# Software ORx leveling (flag-based: RxDecPowerGet + overload indicators).
+target_dbfs   = -12.0   # desired ORx peak/level setpoint
+tolerance_db  = 2.0     # acceptable window around target
+max_iterations = 12     # gain-step iterations before giving up

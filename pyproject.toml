@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adrvtrx"
+version = "0.1.0"
+description = "Python automation for ADRV9026 multi-band TX + synchronized ORx capture over the ADS9 / TES DLL"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "ohammi" }]
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "tomli>=2.0; python_version < '3.11'",
+    # pythonnet is required only on the control PC (Windows + .NET). It is NOT
+    # imported at module import time, so hardware-free unit tests run without it.
+    "pythonnet>=3.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "pre-commit>=3.0",
+]
+
+[project.scripts]
+adrvtrx-program = "adrvtrx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "hardware: tests that require a connected ADS9 + ADRV9026 (skipped in CI)",
+]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
