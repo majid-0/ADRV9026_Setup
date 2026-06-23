@@ -31,19 +31,33 @@ def prepare_channel_iq(
 
 
 def build_tx_data(bridge, channel_iq: Mapping[TxChannel, tuple[np.ndarray, np.ndarray]]):
-    """Build the PerformTx ArrayList (I, Q arrays per channel) + channel mask.
+    """Build the PerformTx ArrayList + channel mask.
 
-    Channels are emitted in ascending order; each contributes its I array then its
-    Q array, matching the proven ADI ``LoadTxData`` ordering.
+    PerformTx requires **exactly 8 arrays** ("one array for each Tx ADC") = all four
+    TX channels, each as an I array then a Q array, in ascending order. Channels not
+    being driven are zero-filled (same length); ``channelMask`` selects who actually
+    transmits. All provided waveforms must be the same length.
     """
+    if not channel_iq:
+        raise ValueError("channel_iq is empty; provide at least one TX waveform")
+    lengths = {len(np.asarray(i)) for i, _q in channel_iq.values()}
+    lengths |= {len(np.asarray(q)) for _i, q in channel_iq.values()}
+    if len(lengths) != 1:
+        raise ValueError(f"all TX I/Q buffers must be the same length, got {sorted(lengths)}")
+    n = lengths.pop()
+    zeros = [0] * n
+
     mask = 0
     items = []
-    for ch in TX_SINGLE:
+    for ch in TX_SINGLE:  # TX1..TX4 always emitted
         if ch in channel_iq:
             i_int, q_int = channel_iq[ch]
             items.append(bridge.int_array(np.asarray(i_int).tolist()))
             items.append(bridge.int_array(np.asarray(q_int).tolist()))
             mask |= int(ch)
+        else:
+            items.append(bridge.int_array(zeros))
+            items.append(bridge.int_array(zeros))
     return bridge.array_list(items), mask
 
 

@@ -1,12 +1,12 @@
 """Snapshot capture: trigger PerformRx, shape per-channel IQ, report clipping, save.
 
-A capture is a single FPGA snapshot of all channels named in ``channels`` taken in
-one ``PerformRx`` call, so they are mutually sample-aligned. Use a ``TXn_SOF``
-trigger to align the snapshot to TX start-of-frame (concern #2).
+A capture is one FPGA snapshot taken in a single ``PerformRx`` call, so all channels
+are mutually sample-aligned. Use a ``TXn_SOF`` trigger to align to TX start-of-frame.
 
-The one seam confirmed on hardware is :func:`extract_channels` -- how the raw
-int IQ buffers are read back out of the ``PerformRx`` result. Everything around it
-(sample-count math, clip reporting, peak windowing, float save) is pure and tested.
+Confirmed on hardware (docs/api_notes.md): ``PerformRx`` ignores its mask argument
+and returns the full ``rxInitChannelMask`` set as a flat indexable of already-scaled
+int arrays, interleaved ``[ch0_I, ch0_Q, ...]`` in ascending channel-bit order. We
+therefore index a wanted channel by its absolute position in that set.
 """
 
 from __future__ import annotations
@@ -19,6 +19,10 @@ import numpy as np
 from ._enums import RX_SINGLE, RxChannel, RxTrigSource
 from .gain import ClipReport, clip_report, peak_window
 from .waveform import samples_for_duration, save_tab_iq_float
+
+#: Single-bit channel for each rxInitChannelMask bit we can name (bits 8/9 are
+#: internal/loopback Rx and map to None -- present in the readback but unnamed).
+_RX_BIT_TO_CHANNEL = {int(ch): ch for ch in RX_SINGLE}
 
 
 @dataclass
@@ -65,45 +69,40 @@ def channel_list(channel_mask: int) -> list[RxChannel]:
     return [ch for ch in RX_SINGLE if channel_mask & int(ch)]
 
 
-def extract_channels(perform_rx_result, channels: list[RxChannel], bits: int) -> dict:
-    """Pull per-channel int IQ out of a ``PerformRx`` result.
+def returned_channel_order(rx_init_mask: int) -> list[RxChannel | None]:
+    """Order of channels in a PerformRx readback: one entry per set bit of
+    ``rxInitChannelMask`` (ascending). Named Rx/ORx channels map to their enum;
+    internal/loopback bits (e.g. 0x100, 0x200) map to ``None``."""
+    order: list[RxChannel | None] = []
+    bit = 0
+    while (1 << bit) <= rx_init_mask:
+        m = 1 << bit
+        if rx_init_mask & m:
+            order.append(_RX_BIT_TO_CHANNEL.get(m))
+        bit += 1
+    return order
 
-    Confirmed by ADI sample (docs/api_notes.md): the result is a flat indexable of
-    already-scaled int arrays, interleaved ``[ch0_I, ch0_Q, ch1_I, ch1_Q, ...]`` in
-    the same (ascending) order as ``channels``. ORx availability is profile
-    dependent, so only mask channels the loaded profile actually provides.
+
+def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
+    """Extract ``wanted`` channels from a PerformRx result by absolute position.
+
+    ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
+    the result holds 2 arrays (I, Q) per entry in ``order``. Returns
+    ``{channel: ChannelCapture}``.
     """
-    per: dict[RxChannel, tuple[np.ndarray, np.ndarray]] = {}
-    for k, ch in enumerate(channels):
-        try:
-            i_buf = perform_rx_result[2 * k]
-            q_buf = perform_rx_result[2 * k + 1]
-        except (IndexError, KeyError) as exc:
-            raise IndexError(
-                f"PerformRx returned fewer buffers than requested channels "
-                f"({len(channels)}); channel {ch.name} (index {k}) missing. "
-                f"On link-sharing profiles only some ORx exist -- mask only "
-                f"available channels."
-            ) from exc
-        per[ch] = (
-            np.fromiter(i_buf, dtype=np.int32),
-            np.fromiter(q_buf, dtype=np.int32),
-        )
-    # Guard: if MORE buffers came back than channels requested, the build is
-    # returning all available channels regardless of mask -> positional mapping
-    # would be wrong. Fail loudly with guidance instead of silently mis-mapping.
-    try:
-        perform_rx_result[2 * len(channels)]
-    except (IndexError, KeyError):
-        pass  # exact count -> mask honored, mapping is correct
-    else:
-        raise RuntimeError(
-            "PerformRx returned more channel buffers than the requested mask "
-            f"({len(channels)} channels). This build appears to return all available "
-            "channels regardless of mask; capture with the full available mask and "
-            "index by absolute channel order (see docs/api_notes.md / hw_smoke.py)."
-        )
-    return per
+    out: dict[RxChannel, ChannelCapture] = {}
+    for ch in wanted:
+        if ch not in order:
+            raise ValueError(
+                f"{ch.name} is not in the active rxInitChannelMask "
+                f"(returned channels: {[c.name for c in order if c]}). "
+                f"Enable it in config [channels].rx_init_mask."
+            )
+        idx = order.index(ch)
+        i = np.fromiter(perform_rx_result[2 * idx], dtype=np.int32)
+        q = np.fromiter(perform_rx_result[2 * idx + 1], dtype=np.int32)
+        out[ch] = ChannelCapture(ch, i, q, bits)
+    return out
 
 
 def capture(
@@ -115,20 +114,42 @@ def capture(
     timeout_ms: int = 1000,
     bits: int,
 ) -> CaptureResult:
-    """Trigger a snapshot and return per-channel captures.
+    """Trigger a snapshot and return the requested channels.
 
+    ``PerformRx`` returns the full ``rxInitChannelMask`` set regardless of mask, so
+    we capture all of it and pick out ``channel_mask``'s channels by position.
     ``bits`` is the Rx datapath width (``ProfileInfo.rx_bits``).
     """
-    chans = channel_list(channel_mask)
-    # Wake the main-Rx datapath before capturing (ORx rides along, per ADI sample).
-    radio.enable_rx(channel_mask & 0x0F or 0x0F)
-    raw = radio.perform_rx(channel_mask, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
-    per_channel = extract_channels(raw, chans, bits)
+    rx_init = radio.config.channels.rx_init_mask
+    order = returned_channel_order(rx_init)
+    radio.enable_rx(rx_init & 0xFF)  # wake the Rx/ORx datapath
+    raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
+
+    # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
+    # per channel in rxInitChannelMask. If a profile returns a different set, the
+    # positional mapping would be wrong -> fail clearly instead.
+    n_arrays = _result_len(raw)
+    if n_arrays is not None and n_arrays != 2 * len(order):
+        raise RuntimeError(
+            f"PerformRx returned {n_arrays} arrays ({n_arrays // 2} channels) but "
+            f"rxInitChannelMask=0x{rx_init:X} implies {len(order)} channels. The "
+            f"profile and rx_init_mask disagree -- set [channels].rx_init_mask to "
+            f"match this profile's framer routing (run scripts/hw_smoke.py to see "
+            f"the actual count)."
+        )
+
+    wanted = channel_list(channel_mask)
     result = CaptureResult(capture_time_ms=capture_time_ms, trig=trig)
-    for ch in chans:
-        i, q = per_channel[ch]
-        result.channels[ch] = ChannelCapture(ch, np.asarray(i), np.asarray(q), bits)
+    result.channels.update(extract_channels(raw, order, wanted, bits))
     return result
+
+
+def _result_len(raw) -> int | None:
+    """Length of a PerformRx result if knowable, else None (skip the check)."""
+    try:
+        return len(raw)
+    except TypeError:
+        return getattr(raw, "Count", None) or getattr(raw, "Length", None)
 
 
 def expected_samples(capture_time_ms: float, rx_rate_khz: float) -> int:

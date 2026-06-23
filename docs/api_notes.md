@@ -153,6 +153,23 @@ Clearing the TX mask **stops** playback → used by `safe_state`/`disable_tx`.
 ADI uses `20*log10(sqrt(pwr)/32768)`, i.e. dBFS reference = `2**(Np-1)` (32768 for
 Np=16). `clip_report` uses this reference; quantization clips at `2**(Np-1)-1`.
 
+### Confirmed on hardware (bench, StdUseCase102_LinkSharing, rx_init=0x3FF)
+- **connect + program works**: PLLs lock (status `0xF`), LO1/LO2 read back exactly.
+- **PerformRx ignores its mask arg** and returns the full **programmed
+  `rxInitChannelMask`** set: `0x3FF` → 20 arrays = 10 channels, in bit order
+  `Rx1..Rx4, ORx1..ORx4,` + 2 internal/loopback (bits 0x100/0x200). So index a
+  wanted channel by absolute position (`capture.returned_channel_order`). The
+  count = popcount(rx_init_mask); which channels carry real data is profile-driven.
+  ORx2 **is** present in this profile (24576 samples @ 0.1 ms / 245.76 MSPS).
+- **PerformTx requires exactly 8 arrays** ("one array for each Tx ADC") = all four
+  TX channels x I/Q; zero-fill undriven channels, `channelMask` selects who TXes.
+- **Trigger enums** are `ADI_FPGA9010_*` (Rx) / `ADI_FPGA9010_TX_*` (Tx) members.
+- **force_safe / TxAttenSet** is rejected pre-`Program()` ("Invalid Tx attenuation
+  control mode") -> startup safe-state is best-effort.
+- **RxDecPowerGet** read `-0.00 dBFS` on ORx2/ORx3 with no armed measurement ->
+  likely needs the channel active / a measurement trigger. Use captured-IQ peak for
+  ORx leveling until its arming is confirmed.
+
 ### Bonus API confirmed (for later)
 - **NCO:** `Tx.TxNcoShifterSet(adi_adrv9025_TxNcoShifterCfg_t{shifterMode=MIX,
   shiftFrequency_kHz, shiftGain, txChannelMask})` and `Rx.RxNcoShifterSet` — digital
