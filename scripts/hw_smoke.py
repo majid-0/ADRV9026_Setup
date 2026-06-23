@@ -87,23 +87,30 @@ def main() -> None:
         raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
         print_table(channel_powers(raw, info.rx_bits), order, "baseline, no TX:")
 
-        # [2] Per-TX probe: which index lights up when TXn transmits a tone?
-        print("\n[2] TX probe -- transmit a tone on each TX, see which index responds")
+        # [2] Per-TX probe. The ADRV9026 has only 2 ORx ADCs (data idx 4 & 5);
+        # ORx1/2/3/4 are front-end inputs muxed into them. Enable the ORx input for
+        # this TX (rxMask bit: ORx2=0x20, ORx3=0x40) so its front-end powers up, then
+        # see which of idx 4/5 carries the tone.
+        print("\n[2] TX probe -- enable the ORx input + transmit, see which ORx ADC responds")
         tone = make_tone(TONE_SAMPLES, TONE_HZ, info.tx_rate_hz)
-        for tx, expected in PAIRS:
+        for tx, orx in PAIRS:
             radio.set_tx_atten(tx, PROBE_TX_ATTEN_DB)
+            radio.rx_tx_enable(0x0F | int(orx), 0)  # main Rx + this ORx front-end
             transmit_bands(radio, {tx: tone}, info.tx_bits, continuous=True)
             raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
             rows = channel_powers(raw, info.rx_bits)
-            live = [r for r in rows if np.isfinite(r[2])]
-            hot = max(live, key=lambda r: r[2]) if live else None
-            print_table(rows, order, f"{tx.name} transmitting (expected {expected.name}):")
+            print_table(
+                rows,
+                order,
+                f"{tx.name} -> {orx.name} input enabled (rxMask 0x{0x0F | int(orx):X}):",
+            )
+            orx_slots = [r for r in rows if r[0] in (4, 5) and np.isfinite(r[2])]
+            hot = max(orx_slots, key=lambda r: r[2]) if orx_slots else None
             if hot:
-                hot_name = order[hot[0]].name if order[hot[0]] else f"index {hot[0]}"
-                print(f"      -> strongest: idx {hot[0]} ({hot_name}) at {hot[2]:+.1f} dBFS")
+                print(f"      -> {tx.name} energy on ORx ADC idx {hot[0]} at {hot[2]:+.1f} dBFS")
             radio.disable_tx()
 
-        print("\nDone. Use the 'strongest idx' per TX to confirm the real mapping.")
+        print("\nDone. The ORx ADC idx that lights up per TX is the real data slot.")
 
 
 if __name__ == "__main__":
