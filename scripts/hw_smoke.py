@@ -1,15 +1,13 @@
-"""Bench bring-up smoke test for the ADRV9026 / ADS9 (run on the control PC).
+"""Bench bring-up + channel-mapping discovery for the ADRV9026 / ADS9.
 
-Discovers the things that can only be confirmed live (docs/api_notes.md open items)
-and exercises the TX->ORx loopback on the channels you have wired:
-    TX2 -> ORx2  and  TX3 -> ORx3.
+Empirically maps the PerformRx readback for the loaded profile: it dumps the power
+of all returned channels at idle, then transmits a tone on each wired TX (TX2, TX3)
+and reports which returned-array index lights up. That reveals the true TX->ORx
+index mapping without assuming bit order (link-sharing profiles reorder/!populate
+some slots).
 
-Run inside myenv with the board connected and booted:
+Run inside myenv with the board connected + booted:
     conda run -n myenv python scripts/hw_smoke.py
-
-It prints a report and writes captures to ./captures/ for you to eyeball. It does
-NOT assert -- it's for discovery. The pytest hardware tests (tests/test_hardware.py)
-do the pass/fail checks once the layout is known.
 """
 
 from __future__ import annotations
@@ -17,28 +15,61 @@ from __future__ import annotations
 import numpy as np
 
 from adrvtrx import RxChannel, TxChannel
-from adrvtrx.capture import capture
+from adrvtrx.capture import returned_channel_order
 from adrvtrx.config import load_config
 from adrvtrx.experiment import session, verify_status
-from adrvtrx.gain import clip_report
 from adrvtrx.transmit import transmit_bands
 
-# Channels you have wired (TX2->ORx2, TX3->ORx3).
 PAIRS = [(TxChannel.TX2, RxChannel.ORX2), (TxChannel.TX3, RxChannel.ORX3)]
 TONE_HZ = 5_000_000
 TONE_SAMPLES = 4096
 CAPTURE_MS = 0.1
+PROBE_TX_ATTEN_DB = 10.0  # lower than the 30 dB default for a clean loopback signal
 
 
 def make_tone(n: int, freq_hz: float, rate_hz: float) -> np.ndarray:
     t = np.arange(n) / rate_hz
-    return 0.5 * np.exp(2j * np.pi * freq_hz * t)  # 0.5 -> headroom before quantize
+    return 0.5 * np.exp(2j * np.pi * freq_hz * t)
+
+
+def _len(arr) -> int:
+    try:
+        return len(arr)
+    except TypeError:
+        return int(getattr(arr, "Length", 0) or getattr(arr, "Count", 0))
+
+
+def channel_powers(raw, n_bits: int):
+    """Return [(idx, n_samples, rms_dbfs)] for each channel in a PerformRx result."""
+    fs = float(1 << (n_bits - 1))
+    n_arrays = _len(raw)
+    rows = []
+    for k in range(n_arrays // 2):
+        i = np.fromiter(raw[2 * k], dtype=np.int64)
+        q = np.fromiter(raw[2 * k + 1], dtype=np.int64)
+        if i.size == 0:
+            rows.append((k, 0, float("-inf")))
+            continue
+        rms = np.sqrt(np.mean(i.astype(float) ** 2 + q.astype(float) ** 2))
+        dbfs = 20 * np.log10(rms / fs) if rms > 0 else float("-inf")
+        rows.append((k, i.size, dbfs))
+    return rows
+
+
+def print_table(rows, order, header):
+    print(f"    {header}")
+    print(f"    {'idx':>3}  {'assumed':<6}  {'n':>7}  rms_dBFS")
+    for idx, n, dbfs in rows:
+        name = order[idx].name if idx < len(order) and order[idx] else "-"
+        d = f"{dbfs:+.1f}" if np.isfinite(dbfs) else "  -inf"
+        print(f"    {idx:>3}  {name:<6}  {n:>7}  {d}")
 
 
 def main() -> None:
     cfg = load_config()
     print(f"Connecting to {cfg.board.ip}:{cfg.board.port} and programming ...")
     with session(cfg) as (radio, info):
+        order = returned_channel_order(cfg.channels.rx_init_mask)
         print(f"Profile: {cfg.profile_path.name}")
         print(
             f"  Tx {info.tx_bits}-bit @ {info.tx_rate_khz/1000:.3f} MSPS | "
@@ -47,66 +78,28 @@ def main() -> None:
         for k, v in verify_status(radio).items():
             print(f"  {k}: {v}")
 
-        # 1) Discover the PerformRx channel layout for THIS profile.
-        print("\n[1] PerformRx layout discovery (mask 0xFF, immediate trigger)")
-        raw = radio.perform_rx(0xFF, CAPTURE_MS, timeout_ms=1000)
-        n_arrays = _count(raw)
-        print(f"    returned {n_arrays} arrays -> {n_arrays // 2} channels present")
-        if n_arrays:
-            print(
-                f"    samples per array: {_len(raw[0])} "
-                f"(expected ~{int(CAPTURE_MS * 1e-3 * info.rx_rate_khz * 1e3)})"
-            )
+        # [1] Idle baseline -- power of every returned channel, no TX.
+        print("\n[1] Idle channel powers (rx_init_mask = " f"0x{cfg.channels.rx_init_mask:X})")
+        raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
+        print_table(channel_powers(raw, info.rx_bits), order, "baseline, no TX:")
 
-        # 2) ORx level readback (confirms RxDecPowerGet sign/scale).
-        print("\n[2] RxDecPowerGet on ORx2 / ORx3")
-        for orx in (RxChannel.ORX2, RxChannel.ORX3):
-            try:
-                print(f"    {orx.name}: {radio.rx_dec_power_dbfs(orx):+.2f} dBFS")
-            except Exception as exc:  # noqa: BLE001 - discovery, report and continue
-                print(f"    {orx.name}: read failed -> {exc}")
-
-        # 3) TX -> ORx loopback on each wired pair.
-        print("\n[3] TX->ORx loopback")
+        # [2] Per-TX probe: which index lights up when TXn transmits a tone?
+        print("\n[2] TX probe -- transmit a tone on each TX, see which index responds")
         tone = make_tone(TONE_SAMPLES, TONE_HZ, info.tx_rate_hz)
-        for tx, orx in PAIRS:
-            print(f"    {tx.name} -> {orx.name}: transmit tone, capture ORx")
+        for tx, expected in PAIRS:
+            radio.set_tx_atten(tx, PROBE_TX_ATTEN_DB)
             transmit_bands(radio, {tx: tone}, info.tx_bits, continuous=True)
-            try:
-                result = capture(radio, int(orx), CAPTURE_MS, bits=info.rx_bits)
-                cap = result.channels[orx]
-                rep = clip_report(cap.i, cap.q, info.rx_bits)
-                print(
-                    f"      captured {len(cap.i)} samples | peak {rep.peak_dbfs:+.2f} dBFS "
-                    f"| railed {rep.railed_samples}"
-                )
-                paths = result.save_all("captures", prefix=f"{tx.name}_{orx.name}")
-                print(f"      saved: {', '.join(str(p) for p in paths)}")
-            except RuntimeError as exc:
-                print(f"      capture mapping issue: {exc}")
+            raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
+            rows = channel_powers(raw, info.rx_bits)
+            live = [r for r in rows if np.isfinite(r[2])]
+            hot = max(live, key=lambda r: r[2]) if live else None
+            print_table(rows, order, f"{tx.name} transmitting (expected {expected.name}):")
+            if hot:
+                hot_name = order[hot[0]].name if order[hot[0]] else f"index {hot[0]}"
+                print(f"      -> strongest: idx {hot[0]} ({hot_name}) at {hot[2]:+.1f} dBFS")
             radio.disable_tx()
 
-        print("\nDone. TX will be left safe on exit. Inspect ./captures/*.txt")
-
-
-def _count(raw) -> int:
-    try:
-        return len(raw)
-    except TypeError:
-        n = 0
-        try:
-            while True:
-                raw[n]
-                n += 1
-        except Exception:  # noqa: BLE001
-            return n
-
-
-def _len(arr) -> int:
-    try:
-        return len(arr)
-    except TypeError:
-        return int(arr.Length)
+        print("\nDone. Use the 'strongest idx' per TX to confirm the real mapping.")
 
 
 if __name__ == "__main__":
