@@ -13,8 +13,8 @@ def test_load_bundled_default():
     assert cfg.board.port == 55556
     assert cfg.channels.rx_init_mask == 0x3FF
     assert cfg.channels.tx_init_mask == 0xF
-    assert cfg.lo.lo1_hz == 1_800_000_000
-    assert cfg.lo.lo2_hz == 2_000_000_000
+    assert cfg.lo.lo1_hz == 2_000_000_000
+    assert cfg.lo.lo2_hz == 1_000_000_000
     assert "TX_QEC_INIT" in cfg.init_cals.mask
     assert cfg.tx_to_orx == ["TX1_ORX1", "TX2_ORX2", "TX3_ORX3", "TX4_ORX4"]
 

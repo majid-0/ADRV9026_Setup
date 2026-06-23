@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 
 from adrvtrx import RxChannel, TxChannel
+from adrvtrx._enums import is_orx
 from adrvtrx.capture import returned_channel_order
 from adrvtrx.config import load_config
 from adrvtrx.experiment import session, verify_status
@@ -56,13 +57,33 @@ def channel_powers(raw, n_bits: int):
     return rows
 
 
+def slot_label(idx, n, order, orx_seen):
+    """Physical-truth label for a readback slot.
+
+    The ADRV9026 has only TWO ORx ADCs: the populated ORx slots are those two
+    converters, not the four bit-order names ORX1..ORX4. Label the real ones
+    ORxADC0/1 (in the order they appear) and the converter-less bits ORx(none).
+    """
+    ch = order[idx] if idx < len(order) and order[idx] else None
+    if ch is None:
+        return "-"
+    if is_orx(ch):
+        if n > 0:
+            label = f"ORxADC{orx_seen[0]}"
+            orx_seen[0] += 1
+            return label
+        return "ORx(none)"
+    return ch.name
+
+
 def print_table(rows, order, header):
     print(f"    {header}")
-    print(f"    {'idx':>3}  {'assumed':<6}  {'n':>7}  rms_dBFS")
+    print(f"    {'idx':>3}  {'channel':<9}  {'n':>7}  rms_dBFS")
+    orx_seen = [0]  # mutable counter of physical ORx ADCs seen so far
     for idx, n, dbfs in rows:
-        name = order[idx].name if idx < len(order) and order[idx] else "-"
+        name = slot_label(idx, n, order, orx_seen)
         d = f"{dbfs:+.1f}" if np.isfinite(dbfs) else "  -inf"
-        print(f"    {idx:>3}  {name:<6}  {n:>7}  {d}")
+        print(f"    {idx:>3}  {name:<9}  {n:>7}  {d}")
 
 
 def main() -> None:
@@ -73,7 +94,8 @@ def main() -> None:
         print(f"Profile: {cfg.profile_path.name}")
         print(
             f"  Tx {info.tx_bits}-bit @ {info.tx_rate_khz/1000:.3f} MSPS | "
-            f"Rx {info.rx_bits}-bit @ {info.rx_rate_khz/1000:.3f} MSPS"
+            f"Rx {info.rx_bits}-bit @ {info.rx_rate_khz/1000:.3f} MSPS | "
+            f"ORx @ {info.orx_rate_khz/1000:.3f} MSPS"
         )
         for k, v in verify_status(radio).items():
             print(f"  {k}: {v}")

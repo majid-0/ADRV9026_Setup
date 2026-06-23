@@ -40,8 +40,8 @@ tx_enable_mode = "SPI_MODE"
 orx_enable_mode = "SPI_MODE"
 
 [lo]
-lo1_hz = 1800000000       # Rx path (rx uses LO1)
-lo2_hz = 2000000000       # Tx / ORx path (tx uses LO2, orx uses TXLO)
+lo1_hz = 2000000000       # Rx path (rx uses LO1)
+lo2_hz = 1000000000       # Tx / ORx path (tx uses LO2, orx uses TXLO)
 aux_hz = 0
 
 [tx_to_orx]

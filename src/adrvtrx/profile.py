@@ -36,12 +36,20 @@ def _first_positive(obj: Any, key: str) -> int | None:
     return None
 
 
+def _all_positive(obj: Any, key: str) -> list[int]:
+    return [int(v) for v in _iter_values(obj, key) if isinstance(v, (int, float)) and v > 0]
+
+
 @dataclass
 class ProfileInfo:
     tx_bits: int
     rx_bits: int
     tx_rate_khz: int
     rx_rate_khz: int
+    #: ORx framer rate. In link-sharing the ORx datapath runs faster than main Rx
+    #: (its rxOutputRate_kHz == txInputRate_kHz); equals rx_rate_khz if a profile
+    #: exposes only one Rx rate.
+    orx_rate_khz: int
 
     @property
     def tx_rate_hz(self) -> int:
@@ -50,6 +58,10 @@ class ProfileInfo:
     @property
     def rx_rate_hz(self) -> int:
         return self.rx_rate_khz * 1000
+
+    @property
+    def orx_rate_hz(self) -> int:
+        return self.orx_rate_khz * 1000
 
 
 def read_profile(path: str | Path) -> ProfileInfo:
@@ -62,7 +74,9 @@ def read_profile(path: str | Path) -> ProfileInfo:
     rx_bits = _first_positive(framer, "jesd204Np") or _first_positive(data, "jesd204Np")
     tx_bits = _first_positive(deframer, "jesd204Np") or rx_bits
     tx_rate = _first_positive(data, "txInputRate_kHz")
-    rx_rate = _first_positive(data, "rxOutputRate_kHz")
+    rx_rates = _all_positive(data, "rxOutputRate_kHz")
+    rx_rate = rx_rates[0] if rx_rates else None  # first found = main Rx datapath
+    orx_rate = max(rx_rates) if rx_rates else None  # faster framer = ORx (link-sharing)
 
     missing = [
         name
@@ -77,4 +91,10 @@ def read_profile(path: str | Path) -> ProfileInfo:
     if missing:
         raise ValueError(f"{path}: could not read profile field(s): {', '.join(missing)}")
 
-    return ProfileInfo(tx_bits=tx_bits, rx_bits=rx_bits, tx_rate_khz=tx_rate, rx_rate_khz=rx_rate)
+    return ProfileInfo(
+        tx_bits=tx_bits,
+        rx_bits=rx_bits,
+        tx_rate_khz=tx_rate,
+        rx_rate_khz=rx_rate,
+        orx_rate_khz=orx_rate,
+    )
