@@ -11,8 +11,6 @@ contradict or extend the documentation. Read this first, then `docs/api_notes.md
 ## 0. Orientation
 
 - **Repo (working copy):** `C:\Users\ohammi\OneDrive - aus.edu\ADRV9026_Setup`
-  - A second clone exists at `C:\Users\ohammi\Desktop\ADRV9026_Setup` — **stale**,
-    independent `.git`. The OneDrive copy is the source of truth.
 - **GitHub:** https://github.com/majid-0/ADRV9026_Setup (remote `origin`, branch `main`).
   CI runs lint + hardware-free tests on push (`.github/workflows/ci.yml`).
 - **Python env:** conda env **`myenv`** (Python 3.11). Conda lives at
