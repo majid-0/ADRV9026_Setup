@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 
 from adrvtrx._enums import RxChannel, TxChannel
-from adrvtrx.capture import channel_list
-from adrvtrx.transmit import build_tx_data, pack_channel, prepare_channel_buffer
+from adrvtrx.capture import channel_list, extract_channels
+from adrvtrx.transmit import build_tx_data, prepare_channel_iq
 
 
 def test_channel_list_expands_mask():
@@ -19,41 +19,50 @@ def test_channel_list_all_rx_and_orx():
     assert RxChannel.ORX4 in chans
 
 
-def test_pack_channel_packed():
-    i = np.array([1, -1], dtype=np.int32)
-    q = np.array([2, -2], dtype=np.int32)
-    packed = pack_channel(i, q, "packed")
-    # high 16 bits = I, low 16 bits = Q
-    assert (packed[0] >> 16) == 1
-    assert (packed[0] & 0xFFFF) == 2
-
-
-def test_pack_channel_interleaved():
-    i = np.array([1, 3], dtype=np.int32)
-    q = np.array([2, 4], dtype=np.int32)
-    out = pack_channel(i, q, "interleaved")
-    assert list(out) == [1, 2, 3, 4]
-
-
-def test_pack_channel_bad_mode():
-    with pytest.raises(ValueError):
-        pack_channel(np.array([1]), np.array([1]), "nope")
-
-
-def test_prepare_channel_buffer_normalizes():
+def test_prepare_channel_iq_normalizes():
     iq = np.array([0.5 + 0j, -0.5 + 0j])
-    buf = prepare_channel_buffer(iq, 16, mode="interleaved")
-    # normalized peak -> full scale on I
-    assert buf[0] == 32767
+    i_int, q_int = prepare_channel_iq(iq, 16, do_normalize=True)
+    assert i_int[0] == 32767  # peak 0.5 normalized to full scale
 
 
-def test_build_tx_data_orders_by_channel(fake_bridge):
+def test_prepare_channel_iq_keeps_integer_vectors():
+    # Already-scaled vector, do_normalize=False -> values pass through (rounded).
+    iq = np.array([1000 + 0j, -2000 + 0j])
+    i_int, _ = prepare_channel_iq(iq, 16, do_normalize=False)
+    assert i_int[0] == 1000
+    assert i_int[1] == -2000
+
+
+def test_build_tx_data_separate_iq_arrays_in_order(fake_bridge):
     bufs = {
-        TxChannel.TX3: np.array([3, 3], dtype=np.int32),
-        TxChannel.TX1: np.array([1, 1], dtype=np.int32),
+        TxChannel.TX3: (np.array([3, 3]), np.array([30, 30])),
+        TxChannel.TX1: (np.array([1, 1]), np.array([10, 10])),
     }
     data, mask = build_tx_data(fake_bridge, bufs)
     assert mask == (int(TxChannel.TX1) | int(TxChannel.TX3))
-    # TX1 must come before TX3 in the data list (stable channel order)
-    assert list(data[0]) == [1, 1]
-    assert list(data[1]) == [3, 3]
+    # ascending channel order, each channel = I array then Q array
+    assert list(data[0]) == [1, 1]  # TX1 I
+    assert list(data[1]) == [10, 10]  # TX1 Q
+    assert list(data[2]) == [3, 3]  # TX3 I
+    assert list(data[3]) == [30, 30]  # TX3 Q
+
+
+def test_extract_channels_interleaved_readback():
+    # PerformRx returns [ch0_I, ch0_Q, ch1_I, ch1_Q, ...] in ascending order.
+    raw = [
+        np.array([1, 2, 3]),
+        np.array([4, 5, 6]),
+        np.array([7, 8, 9]),
+        np.array([10, 11, 12]),
+    ]
+    chans = [RxChannel.RX1, RxChannel.ORX1]
+    per = extract_channels(raw, chans, 16)
+    assert list(per[RxChannel.RX1][0]) == [1, 2, 3]
+    assert list(per[RxChannel.RX1][1]) == [4, 5, 6]
+    assert list(per[RxChannel.ORX1][0]) == [7, 8, 9]
+    assert list(per[RxChannel.ORX1][1]) == [10, 11, 12]
+
+
+def test_extract_channels_too_few_buffers_raises():
+    with pytest.raises(IndexError):
+        extract_channels([np.array([1])], [RxChannel.RX1], 16)  # need I and Q

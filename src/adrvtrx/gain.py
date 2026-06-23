@@ -43,11 +43,14 @@ def clip_report(i_int: np.ndarray, q_int: np.ndarray, n_bits: int) -> ClipReport
     if n == 0:
         return ClipReport(peak_dbfs=float("-inf"), railed_samples=0, peak_index=-1, n_samples=0)
     per_sample_peak = np.maximum(i, q)
-    fs = full_scale(n_bits)
+    # dBFS reference is 2**(N-1) (=32768 for N=16), per ADI's `/32768` convention;
+    # the rail is the max representable magnitude, 2**(N-1)-1.
+    fs_ref = 1 << (n_bits - 1)
+    rail = full_scale(n_bits)
     peak = int(per_sample_peak.max())
     peak_index = int(per_sample_peak.argmax())
-    railed = int(np.count_nonzero(per_sample_peak >= fs))
-    peak_dbfs = 20.0 * np.log10(peak / fs) if peak > 0 else float("-inf")
+    railed = int(np.count_nonzero(per_sample_peak >= rail))
+    peak_dbfs = 20.0 * np.log10(peak / fs_ref) if peak > 0 else float("-inf")
     return ClipReport(
         peak_dbfs=float(peak_dbfs),
         railed_samples=railed,

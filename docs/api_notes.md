@@ -4,6 +4,10 @@ Source: decompiled CHM help shipped with TES build 6.4.0.x
 (`AdrvTrx_TCPIP_Client_DLL.chm`, `adrv9025.chm`). Namespace is **`adrv9010_dll`**.
 Doc generated 2022-06-28. These are the host-callable (pythonnet) signatures.
 
+**Update:** the two previously-open blockers (PerformRx readback, PerformTx packing)
+plus channel enable/disable are now RESOLVED from working ADI sample scripts the
+user supplied — see "Resolved from ADI samples" at the bottom.
+
 Object model: `AdiEvaluationSystem.Instance` → `.platform.board` is an
 **`AdrvDaughterCard`** (top-level). Device sub-API via `link.Adrv9010Get(1)` →
 `.Rx`, `.Tx`, `.RadioCtrl`, `.Cals`, `.Hal`, `.DataInterface`, etc.
@@ -111,4 +115,53 @@ profile; confirm effective DAC range against `DacFullScale*` on hardware.
 - Retune via `PllFrequencySet` + `PllStatusGet` poll.
 
 Open (hardware-only) confirmations: exact `RxDecPowerGet` behavior/latency on ORx,
-effective DAC full-scale vs Np, and `PerformTx` int[] sample packing (real vs I/Q interleave).
+and effective DAC full-scale vs Np.
+
+---
+
+## Resolved from ADI sample scripts (user-supplied)
+
+Two ADI examples (a DPD/CLGC script and an Rx-capture script) confirm runtime
+behavior the CHM didn't:
+
+### PerformRx readback — RESOLVED
+```python
+rx_data = board.PerformRx(FpgaTypes...IMM_TRIG, 255, capture_ms, timeout_ms)
+rx1I = rx_data[0]; rx1Q = rx_data[1]; rx2I = rx_data[2]; ...  Orx1I = rx_data[8] ...
+```
+Returns a **flat indexable of already-scaled int arrays**, interleaved
+`[ch0_I, ch0_Q, ch1_I, ch1_Q, ...]` in ascending channel order. No `ScaleRx` call
+needed. **ORx availability is profile-dependent** (link-sharing mask `0xFF` returned
+only ORx1 & ORx3 → 12 arrays). `captureTime`/`timeout` are in **ms**.
+→ implemented in `capture.extract_channels`.
+
+### PerformTx packing — RESOLVED
+```python
+tx_data = ArrayList()
+tx_data.Add(Tx1Iarray); tx_data.Add(Tx1Qarray); tx_data.Add(Tx2Iarray); ...
+board.PerformTx(FpgaTypes...TX_IMM_TRIG, tx_data, 255)
+```
+**Separate I and Q int arrays per channel** (two arrays/channel), ascending order —
+NOT packed `(I<<16|Q)` or single-array interleaved. → `transmit.build_tx_data`.
+
+### Channel enable + TX stop — RESOLVED (was missing entirely)
+`device.RadioCtrl.RxTxEnableSet(rxMask, txMask)` sets both at once. Capture enables
+Rx first (`0x0F`); TX flow is **disable → PerformTx → enable** (`RxTxEnableSet(rx, 0x01)`).
+Clearing the TX mask **stops** playback → used by `safe_state`/`disable_tx`.
+
+### Full-scale code — RESOLVED
+ADI uses `20*log10(sqrt(pwr)/32768)`, i.e. dBFS reference = `2**(Np-1)` (32768 for
+Np=16). `clip_report` uses this reference; quantization clips at `2**(Np-1)-1`.
+
+### Bonus API confirmed (for later)
+- **NCO:** `Tx.TxNcoShifterSet(adi_adrv9025_TxNcoShifterCfg_t{shifterMode=MIX,
+  shiftFrequency_kHz, shiftGain, txChannelMask})` and `Rx.RxNcoShifterSet` — digital
+  band offset (multi-band within one channel).
+- **Main-Rx hardware AGC template:** `Agc.AgcCfgSet(adi_adrv9010_AgcCfg_t[], n)` +
+  `Rx.RxGainCtrlModeSet([RxAgcMode{agcMode=AGCSLOW}], n)`, with `agcPeak`
+  (apd/hb2 thresholds) and `agcPower` sub-structs. Confirms AGC is a main-Rx feature
+  (ORx stays manual → software leveling). Useful if main-Rx AGC is ever wanted.
+- **Connection accessor varies by board:** ADS9 uses `link.platform.board.*`; older
+  ADS8 samples use `link.Ads8.board.*`. We target ADS9 (`platform.board`).
+- **TX vectors are integer files** ("I⟶Q signed integers, equal length") — matches
+  our format; use `do_normalize=False` to preserve a fixed PeakScaling.

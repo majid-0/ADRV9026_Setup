@@ -51,5 +51,33 @@ def test_exit_forces_safe_and_disconnects(fake_radio):
 def test_perform_tx_marks_live_then_safe_clears(fake_radio):
     fake_radio.perform_tx([[1, 2, 3]], int(TxChannel.TX1), continuous=True)
     assert fake_radio._tx_live is True
+    assert fake_radio._en_tx == int(TxChannel.TX1)
     fake_radio.safe_state()
     assert fake_radio._tx_live is False
+    assert fake_radio._en_tx == 0
+
+
+def test_enable_masks_accumulate_and_apply(fake_radio):
+    fake_radio.enable_rx(0x0F)
+    assert (fake_radio._en_rx, fake_radio._en_tx) == (0x0F, 0)
+    fake_radio.enable_tx(int(TxChannel.TX1))
+    assert (fake_radio._en_rx, fake_radio._en_tx) == (0x0F, 0x1)
+    # most recent DLL call reflects both masks
+    rx, tx = fake_radio.device.RadioCtrl.RxTxEnableSet.call_args.args
+    assert (rx, tx) == (0x0F, 0x1)
+
+
+def test_disable_tx_keeps_rx(fake_radio):
+    fake_radio.enable_rx(0x0F)
+    fake_radio.enable_tx(0xF)
+    fake_radio.disable_tx()
+    assert fake_radio._en_rx == 0x0F
+    assert fake_radio._en_tx == 0
+
+
+def test_safe_state_stops_tx_enable(fake_radio):
+    fake_radio.enable_rx(0x0F)
+    fake_radio.enable_tx(0xF)
+    fake_radio.safe_state()
+    rx, tx = fake_radio.device.RadioCtrl.RxTxEnableSet.call_args.args
+    assert tx == 0  # TX playback stopped

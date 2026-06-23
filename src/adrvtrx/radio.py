@@ -41,6 +41,8 @@ class Radio:
         self._connected = False
         self._tx_live = False
         self._safe_hooks_installed = False
+        self._en_rx = 0  # tracked RxTxEnableSet state (rx + tx set atomically together)
+        self._en_tx = 0
         # Resolved on connect:
         self.link = None
         self.board = None
@@ -124,18 +126,46 @@ class Radio:
     def force_safe(self) -> None:
         """Force TX to a known-safe state regardless of prior state (run on startup)."""
         self.set_tx_atten(TxChannel.ALL, MAX_TX_ATTEN_DB)
+        self._disable_tx_quiet()
         self._tx_live = False
 
     def safe_state(self) -> None:
-        """Force max TX attenuation. Cheap and idempotent; called on every exit path."""
+        """Stop TX and force max attenuation. Cheap, idempotent; called on every exit."""
         if not self._connected:
             return
         try:
             self.set_tx_atten(TxChannel.ALL, MAX_TX_ATTEN_DB)
         except Exception:
             pass
-        finally:
-            self._tx_live = False
+        self._disable_tx_quiet()
+        self._tx_live = False
+
+    def _disable_tx_quiet(self) -> None:
+        """Best-effort: clear the TX enable mask (stops playback) without raising."""
+        try:
+            self.rx_tx_enable(self._en_rx, 0)
+        except Exception:
+            pass
+
+    # -- channel enables (RxTxEnableSet sets rx + tx together) ------------------
+
+    def rx_tx_enable(self, rx_mask: int, tx_mask: int) -> None:
+        """Set the absolute Rx/Tx enable masks (both applied in one DLL call)."""
+        self._en_rx = int(rx_mask)
+        self._en_tx = int(tx_mask)
+        self.device.RadioCtrl.RxTxEnableSet(self._en_rx, self._en_tx)
+
+    def enable_rx(self, mask: int) -> None:
+        """Add channels to the Rx enable mask (keeps current TX state)."""
+        self.rx_tx_enable(self._en_rx | int(mask), self._en_tx)
+
+    def enable_tx(self, mask: int) -> None:
+        """Add channels to the Tx enable mask (keeps current Rx state)."""
+        self.rx_tx_enable(self._en_rx, self._en_tx | int(mask))
+
+    def disable_tx(self) -> None:
+        """Clear the Tx enable mask (stops playback), keep Rx enabled."""
+        self.rx_tx_enable(self._en_rx, 0)
 
     # -- programming (mirrors the init script, driven by config) ---------------
 
@@ -319,8 +349,8 @@ class Radio:
     ):
         """Arm + trigger a snapshot capture. Returns the DLL capture result object.
 
-        Higher-level shaping (per-channel int IQ arrays) lives in ``capture.py``;
-        the exact readback container is confirmed against hardware there.
+        The result is a flat indexable of already-scaled int arrays interleaved
+        ``[ch0_I, ch0_Q, ...]``; ``capture.extract_channels`` shapes it.
         """
         return self.board.PerformRx(
             self._rx_trig(trig), int(channel_mask), float(capture_time_ms), int(timeout_ms)
@@ -334,10 +364,16 @@ class Radio:
         trig: TxTrigSource = TxTrigSource.IMMEDIATE,
         continuous: bool = True,
     ) -> None:
-        """Load per-channel sample buffers and start playback (looping if continuous)."""
+        """Load per-channel sample buffers and start playback (looping if continuous).
+
+        Mirrors the ADI sample: disable TX, load the buffers, then enable the TX
+        channels so playback runs.
+        """
+        self.disable_tx()
         self.board.PerformTx(
             self._tx_trig(trig), tx_data, int(channel_mask), 1 if continuous else 0
         )
+        self.enable_tx(int(channel_mask))
         self._tx_live = True
 
 

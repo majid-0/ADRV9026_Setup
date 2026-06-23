@@ -66,17 +66,30 @@ def channel_list(channel_mask: int) -> list[RxChannel]:
 
 
 def extract_channels(perform_rx_result, channels: list[RxChannel], bits: int) -> dict:
-    """Pull per-channel int IQ out of a ``PerformRx`` result via the DLL ScaleRx path.
+    """Pull per-channel int IQ out of a ``PerformRx`` result.
 
-    HARDWARE SEAM: the precise readback container is confirmed during bring-up
-    (docs/api_notes.md flags this). The expected shape is a list of int[] buffers
-    (I and Q per channel). Until confirmed on hardware, this raises clearly rather
-    than guessing silently.
+    Confirmed by ADI sample (docs/api_notes.md): the result is a flat indexable of
+    already-scaled int arrays, interleaved ``[ch0_I, ch0_Q, ch1_I, ch1_Q, ...]`` in
+    the same (ascending) order as ``channels``. ORx availability is profile
+    dependent, so only mask channels the loaded profile actually provides.
     """
-    raise NotImplementedError(
-        "extract_channels: confirm the PerformRx readback container on hardware "
-        "(see docs/api_notes.md). Expected: per-channel int[] I/Q from ScaleRx/ScaleRxSingle."
-    )
+    per: dict[RxChannel, tuple[np.ndarray, np.ndarray]] = {}
+    for k, ch in enumerate(channels):
+        try:
+            i_buf = perform_rx_result[2 * k]
+            q_buf = perform_rx_result[2 * k + 1]
+        except (IndexError, KeyError) as exc:
+            raise IndexError(
+                f"PerformRx returned fewer buffers than requested channels "
+                f"({len(channels)}); channel {ch.name} (index {k}) missing. "
+                f"On link-sharing profiles only some ORx exist -- mask only "
+                f"available channels."
+            ) from exc
+        per[ch] = (
+            np.fromiter(i_buf, dtype=np.int32),
+            np.fromiter(q_buf, dtype=np.int32),
+        )
+    return per
 
 
 def capture(
@@ -93,6 +106,8 @@ def capture(
     ``bits`` is the Rx datapath width (``ProfileInfo.rx_bits``).
     """
     chans = channel_list(channel_mask)
+    # Wake the main-Rx datapath before capturing (ORx rides along, per ADI sample).
+    radio.enable_rx(channel_mask & 0x0F or 0x0F)
     raw = radio.perform_rx(channel_mask, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
     per_channel = extract_channels(raw, chans, bits)
     result = CaptureResult(capture_time_ms=capture_time_ms, trig=trig)

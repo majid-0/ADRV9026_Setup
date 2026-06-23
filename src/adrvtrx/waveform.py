@@ -70,12 +70,19 @@ def quantize(iq_norm: np.ndarray, n_bits: int) -> tuple[np.ndarray, np.ndarray]:
 def prepare_tx(
     iq: np.ndarray, n_bits: int, *, do_normalize: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Full TX pipeline: (optionally normalize) then quantize to ``n_bits``.
+    """TX pipeline producing signed int ``(i_int, q_int)`` for ``PerformTx``.
 
-    Returns ``(i_int, q_int)`` ready to be packed for ``PerformTx``.
+    * ``do_normalize=True`` (floats): scale to unit peak, then quantize to full scale.
+    * ``do_normalize=False`` (already in integer code units, e.g. ADI vectors):
+      round + clip to the signed range, with NO rescaling.
     """
-    work = normalize(iq) if do_normalize else iq
-    return quantize(work, n_bits)
+    if do_normalize:
+        return quantize(normalize(iq), n_bits)
+    fs = full_scale(n_bits)
+    lo, hi = -(fs + 1), fs
+    i_int = np.clip(np.round(iq.real), lo, hi).astype(np.int32)
+    q_int = np.clip(np.round(iq.imag), lo, hi).astype(np.int32)
+    return i_int, q_int
 
 
 def save_tab_iq_float(
