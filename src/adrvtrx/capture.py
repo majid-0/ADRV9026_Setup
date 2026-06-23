@@ -245,7 +245,7 @@ def measure_delay(
     captures -- the reference's TX must already be running. ``fs`` is the ORx rate
     (``ProfileInfo.orx_rate_hz``).
     """
-    from .align import estimate_and_align, estimate_delay
+    from .align import estimate_delay, match_corr
 
     ref = np.asarray(reference)
     capture_time_ms = oversample * len(ref) / float(fs) * 1e3
@@ -254,12 +254,7 @@ def measure_delay(
     y = cap.i.astype(np.float64) + 1j * cap.q.astype(np.float64)
 
     delay = estimate_delay(ref, y, fs)
-    xa, ya, _ = estimate_and_align(ref, y, fs)
-    m = min(len(xa), len(ya))
-    a = np.asarray(xa[:m], dtype=np.complex128)
-    b = np.asarray(ya[:m], dtype=np.complex128)
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
-    corr = float(np.abs(np.vdot(a, b)) / denom)
+    corr = match_corr(ref, y, fs)  # in-band: ~1.0 for a clean band even in dual-band
     return delay, delay / float(fs) * 1e9, corr
 
 

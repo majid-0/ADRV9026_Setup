@@ -7,10 +7,10 @@ pythonnet; only the .NET boundary in ``_clr`` / ``radio`` needs it.
 from __future__ import annotations
 
 from ._enums import RxChannel, RxTrigSource, TxChannel, TxTrigSource
-from .align import apply_delay, estimate_and_align, estimate_delay
+from .align import apply_delay, estimate_and_align, estimate_delay, match_corr
 from .bands import Band, make_bands, run_bands
 from .capture import measure_delay
-from .config import Config, load_config
+from .config import Config, lo_for_tx, load_config
 from .gain import ClipReport, autolevel_orx, clip_report, level_orx, peak_window
 from .profile import ProfileInfo, read_profile
 from .sweep import SweepAxis, run_sweep, sweep_points
@@ -21,6 +21,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Config",
     "load_config",
+    "lo_for_tx",
     "RxChannel",
     "TxChannel",
     "RxTrigSource",
@@ -40,6 +41,7 @@ __all__ = [
     "estimate_delay",
     "estimate_and_align",
     "apply_delay",
+    "match_corr",
     "measure_delay",
     "Band",
     "make_bands",

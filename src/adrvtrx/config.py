@@ -162,6 +162,15 @@ def _levels_from(raw: dict[str, Any]) -> LevelsConfig:
     return levels
 
 
+def lo_for_tx(clocks: ClocksConfig, tx_channel) -> str:
+    """Which LO ('LO1'/'LO2') a TX channel uses, per the per-pair clock select.
+
+    TX1/TX2 follow ``tx12_lo``; TX3/TX4 follow ``tx34_lo``. Use this to retune the
+    right LO for a given TX (e.g. a frequency sweep of TX2 should retune its LO).
+    """
+    return clocks.tx12_lo if int(tx_channel) & 0x03 else clocks.tx34_lo
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     """Load config from ``path``, or from the ``ADRVTRX_CONFIG`` env var, or the
     bundled ``config/default.toml``."""

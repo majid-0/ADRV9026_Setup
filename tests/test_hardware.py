@@ -152,7 +152,8 @@ def test_measure_delay_matches_reference(hw):
     try:
         # Level the ORx so the capture has SNR (default programmed gain can be near floor).
         def _pk():
-            cap = capture(radio, int(RxChannel.ORX2), 0.05, bits=info.rx_bits).channels[RxChannel.ORX2]
+            res = capture(radio, int(RxChannel.ORX2), 0.05, bits=info.rx_bits)
+            cap = res.channels[RxChannel.ORX2]
             return clip_report(cap.i, cap.q, info.rx_bits).peak_dbfs
 
         autolevel_orx(lambda g: radio.set_rx_gain(RxChannel.ORX2, g), _pk, target_dbfs=-15.0)
