@@ -124,8 +124,17 @@ class Radio:
             pass  # best effort during interpreter shutdown
 
     def force_safe(self) -> None:
-        """Force TX to a known-safe state regardless of prior state (run on startup)."""
-        self.set_tx_atten(TxChannel.ALL, MAX_TX_ATTEN_DB)
+        """Best-effort: force TX safe regardless of prior state (run on startup).
+
+        On a freshly-connected board not yet programmed, ``TxAttenSet`` is rejected
+        ("Invalid Tx attenuation control mode") -- which is fine, an unconfigured
+        device isn't transmitting. So this is best-effort, like :meth:`safe_state`;
+        ``program()`` establishes a valid atten mode and applies real levels.
+        """
+        try:
+            self.set_tx_atten(TxChannel.ALL, MAX_TX_ATTEN_DB)
+        except Exception:
+            pass
         self._disable_tx_quiet()
         self._tx_live = False
 
