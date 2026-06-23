@@ -73,13 +73,20 @@ def run_bands(
                     tolerance_db=orx_tolerance_db,
                 )
 
-    # 3. One aligned snapshot over the union of capture channels.
-    capture_mask = 0
-    for b in bands:
-        capture_mask |= int(b.capture_channel)
+    # 3. Capture each band's channel in its OWN snapshot. Enabling two ORx inputs
+    #    at once mis-routes on this hardware (one band bleeds into both ORx ADC
+    #    slots, so a union capture returns the wrong band on one slot); a per-channel
+    #    capture is required for correct multiband data. The trade-off is that the
+    #    bands are no longer mutually sample-aligned -- fine for per-band level/delay/
+    #    save, which is what this returns.
     trig = trig if trig is not None else _sof_trigger(bands)
     longest = max(b.capture_time_ms for b in bands)
-    result = capture(radio, capture_mask, longest, trig=trig, bits=rx_bits)
+    result = CaptureResult(capture_time_ms=longest, trig=trig)
+    for b in bands:
+        one = capture(radio, int(b.capture_channel), b.capture_time_ms, trig=trig, bits=rx_bits)
+        cap = one.channels.get(b.capture_channel)
+        if cap is not None:
+            result.channels[b.capture_channel] = cap
 
     # 4. Save each band's capture channel under the band name.
     out_dir = Path(out_dir)
