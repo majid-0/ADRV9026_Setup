@@ -89,6 +89,20 @@ def extract_channels(perform_rx_result, channels: list[RxChannel], bits: int) ->
             np.fromiter(i_buf, dtype=np.int32),
             np.fromiter(q_buf, dtype=np.int32),
         )
+    # Guard: if MORE buffers came back than channels requested, the build is
+    # returning all available channels regardless of mask -> positional mapping
+    # would be wrong. Fail loudly with guidance instead of silently mis-mapping.
+    try:
+        perform_rx_result[2 * len(channels)]
+    except (IndexError, KeyError):
+        pass  # exact count -> mask honored, mapping is correct
+    else:
+        raise RuntimeError(
+            "PerformRx returned more channel buffers than the requested mask "
+            f"({len(channels)} channels). This build appears to return all available "
+            "channels regardless of mask; capture with the full available mask and "
+            "index by absolute channel order (see docs/api_notes.md / hw_smoke.py)."
+        )
     return per
 
 
