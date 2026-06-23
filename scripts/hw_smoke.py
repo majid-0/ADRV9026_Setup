@@ -57,31 +57,64 @@ def channel_powers(raw, n_bits: int):
     return rows
 
 
-def slot_label(idx, n, order, orx_seen):
-    """Physical-truth label for a readback slot.
+ORX_FLOOR_MARGIN_DB = 10.0  # a slot must beat the idle floor by this to count as carrying the input
 
-    The ADRV9026 has only TWO ORx ADCs: the populated ORx slots are those two
-    converters, not the four bit-order names ORX1..ORX4. Label the real ones
-    ORxADC0/1 (in the order they appear) and the converter-less bits ORx(none).
+
+def orx_readback_slots(rows, order):
+    """Readback indices of the physical ORx ADC slots that actually carry data."""
+    return [
+        idx
+        for idx, n, _d in rows
+        if idx < len(order) and order[idx] and is_orx(order[idx]) and n > 0
+    ]
+
+
+def resolve_selected_orx(rows, order, selected, floor_dbfs):
+    """Label the physical ORx slots in terms of the ORx INPUT that was selected.
+
+    You enable ORx1/2/3/4; its data lands on one of the 2 ORx ADC slots. The slot
+    that rises above the idle floor is the one carrying ``selected`` -- so we name
+    it after the input you picked (e.g. ``ORX2``). Returns ``(labels, note)`` and
+    refuses to guess when zero slots (input not landing) or several slots (a spur
+    lighting everything) are hot.
     """
-    ch = order[idx] if idx < len(order) and order[idx] else None
-    if ch is None:
-        return "-"
-    if is_orx(ch):
-        if n > 0:
-            label = f"ORxADC{orx_seen[0]}"
-            orx_seen[0] += 1
-            return label
-        return "ORx(none)"
-    return ch.name
+    by_idx = {idx: d for idx, _n, d in rows}
+    slots = orx_readback_slots(rows, order)
+    labels = dict.fromkeys(slots, "ORx(off)")
+    hot = [
+        idx
+        for idx in slots
+        if np.isfinite(by_idx[idx]) and by_idx[idx] > floor_dbfs + ORX_FLOOR_MARGIN_DB
+    ]
+    if len(hot) == 1:
+        labels[hot[0]] = selected.name
+        return labels, f"{selected.name} -> readback idx {hot[0]} at {by_idx[hot[0]]:+.1f} dBFS"
+    if not hot:
+        return labels, (
+            f"{selected.name}: NOT LANDING -- no ORx slot beat the idle floor by "
+            f"{ORX_FLOOR_MARGIN_DB:.0f} dB (check cable / TX level)"
+        )
+    for idx in hot:
+        labels[idx] = f"{selected.name}?"
+    idxs = ", ".join(str(i) for i in hot)
+    return labels, (
+        f"{selected.name}: AMBIGUOUS -- idx {idxs} all hot at ~{by_idx[hot[0]]:+.1f} dBFS "
+        f"(looks like a spur, not a clean tone)"
+    )
 
 
-def print_table(rows, order, header):
+def print_table(rows, order, header, orx_label=None):
+    orx_label = orx_label or {}
     print(f"    {header}")
     print(f"    {'idx':>3}  {'channel':<9}  {'n':>7}  rms_dBFS")
-    orx_seen = [0]  # mutable counter of physical ORx ADCs seen so far
     for idx, n, dbfs in rows:
-        name = slot_label(idx, n, order, orx_seen)
+        ch = order[idx] if idx < len(order) and order[idx] else None
+        if ch is not None and is_orx(ch):
+            name = orx_label.get(idx) or ("ORx(none)" if n == 0 else "ORx")
+        elif ch is not None:
+            name = ch.name
+        else:
+            name = "-"
         d = f"{dbfs:+.1f}" if np.isfinite(dbfs) else "  -inf"
         print(f"    {idx:>3}  {name:<9}  {n:>7}  {d}")
 
@@ -107,32 +140,35 @@ def main() -> None:
         # [1] Idle baseline -- power of every returned channel, no TX.
         print("\n[1] Idle channel powers (rx_init_mask = " f"0x{cfg.channels.rx_init_mask:X})")
         raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
-        print_table(channel_powers(raw, info.rx_bits), order, "baseline, no TX:")
+        idle_rows = channel_powers(raw, info.rx_bits)
+        idle_slots = orx_readback_slots(idle_rows, order)
+        print_table(idle_rows, order, "baseline, no TX:", dict.fromkeys(idle_slots, "ORx(idle)"))
+        idle_floor = max(
+            (d for i, _n, d in idle_rows if i in idle_slots and np.isfinite(d)), default=-100.0
+        )
 
-        # [2] Per-TX probe. The ADRV9026 has only 2 ORx ADCs (data idx 4 & 5);
-        # ORx1/2/3/4 are front-end inputs muxed into them. Enable the ORx input for
-        # this TX (rxMask bit: ORx2=0x20, ORx3=0x40) so its front-end powers up, then
-        # see which of idx 4/5 carries the tone.
-        print("\n[2] TX probe -- enable the ORx input + transmit, see which ORx ADC responds")
+        # [2] Per-input probe: select an ORx INPUT (ORx1/2/3/4), transmit its TX,
+        # and the readback names that input on whichever slot carries it -- so the
+        # feedback is in your terms, not ADC indices.
+        print("\n[2] ORx probe -- select an ORx input, transmit, read it back by name")
         tone = make_tone(TONE_SAMPLES, TONE_HZ, info.tx_rate_hz)
         for tx, orx in PAIRS:
             radio.set_tx_atten(tx, PROBE_TX_ATTEN_DB)
-            radio.rx_tx_enable(0x0F | int(orx), 0)  # main Rx + this ORx front-end
+            radio.rx_tx_enable(0x0F | int(orx), 0)  # main Rx + this ORx input
             transmit_bands(radio, {tx: tone}, info.tx_bits, continuous=True)
             raw = radio.perform_rx(cfg.channels.rx_init_mask, CAPTURE_MS, timeout_ms=1000)
             rows = channel_powers(raw, info.rx_bits)
+            labels, note = resolve_selected_orx(rows, order, orx, idle_floor)
             print_table(
                 rows,
                 order,
-                f"{tx.name} -> {orx.name} input enabled (rxMask 0x{0x0F | int(orx):X}):",
+                f"{tx.name} -> {orx.name} selected (rxMask 0x{0x0F | int(orx):X}):",
+                labels,
             )
-            orx_slots = [r for r in rows if r[0] in (4, 5) and np.isfinite(r[2])]
-            hot = max(orx_slots, key=lambda r: r[2]) if orx_slots else None
-            if hot:
-                print(f"      -> {tx.name} energy on ORx ADC idx {hot[0]} at {hot[2]:+.1f} dBFS")
+            print(f"      -> {note}")
             radio.disable_tx()
 
-        print("\nDone. The ORx ADC idx that lights up per TX is the real data slot.")
+        print("\nDone. Each ORx input you select is labeled by name on the slot it lands on.")
 
 
 if __name__ == "__main__":

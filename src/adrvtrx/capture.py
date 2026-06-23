@@ -16,13 +16,24 @@ from pathlib import Path
 
 import numpy as np
 
-from ._enums import RX_SINGLE, RxChannel, RxTrigSource
+from ._enums import RX_SINGLE, RxChannel, RxTrigSource, is_orx
 from .gain import ClipReport, clip_report, peak_window
 from .waveform import samples_for_duration, save_tab_iq_float
 
 #: Single-bit channel for each rxInitChannelMask bit we can name (bits 8/9 are
 #: internal/loopback Rx and map to None -- present in the readback but unnamed).
 _RX_BIT_TO_CHANNEL = {int(ch): ch for ch in RX_SINGLE}
+
+#: Which physical ORx ADC each ORx front-end input muxes into. The ADRV9026 has
+#: only 2 ORx ADCs: ORx1/ORx2 share ADC0, ORx3/ORx4 share ADC1. Confirmed on the
+#: bench (TX2->ORx2 lands on ADC0; enabling ORx1/2 zeros the ADC1 slot) and by
+#: ADI's rxDataCapture sample, whose readback slots are ...,ORx1,ORx3 (the 2 ADCs).
+_ORX_ADC_INDEX = {
+    RxChannel.ORX1: 0,
+    RxChannel.ORX2: 0,
+    RxChannel.ORX3: 1,
+    RxChannel.ORX4: 1,
+}
 
 
 @dataclass
@@ -83,22 +94,46 @@ def returned_channel_order(rx_init_mask: int) -> list[RxChannel | None]:
     return order
 
 
+def orx_slot_positions(order) -> list[int]:
+    """Readback positions of the physical ORx ADC slots, in ascending order.
+
+    Only TWO ORx ADCs exist; they occupy the first two ORx positions of the
+    readback (ADI's sample names them ORx1 and ORx3). Any further ORx bit
+    positions are empty placeholders with no converter.
+    """
+    return [i for i, ch in enumerate(order) if ch is not None and is_orx(ch)]
+
+
 def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
     """Extract ``wanted`` channels from a PerformRx result by absolute position.
 
     ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
-    the result holds 2 arrays (I, Q) per entry in ``order``. Returns
-    ``{channel: ChannelCapture}``.
+    the result holds 2 arrays (I, Q) per entry in ``order``. Main Rx channels sit
+    at their own bit position. ORx is different: the 4 ORx inputs mux into just 2
+    ADCs, so an ORx request resolves to one of the two physical ORx ADC slots
+    (ORx1/ORx2 -> slot 0, ORx3/ORx4 -> slot 1) -- confirmed on the bench and
+    against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
     """
     out: dict[RxChannel, ChannelCapture] = {}
+    orx_slots = orx_slot_positions(order)
     for ch in wanted:
-        if ch not in order:
+        if is_orx(ch):
+            adc = _ORX_ADC_INDEX[ch]
+            if adc >= len(orx_slots):
+                raise ValueError(
+                    f"{ch.name} maps to ORx ADC{adc}, but the readback exposes "
+                    f"{len(orx_slots)} ORx slot(s) for this rxInitChannelMask. "
+                    f"Enable ORx in config [channels].rx_init_mask."
+                )
+            idx = orx_slots[adc]
+        elif ch in order:
+            idx = order.index(ch)
+        else:
             raise ValueError(
                 f"{ch.name} is not in the active rxInitChannelMask "
                 f"(returned channels: {[c.name for c in order if c]}). "
                 f"Enable it in config [channels].rx_init_mask."
             )
-        idx = order.index(ch)
         i = np.fromiter(perform_rx_result[2 * idx], dtype=np.int32)
         q = np.fromiter(perform_rx_result[2 * idx + 1], dtype=np.int32)
         out[ch] = ChannelCapture(ch, i, q, bits)
@@ -122,7 +157,12 @@ def capture(
     """
     rx_init = radio.config.channels.rx_init_mask
     order = returned_channel_order(rx_init)
-    radio.enable_rx(rx_init & 0x0F)  # enable main-Rx framer; ORx rides it (link-sharing)
+    wanted = channel_list(channel_mask)
+    # Enable the main-Rx framer (ORx rides it in link-sharing) plus any requested
+    # ORx INPUT bits -- an ORx front-end reads zeros until its enable bit is set.
+    # Absolute set (preserving TX) so a prior capture's ORx enable can't leak in.
+    orx_bits = sum(int(ch) for ch in wanted if is_orx(ch))
+    radio.rx_tx_enable((rx_init & 0x0F) | orx_bits, radio._en_tx)
     raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
 
     # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
@@ -138,7 +178,6 @@ def capture(
             f"the actual count)."
         )
 
-    wanted = channel_list(channel_mask)
     result = CaptureResult(capture_time_ms=capture_time_ms, trig=trig)
     result.channels.update(extract_channels(raw, order, wanted, bits))
     return result

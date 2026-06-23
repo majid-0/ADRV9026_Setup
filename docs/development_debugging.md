@@ -240,15 +240,20 @@ probes rather than guessing struct/index semantics.
 Confirmed working on hardware: connect, **program** (PLLs lock `0xF`, LO readback exact),
 PerformRx readback + per-slot decode, PerformTx (8-array), channel enable.
 
-**In progress — TX→ORx loopback / ORx observation.** The tone was not appearing because
-the ORx input wasn't enabled; the probe now enables `0x0F | ORx-bit` per TX. Awaiting the
-bench result of "which ORx ADC (idx 4 or 5) lights up for TX2 and for TX3."
+**DONE — TX→ORx loopback / ORx capture model.** Confirmed on the bench and against ADI's
+`rxDataCapture` sample (which unpacks the readback as `...,ORx1,ORx3`): there are **2 ORx
+ADCs**, and the 4 ORx inputs mux into them in fixed pairs — **ORx1/ORx2 → ADC0 (readback
+slot 0), ORx3/ORx4 → ADC1 (slot 1)**. Evidence: enabling ORx1/ORx2 lights slot 0 and zeros
+slot 1; TX2→ORx2 lands on slot 0; ADI names the slots ORx1/ORx3. `capture.py` now resolves
+an ORx request to its ADC slot (`_ORX_ADC_INDEX`) instead of the old bit-order position,
+and `capture()` enables the requested ORx **input bit** (an ORx reads zeros until enabled).
+All 8 `-m hardware` tests pass, incl. `TX2→ORx2` and `TX3→ORx3`.
 
-Once the loopback is confirmed, the **capture model needs a redesign**: ORx is **2 ADC
-data slots + a front-end mux**, not the current `ORX1..ORX4`-as-slots model. Capture should
-expose the 2 ORx ADC streams and let the caller pick the front-end input (via enable bit +
-tx→orx mapping). The user's wiring is **TX2→ORx2 input, TX3→ORx3 input**, to be observed
-on the two ORx ADCs.
+**Open — TX3 cleanliness.** With TX3 transmitting, every readback slot reads a uniform
+~−46.7 dBFS (`hw_smoke` flags this AMBIGUOUS), unlike TX2's clean single-slot tone. Looks
+like a TX3/LO spur, not the loopback tone landing on one ADC. The `TX3→ORx3` loopback test
+passes (slot 1 is above the floor) but the signal isn't clean — chase the spur (LO2 now at
+1.0 GHz, see [lo] in config) before trusting TX3 ORx data.
 
 Still bench-only: `RxDecPowerGet` arming, effective DAC full-scale vs Np, crash-recovery.
 

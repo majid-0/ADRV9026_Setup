@@ -79,14 +79,24 @@ def test_returned_channel_order_full_mask():
     assert order[8] is None and order[9] is None  # internal/loopback bits
 
 
-def test_extract_by_absolute_position():
+def test_extract_orx_by_adc_slot():
     order = returned_channel_order(0x3FF)
     # 20 arrays; pair k encodes its own index so we can check positions.
     raw = [np.array([k]) for k in range(20)]
     per = extract_channels(raw, order, [RxChannel.ORX2, RxChannel.ORX3], 16)
-    # ORX2 is order index 5 -> arrays [10],[11]; ORX3 index 6 -> [12],[13]
-    assert per[RxChannel.ORX2].i[0] == 10 and per[RxChannel.ORX2].q[0] == 11
-    assert per[RxChannel.ORX3].i[0] == 12 and per[RxChannel.ORX3].q[0] == 13
+    # Only 2 physical ORx ADCs: ORx1/ORx2 -> slot 0 (order idx 4 -> arrays [8],[9]),
+    # ORx3/ORx4 -> slot 1 (order idx 5 -> arrays [10],[11]). Bench- + ADI-confirmed.
+    assert per[RxChannel.ORX2].i[0] == 8 and per[RxChannel.ORX2].q[0] == 9
+    assert per[RxChannel.ORX3].i[0] == 10 and per[RxChannel.ORX3].q[0] == 11
+
+
+def test_extract_orx1_and_orx2_share_adc0():
+    order = returned_channel_order(0x3FF)
+    raw = [np.array([k]) for k in range(20)]
+    per = extract_channels(raw, order, [RxChannel.ORX1, RxChannel.ORX2], 16)
+    # Both front-ends of ADC0 resolve to the same slot 0 (arrays [8],[9]).
+    assert per[RxChannel.ORX1].i[0] == 8
+    assert per[RxChannel.ORX2].i[0] == 8
 
 
 def test_extract_channel_not_in_mask_raises():
