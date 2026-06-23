@@ -57,6 +57,33 @@ def test_perform_tx_marks_live_then_safe_clears(fake_radio):
     assert fake_radio._en_tx == 0
 
 
+def test_status_reports_tx_off_from_hardware_readback(fake_radio):
+    # (retcode, rxMask, txMask) -> nothing enabled.
+    fake_radio.device.RadioCtrl.RxTxEnableGet.return_value = (0, 0, 0)
+    st = fake_radio.status()
+    assert st["tx_off"] is True
+    assert st["tx_enabled"] == []
+    assert st["enable_source"] == "hardware"
+    for key in ("connected", "pll_lock", "lo1_hz", "lo2_hz", "rx_enabled", "tx_atten_db"):
+        assert key in st
+
+
+def test_status_decodes_enabled_channels(fake_radio):
+    fake_radio.device.RadioCtrl.RxTxEnableGet.return_value = (0, 0x0F, int(TxChannel.TX2))
+    st = fake_radio.status()
+    assert st["tx_off"] is False
+    assert "TX2" in st["tx_enabled"]
+    assert "RX1" in st["rx_enabled"] and "RX4" in st["rx_enabled"]
+
+
+def test_status_degrades_to_tracked_when_readback_fails(fake_radio):
+    fake_radio.device.RadioCtrl.RxTxEnableGet.side_effect = RuntimeError("boom")
+    fake_radio.enable_tx(int(TxChannel.TX1))  # sets the tracked mask
+    st = fake_radio.status()
+    assert st["enable_source"] == "tracked"
+    assert "TX1" in st["tx_enabled"]
+
+
 def test_enable_masks_accumulate_and_apply(fake_radio):
     fake_radio.enable_rx(0x0F)
     assert (fake_radio._en_rx, fake_radio._en_tx) == (0x0F, 0)

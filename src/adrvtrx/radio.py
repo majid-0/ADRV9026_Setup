@@ -176,6 +176,11 @@ class Radio:
         """Clear the Tx enable mask (stops playback), keep Rx enabled."""
         self.rx_tx_enable(self._en_rx, 0)
 
+    def rx_tx_enable_get(self) -> tuple[int, int]:
+        """Read the live ``(rxChannelMask, txChannelMask)`` enable state from hardware."""
+        res = self.device.RadioCtrl.RxTxEnableGet(0, 0)
+        return int(res[1]), int(res[2])
+
     # -- programming (mirrors the init script, driven by config) ---------------
 
     def program(self) -> None:
@@ -284,6 +289,14 @@ class Radio:
         arr[0] = item
         self.device.Tx.TxAttenSet(arr, 1)
 
+    def get_tx_atten(self, channel: TxChannel) -> float:
+        """Read back a single TX channel's attenuation in dB (TxAttenGet)."""
+        b = self.bridge
+        ch = b.enum("adi_adrv9010_TxChannels_e", _tx_channel_member(channel))
+        placeholder = b.Types.adi_adrv9010_TxAtten_t()
+        res = self.device.Tx.TxAttenGet(ch, placeholder)
+        return int(res[1].txAttenuation_mdB) / 1000.0
+
     def set_rx_gain(self, channel: RxChannel, gain_index: int) -> None:
         b = self.bridge
         arr = b.new_array("adi_adrv9010_RxGain_t", 1)
@@ -325,6 +338,69 @@ class Radio:
 
     def pll_lock_status(self) -> int:
         return int(self.adrv.RadioCtrl.PllStatusGet(0)[1])
+
+    # -- overall status --------------------------------------------------------
+
+    def status(self) -> dict:
+        """One-stop health/safety summary: connection, PLLs, LOs, channel enables,
+        TX attenuation, and whether TX is OFF.
+
+        Enable state is read back from hardware (``RxTxEnableGet``); if that read
+        fails it falls back to the masks we last commanded (marked in the dict).
+        ``tx_off`` is the quick answer to "is anything transmitting" -- True when no
+        TX channel is enabled.
+        """
+
+        def _safe(fn, default=None):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001 - status must never raise
+                return default
+
+        enable = _safe(self.rx_tx_enable_get)
+        if enable is not None:
+            rx_mask, tx_mask, source = enable[0], enable[1], "hardware"
+        else:
+            rx_mask, tx_mask, source = self._en_rx, self._en_tx, "tracked"
+
+        tx_on = [c.name for c in _enums.TX_SINGLE if tx_mask & int(c)]
+        rx_on = [c.name for c in _enums.RX_SINGLE if rx_mask & int(c)]
+        atten = {}
+        for c in _enums.TX_SINGLE:
+            db = _safe(lambda c=c: round(self.get_tx_atten(c), 2))
+            if db is not None:
+                atten[c.name] = db
+        lock = _safe(self.pll_lock_status)
+        pll = (
+            "n/a"
+            if lock is None
+            else (f"0x{lock:X}" + (" (all locked)" if lock == 0xF else " (NOT all locked)"))
+        )
+        return {
+            "connected": _safe(self._is_connected, False),
+            "pll_lock": pll,
+            "lo1_hz": _safe(lambda: self.get_lo("LO1")),
+            "lo2_hz": _safe(lambda: self.get_lo("LO2")),
+            "enable_source": source,
+            "tx_enabled": tx_on,
+            "rx_enabled": rx_on,
+            "tx_atten_db": atten,
+            "tx_off": tx_mask == 0,
+            "tx_live(tracked)": self._tx_live,
+        }
+
+    def print_status(self) -> dict:
+        """Pretty-print :meth:`status` (and return it) -- a quick bench check."""
+        st = self.status()
+        print("Radio status:")
+        print(f"  connected      : {st['connected']}")
+        print(f"  PLL lock       : {st['pll_lock']}")
+        print(f"  LO1 / LO2 (Hz) : {st['lo1_hz']} / {st['lo2_hz']}")
+        print(f"  TX enabled     : {st['tx_enabled'] or '(none)'}   [{st['enable_source']}]")
+        print(f"  Rx/ORx enabled : {st['rx_enabled'] or '(none)'}")
+        print(f"  TX atten (dB)  : {st['tx_atten_db']}")
+        print(f"  >> TX OFF      : {st['tx_off']}")
+        return st
 
     def retune_lo(self, pll: str, freq_hz: int, *, settle_poll: int = 50) -> int:
         """Set an LO and poll lock status until stable. Returns the lock bitmask.
@@ -401,6 +477,10 @@ class Radio:
 
 def _rx_channel_member(channel: RxChannel) -> str:
     return f"ADI_ADRV9010_{channel.name}"
+
+
+def _tx_channel_member(channel: TxChannel) -> str:
+    return f"ADI_ADRV9010_{channel.name}"  # TxChannel.TX1 -> ADI_ADRV9010_TX1
 
 
 def _fpga_enum(bridge, type_name: str, member_name: str, int_val: int):

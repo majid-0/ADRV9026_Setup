@@ -132,3 +132,16 @@ def test_safe_state_clears_tx_enable(hw):
     assert radio._en_tx != 0
     radio.safe_state()
     assert radio._en_tx == 0  # TX playback stopped
+
+
+def test_status_reads_back_from_hardware(hw):
+    from adrvtrx.radio import MAX_TX_ATTEN_DB
+
+    radio, _info = hw
+    radio.safe_state()
+    st = radio.status()
+    assert st["connected"] is True
+    assert st["enable_source"] == "hardware", "RxTxEnableGet readback failed"
+    assert st["tx_off"] is True, f"TX still enabled: {st['tx_enabled']}"
+    assert st["tx_atten_db"], "TxAttenGet readback returned nothing"
+    assert all(v >= MAX_TX_ATTEN_DB - 0.1 for v in st["tx_atten_db"].values())
