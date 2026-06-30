@@ -154,7 +154,8 @@ def test_measure_delay_matches_reference(hw):
         def _pk():
             res = capture(radio, int(RxChannel.ORX2), 0.05, bits=info.rx_bits)
             cap = res.channels[RxChannel.ORX2]
-            return clip_report(cap.i, cap.q, info.rx_bits).peak_dbfs
+            rep = clip_report(cap.i, cap.q, info.rx_bits)
+            return rep.peak_dbfs, rep.railed_samples
 
         autolevel_orx(lambda g: radio.set_rx_gain(RxChannel.ORX2, g), _pk, target_dbfs=-15.0)
         d, ns, corr = measure_delay(

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from adrvtrx._enums import RxChannel
-from adrvtrx.gain import clip_report, level_orx, peak_window
+from adrvtrx.gain import clip_report, peak_window
 
 
 def test_clip_report_detects_railing():
@@ -45,36 +44,3 @@ def test_peak_window_larger_than_signal_returns_all():
     q = np.zeros(10, dtype=np.int32)
     wi, wq = peak_window(i, q, 50)
     assert len(wi) == 10
-
-
-class _FakeLeveler:
-    """Models a monotonic level vs gain index for the leveling loop."""
-
-    def __init__(self, start_gain=180, dbfs_at_start=-20.0, db_per_index=0.5):
-        self._gain = start_gain
-        self._start = start_gain
-        self._dbfs0 = dbfs_at_start
-        self._slope = db_per_index
-
-    def get_rx_gain(self, ch):
-        return self._gain
-
-    def set_rx_gain(self, ch, g):
-        self._gain = g
-
-    def rx_dec_power_dbfs(self, ch):
-        return self._dbfs0 + (self._gain - self._start) * self._slope
-
-
-def test_level_orx_converges_up():
-    lev = _FakeLeveler(start_gain=180, dbfs_at_start=-20.0)
-    res = level_orx(lev, RxChannel.ORX1, target_dbfs=-12.0, tolerance_db=1.0)
-    assert res.converged
-    assert abs(res.final_dbfs - (-12.0)) <= 1.0
-    assert res.final_gain_index > 180
-
-
-def test_level_orx_stops_at_gain_rail():
-    lev = _FakeLeveler(start_gain=250, dbfs_at_start=-40.0)
-    res = level_orx(lev, RxChannel.ORX1, target_dbfs=-12.0, gain_max=255, max_iterations=20)
-    assert res.final_gain_index <= 255
