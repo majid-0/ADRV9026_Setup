@@ -68,7 +68,14 @@ tx_atten_db   = { default = 30 }
 rx_gain_index = { default = 195 }   # applies to Rx1-4 and ORx1-4
 
 [orx_agc]
-# Software ORx leveling (flag-based: RxDecPowerGet + overload indicators).
-target_dbfs   = -12.0   # desired ORx peak/level setpoint
-tolerance_db  = 2.0     # acceptable window around target
-max_iterations = 12     # gain-step iterations before giving up
+# Software ORx AGC: levels on the captured-IQ peak with a railed-sample clip veto
+# (ORx has no hardware AGC; RxDecPowerGet is range-compressed and RxGainGet reads 0,
+# so the gain index is tracked in software). See docs/development_debugging.md.
+target_dbfs    = -1.0   # desired ORx peak setpoint (dBFS)
+tol_up_db      = 0.3    # accept up to target + this toward the rail
+tol_down_db    = 0.6    # accept down to target - this toward the floor
+coarse_ms      = 0.1    # short capture length for the coarse/fine stages (ms)
+max_iterations = 16     # Stage B fine-trim iterations before giving up
+gain_min       = 185    # usable ORx gain-table floor (clean & monotonic from here)
+gain_max       = 255    # ORx gain-table ceiling (rails hard at the very top)
+db_per_index   = 0.50   # measured ORx gain slope (dB per gain index)

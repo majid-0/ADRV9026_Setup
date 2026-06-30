@@ -17,8 +17,10 @@ parameterized from config.
 - **Captures** one sample-aligned snapshot (`PerformRx`) over any Rx **or** ORx
   channels, aligned to TX start-of-frame (`TXn_SOF` trigger). Saves normalized
   float `I⟶Q`.
-- **Levels ORx** in software (flag-based: `RxDecPowerGet` mdBFS + overload
-  indicators) — works without DPD. Reports clipping (peak dBFS, railed samples).
+- **Levels ORx** in software — an **ORx AGC** (`autolevel_capture`) on the captured-IQ
+  peak with a railed-sample clip veto, targeting an asymmetric dBFS band. ORx has no
+  hardware AGC and its overload flags / gain readback are unusable, so the gain index
+  is tracked in software. Reports clipping (peak dBFS, railed samples).
 - **Sweeps** frequency / attenuation / gain — 1-D and nested grids — with templated
   filenames and an interactive (inspect-then-proceed) mode.
 - Leaves **TX safe on every exit path** (context manager + `atexit` + signals) and
@@ -71,6 +73,20 @@ def action(point):
 run_sweep(axes, action)
 ```
 
+Declarative sweep plan (notebooks; per-block zip/grid, preview before run):
+
+```python
+from adrvtrx.sweep_plan import summarize_sweep_plan, run_planned_sweep, sweep_defaults_from_config
+
+SWEEP = {
+    "freq": {"mode": "zip", "lo1_hz": [1.0e9, 1.1e9], "lo2_hz": [0.9e9, 1.0e9]},
+    "power_db": {"mode": "grid", "shared": [13, 14, 15]},
+}
+defaults = sweep_defaults_from_config(cfg, BANDS)
+print(summarize_sweep_plan(BANDS, SWEEP, defaults))
+records = run_planned_sweep(radio, BANDS, SWEEP, action, defaults=defaults, tx_bits=info.tx_bits)
+```
+
 ## Develop / CI
 
 ```bash
@@ -92,11 +108,12 @@ src/adrvtrx/
   radio.py       context-managed driver: connect, program, safe-state, IO wrappers
   waveform.py    tab IQ load / normalize / quantize / float save
   profile.py     read jesd204Np + sample rates from a .profile JSON
-  gain.py        clip report, peak window, software ORx leveling loop
-  capture.py     PerformRx snapshot -> per-channel IQ, save
+  gain.py        clip report, peak window, software ORx AGC (autolevel_orx / verify_no_clip)
+  capture.py     PerformRx snapshot -> per-channel IQ, save, autolevel_capture AGC
   transmit.py    PerformTx multi-band buffers
   bands.py       Band primitive + single/dual/quad orchestration
-  sweep.py       1-D + nested-grid sweeps
+  sweep.py       Low-level SweepAxis + run_sweep
+  sweep_plan.py  Declarative multi-band sweep plans + summarize_sweep_plan
   experiment.py  session() convenience + status
   cli.py         adrvtrx-program entry point
 config/default.toml   all parameters (DLL path, board, profile, clocks, cals, levels)

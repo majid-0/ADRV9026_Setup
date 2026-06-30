@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from ._enums import RX_SINGLE, TX_SOF_FOR, RxChannel, RxTrigSource, TxChannel, is_orx
-from .gain import ClipReport, clip_report, peak_window
+from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
 from .waveform import samples_for_duration, save_tab_iq_float
 
 #: Single-bit channel for each rxInitChannelMask bit we can name (bits 8/9 are
@@ -256,6 +256,115 @@ def measure_delay(
     delay = estimate_delay(ref, y, fs)
     corr = match_corr(ref, y, fs)  # in-band: ~1.0 for a clean band even in dual-band
     return delay, delay / float(fs) * 1e9, corr
+
+
+@dataclass
+class AgcResult:
+    """Outcome of :func:`autolevel_capture` (the full A/B/C software ORx AGC)."""
+
+    final_gain_index: int
+    converged: bool
+    at_max_gain: bool
+    reason: str
+    coarse_peak_dbfs: float  # peak after Stages A+B (short captures)
+    final_peak_dbfs: float  # peak after Stage C verify (full signal), or == coarse
+    railed: int  # samples at the ADC rail at the final gain (0 when accepted)
+    fine_iters: int  # Stage B trim iterations
+    verify_steps: int  # Stage C back-off steps on the full signal
+
+
+def autolevel_capture(
+    radio,
+    channel: RxChannel,
+    *,
+    bits: int,
+    orx_rate_hz: float,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    coarse_ms: float = 0.1,
+    verify_capture_ms: float | None = None,
+    max_iterations: int = 16,
+) -> AgcResult:
+    """End-to-end software ORx AGC against live hardware (TX must already be running).
+
+    Wraps the pure stages in :mod:`adrvtrx.gain`:
+
+    * Builds ``set_gain`` and a coarse ``measure()`` (a ``coarse_ms`` capture ->
+      ``clip_report`` -> ``(peak_dbfs, railed)``) and runs :func:`autolevel_orx`
+      (Stages A+B) to settle the gain index.
+    * If ``verify_capture_ms`` is given, builds a full-duration ``measure_full()``
+      and runs :func:`verify_no_clip` (Stage C) to back off on full-signal clipping.
+
+    On any FATAL stage result it leaves the bench safe -- ``radio.safe_state()`` +
+    ``radio.disconnect()`` -- and raises :class:`~adrvtrx.gain.AgcError`. ORx
+    ``RxGainGet`` is unusable, so the gain index is tracked entirely in software here.
+
+    ``orx_rate_hz`` is the ORx datapath rate (``ProfileInfo.orx_rate_hz``); the caller
+    typically derives ``verify_capture_ms`` from it and the waveform length.
+    """
+
+    def set_gain(g: int) -> None:
+        radio.set_rx_gain(channel, g)
+
+    def coarse_measure() -> tuple[float, int]:
+        cap = capture(radio, int(channel), coarse_ms, bits=bits).channels[channel]
+        rep = clip_report(cap.i, cap.q, bits)
+        return rep.peak_dbfs, rep.railed_samples
+
+    lr = autolevel_orx(
+        set_gain,
+        coarse_measure,
+        target_dbfs=target_dbfs,
+        tol_up_db=tol_up_db,
+        tol_down_db=tol_down_db,
+        max_iterations=max_iterations,
+    )
+    if lr.fatal:
+        radio.safe_state()
+        radio.disconnect()
+        raise AgcError(lr.reason)
+
+    result = AgcResult(
+        final_gain_index=lr.final_gain_index,
+        converged=lr.converged,
+        at_max_gain=lr.at_max_gain,
+        reason=lr.reason,
+        coarse_peak_dbfs=lr.final_dbfs,
+        final_peak_dbfs=lr.final_dbfs,
+        railed=lr.railed,
+        fine_iters=lr.iterations,
+        verify_steps=0,
+    )
+
+    if verify_capture_ms is not None:
+
+        def full_measure() -> tuple[float, int]:
+            cap = capture(radio, int(channel), verify_capture_ms, bits=bits).channels[channel]
+            rep = clip_report(cap.i, cap.q, bits)
+            return rep.peak_dbfs, rep.railed_samples
+
+        vr = verify_no_clip(
+            set_gain,
+            full_measure,
+            lr.final_gain_index,
+            target_dbfs=target_dbfs,
+            tol_up_db=tol_up_db,
+        )
+        if vr.fatal:
+            radio.safe_state()
+            radio.disconnect()
+            raise AgcError(vr.reason)
+        result.final_gain_index = vr.final_gain_index
+        result.final_peak_dbfs = vr.final_dbfs
+        result.railed = vr.railed
+        result.verify_steps = vr.iterations
+        result.converged = lr.converged and vr.converged
+        if vr.iterations > 0:  # Stage C backed the gain off the max
+            result.at_max_gain = False
+            result.reason = vr.reason
+
+    return result
 
 
 def _result_len(raw) -> int | None:
