@@ -27,7 +27,7 @@ contradict or extend the documentation. Read this first, then `docs/api_notes.md
 ### Run things
 ```powershell
 $conda = "C:\ProgramData\anaconda3\Scripts\conda.exe"
-& $conda run -n myenv python -m pytest -m "not hardware" -q   # 48 mocked tests
+& $conda run -n myenv python -m pytest -m "not hardware" -q   # hardware-free unit tests (~75)
 & $conda run -n myenv python -m ruff check src tests scripts
 & $conda run -n myenv python -m black src tests scripts
 & $conda run -n myenv adrvtrx-program                          # connect + program + status
@@ -232,7 +232,7 @@ Design rules to preserve:
 
 ### Sweep plans (`sweep_plan.py`)
 
-Notebooks and bench scripts declare a `SWEEP` dict with up to three blocks:
+Sweep notebooks declare a `SWEEP` dict with up to three blocks:
 
 - **`freq`** — `lo1_hz`, `lo2_hz` (direct hardware LOs; two independent degrees of freedom).
 - **`power_db`** — per-band keys or `"shared"` (TX attenuation in dB).
@@ -248,8 +248,9 @@ paths) come from config + the `BANDS` wiring list.
 
 At each point `run_planned_sweep` → `retune_lo` (lock-checked) → `set_tx_atten` →
 `transmit_bands` (continuous) → notebook `action` runs ORx `autolevel_orx` + per-ORx
-capture (multiband requires separate ORx captures — see §4.1). Low-level `sweep.run_sweep`
-remains for scripts that build `SweepAxis` setters by hand (`agc_test_*.py`).
+capture (multiband requires separate per-ORx captures — see §4 item 1 and `bands.py`).
+Low-level `sweep.run_sweep` remains for scripts that build `SweepAxis` setters by hand
+(`agc_test_*.py`; `agc_test_dual.py` still uses a union ORx mask for short AGC-only reads).
 
 ---
 
