@@ -48,8 +48,9 @@ BANDS = [
 FREQS_HZ = [0.90e9, 1.00e9, 1.10e9]  # LO2 (TX+ORx) frequencies
 
 # ORx AGC ---------------------------------------------------------------------
-ORX_TARGET_DBFS = -15.0
-ORX_TOLERANCE_DB = 2.0
+ORX_TARGET_DBFS = -1.0
+ORX_TOL_UP_DB = 0.3  # accept up to target + this (toward the rail)
+ORX_TOL_DOWN_DB = 0.6  # accept down to target - this (toward the floor)
 CAPTURE_MS = 0.1
 # =============================================================================
 
@@ -73,7 +74,7 @@ def main() -> None:
                 f"{b['atten_db']:.1f} dB atten, {len(b['wave'])} samples"
             )
         print(
-            f"  target {ORX_TARGET_DBFS:+.1f}+/-{ORX_TOLERANCE_DB:.0f} dBFS | "
+            f"  target {ORX_TARGET_DBFS:+.1f} (+{ORX_TOL_UP_DB:.1f}/-{ORX_TOL_DOWN_DB:.1f}) dBFS | "
             f"gain window {ORX_GAIN_MIN}-{ORX_GAIN_MAX}"
         )
 
@@ -91,18 +92,20 @@ def main() -> None:
         for b in BANDS:
             cap_mask |= int(b["orx"])
 
-        def peak_dbfs(ch):
+        def measure(ch):
             cap = capture(radio, int(ch), CAPTURE_MS, bits=info.rx_bits).channels[ch]
-            return clip_report(cap.i, cap.q, info.rx_bits).peak_dbfs
+            rep = clip_report(cap.i, cap.q, info.rx_bits)
+            return rep.peak_dbfs, rep.railed_samples
 
         def action(point):
             row = dict(point)
             for b in BANDS:
                 lr = autolevel_orx(
                     lambda g, ch=b["orx"]: radio.set_rx_gain(ch, g),
-                    lambda ch=b["orx"]: peak_dbfs(ch),
+                    lambda ch=b["orx"]: measure(ch),
                     target_dbfs=ORX_TARGET_DBFS,
-                    tolerance_db=ORX_TOLERANCE_DB,
+                    tol_up_db=ORX_TOL_UP_DB,
+                    tol_down_db=ORX_TOL_DOWN_DB,
                 )
                 row[f"{b['name']}_gain"] = lr.final_gain_index
                 row[f"{b['name']}_ok"] = lr.converged

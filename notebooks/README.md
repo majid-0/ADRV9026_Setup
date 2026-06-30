@@ -10,11 +10,14 @@ have been run end-to-end on hardware.
 | [single_band_sweep.ipynb](single_band_sweep.ipynb) | Sweep TX atten (or LO2 freq) and auto-level the ORx ("AGC") at every step before capturing. |
 | [dual_band_sweep.ipynb](dual_band_sweep.ipynb) | Same sweep, two bands; auto-levels each ORx independently per step. |
 
-**ORx "AGC":** the sweep notebooks auto-level the ORx in software on the captured-IQ
-peak (`gain.autolevel_orx`) — `RxDecPowerGet` is range-compressed and not used. The
-leveler clamps to the valid ORx gain window (190–255) and **fails loud** when a target
-level is physically out of reach (watch the `leveled` column / red X's), rather than
-silently mis-leveling.
+**ORx "AGC":** every notebook can auto-level the ORx in software (`USE_AGC=True`) on
+the captured-IQ peak with a railed-sample clip veto (`gain.autolevel_orx` /
+`capture.autolevel_capture`) — `RxDecPowerGet` is range-compressed and `RxGainGet`
+returns 0, so the gain index is tracked in software. It starts at the gain floor and
+trims into an asymmetric band (default −1.0 +0.3/−0.6 dBFS) within the valid ORx gain
+window (185–255). It stops **fatally** if the TX is too strong even at the floor (185)
+and **accepts max gain** (255) if the signal is too weak to reach the band (watch the
+`leveled` column / red X's). Set `USE_AGC=False` to use a manual `ORX_GAIN_INDEX`.
 
 ## Running
 

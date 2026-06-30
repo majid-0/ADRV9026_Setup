@@ -36,8 +36,9 @@ TX_ATTENS_DB = [15.0]  # TX level(s); dB, 0..41.95
 FREQS_HZ = [0.90e9, 1.00e9, 1.10e9]  # LO2 (TX+ORx) frequencies
 
 # ORx AGC ---------------------------------------------------------------------
-ORX_TARGET_DBFS = -15.0  # aim point for captured peak
-ORX_TOLERANCE_DB = 2.0
+ORX_TARGET_DBFS = -1.0  # aim point for captured peak
+ORX_TOL_UP_DB = 0.3  # accept up to target + this (toward the rail)
+ORX_TOL_DOWN_DB = 0.6  # accept down to target - this (toward the floor)
 CAPTURE_MS = 0.1
 # =============================================================================
 
@@ -55,24 +56,26 @@ def main() -> None:
         print(f"  Signal {SIGNAL_PATH} ({len(wave)} samples)")
         print(
             f"  {TX_CHANNEL.name}->{ORX_CHANNEL.name} | target "
-            f"{ORX_TARGET_DBFS:+.1f}+/-{ORX_TOLERANCE_DB:.0f} dBFS | "
+            f"{ORX_TARGET_DBFS:+.1f} (+{ORX_TOL_UP_DB:.1f}/-{ORX_TOL_DOWN_DB:.1f}) dBFS | "
             f"gain window {ORX_GAIN_MIN}-{ORX_GAIN_MAX}"
         )
 
         transmit_bands(radio, {TX_CHANNEL: wave}, info.tx_bits, continuous=True, do_normalize=True)
 
-        def peak_dbfs():
+        def measure():
             cap = capture(radio, int(ORX_CHANNEL), CAPTURE_MS, bits=info.rx_bits).channels[
                 ORX_CHANNEL
             ]
-            return clip_report(cap.i, cap.q, info.rx_bits).peak_dbfs
+            rep = clip_report(cap.i, cap.q, info.rx_bits)
+            return rep.peak_dbfs, rep.railed_samples
 
         def action(point):
             lr = autolevel_orx(
                 lambda g: radio.set_rx_gain(ORX_CHANNEL, g),
-                peak_dbfs,
+                measure,
                 target_dbfs=ORX_TARGET_DBFS,
-                tolerance_db=ORX_TOLERANCE_DB,
+                tol_up_db=ORX_TOL_UP_DB,
+                tol_down_db=ORX_TOL_DOWN_DB,
             )
             cap = capture(radio, int(ORX_CHANNEL), CAPTURE_MS, bits=info.rx_bits).channels[
                 ORX_CHANNEL
