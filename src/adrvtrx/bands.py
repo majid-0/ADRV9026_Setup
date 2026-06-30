@@ -16,7 +16,7 @@ import numpy as np
 
 from ._enums import RxChannel, RxTrigSource, TxChannel, is_orx
 from .capture import CaptureResult, capture
-from .gain import level_orx
+from .gain import autolevel_orx, clip_report
 from .transmit import transmit_bands
 
 
@@ -54,23 +54,34 @@ def run_bands(
     out_dir: str | Path,
     trig: RxTrigSource | None = None,
     level_orx_channels: bool = True,
-    orx_target_dbfs: float = -12.0,
-    orx_tolerance_db: float = 2.0,
+    orx_target_dbfs: float = -1.0,
+    orx_tol_up_db: float = 0.3,
+    orx_tol_down_db: float = 0.6,
+    orx_coarse_ms: float = 0.1,
 ) -> BandRun:
-    """Transmit all bands, (optionally) level ORx, capture one snapshot, save per band."""
+    """Transmit all bands, (optionally) auto-level ORx, capture one snapshot, save per band."""
     # 1. Multi-band transmit (all TX channels start together).
     channel_to_iq = {b.tx_channel: b.waveform for b in bands}
     transmit_bands(radio, channel_to_iq, tx_bits, continuous=True)
 
-    # 2. Software ORx leveling on any ORx capture channels (flag-based).
+    # 2. Software ORx AGC on any ORx capture channels (captured-IQ peak + railed
+    #    veto; ORx has no hardware AGC). Levels on a short coarse capture.
     if level_orx_channels:
         for b in bands:
             if is_orx(b.capture_channel):
-                level_orx(
-                    radio,
-                    b.capture_channel,
+                ch = b.capture_channel
+
+                def _measure(c: RxChannel = ch) -> tuple[float, int]:
+                    one = capture(radio, int(c), orx_coarse_ms, bits=rx_bits).channels[c]
+                    rep = clip_report(one.i, one.q, rx_bits)
+                    return rep.peak_dbfs, rep.railed_samples
+
+                autolevel_orx(
+                    lambda g, c=ch: radio.set_rx_gain(c, g),
+                    _measure,
                     target_dbfs=orx_target_dbfs,
-                    tolerance_db=orx_tolerance_db,
+                    tol_up_db=orx_tol_up_db,
+                    tol_down_db=orx_tol_down_db,
                 )
 
     # 3. Capture each band's channel in its OWN snapshot. Enabling two ORx inputs

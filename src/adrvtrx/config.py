@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -92,9 +92,14 @@ class LevelsConfig:
 
 @dataclass
 class OrxAgcConfig:
-    target_dbfs: float = -12.0
-    tolerance_db: float = 2.0
-    max_iterations: int = 12
+    target_dbfs: float = -1.0
+    tol_up_db: float = 0.3
+    tol_down_db: float = 0.6
+    coarse_ms: float = 0.1
+    max_iterations: int = 16
+    gain_min: int = 185
+    gain_max: int = 255
+    db_per_index: float = 0.50
 
 
 @dataclass
@@ -148,9 +153,19 @@ class Config:
             ),
             init_cals=InitCalsConfig(**data.get("init_cals", {})),
             levels=_levels_from(data.get("levels", {})),
-            orx_agc=OrxAgcConfig(**data.get("orx_agc", {})),
+            orx_agc=_orx_agc_from(data.get("orx_agc", {})),
             profile_name=profile.get("name", cls.profile_name),
         )
+
+
+def _orx_agc_from(raw: dict[str, Any]) -> OrxAgcConfig:
+    """Build OrxAgcConfig, ignoring unknown keys (e.g. a retired ``tolerance_db``).
+
+    Keeps the loader forward/backward compatible with TOML files that carry extra
+    or missing ``[orx_agc]`` keys.
+    """
+    known = {f.name for f in fields(OrxAgcConfig)}
+    return OrxAgcConfig(**{k: v for k, v in raw.items() if k in known})
 
 
 def _levels_from(raw: dict[str, Any]) -> LevelsConfig:
