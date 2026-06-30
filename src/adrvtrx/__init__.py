@@ -14,6 +14,17 @@ from .config import Config, lo_for_tx, load_config
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
 from .profile import ProfileInfo, read_profile
 from .sweep import SweepAxis, run_sweep, sweep_points
+from .sweep_plan import (
+    SweepPlanSummary,
+    apply_sweep_point,
+    flatten_point,
+    format_point_label,
+    iter_sweep_points,
+    max_power_db,
+    run_planned_sweep,
+    summarize_sweep_plan,
+    sweep_defaults_from_config,
+)
 from .waveform import load_tab_iq, normalize, prepare_tx, quantize, save_tab_iq_float
 
 __version__ = "0.1.0"
@@ -52,6 +63,15 @@ __all__ = [
     "SweepAxis",
     "run_sweep",
     "sweep_points",
+    "iter_sweep_points",
+    "summarize_sweep_plan",
+    "SweepPlanSummary",
+    "apply_sweep_point",
+    "run_planned_sweep",
+    "flatten_point",
+    "format_point_label",
+    "max_power_db",
+    "sweep_defaults_from_config",
 ]
 
 

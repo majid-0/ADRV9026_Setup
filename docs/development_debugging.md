@@ -218,7 +218,8 @@ They override anything the docs imply.
 | `capture.py` | `PerformRx` → per-channel IQ by **absolute slot index** (`returned_channel_order`), count-mismatch guard, `autolevel_capture` AGC orchestrator + `AgcResult`. |
 | `transmit.py` | `PerformTx` 8-array builder (zero-fill), multi-band. |
 | `bands.py` | `Band` primitive + single/dual/quad orchestration. |
-| `sweep.py` | 1-D + nested-grid parameter sweeps, templated filenames. |
+| `sweep.py` | Low-level `SweepAxis` + `run_sweep` (setter callbacks, Cartesian product). |
+| `sweep_plan.py` | Declarative sweep plans (`freq` / `power_db` / `signals` blocks, per-block `zip` or `grid`), `summarize_sweep_plan`, `run_planned_sweep`. |
 | `experiment.py` | `session()` convenience (connect+program+safe), `verify_status`. |
 | `cli.py` | `adrvtrx-program` entry point. |
 
@@ -228,6 +229,27 @@ Design rules to preserve:
   profile at runtime.
 - **TX is forced safe on every exit path** (`__exit__`, `atexit`, SIGINT/SIGTERM) and on
   startup. `safe_state` = max atten + clear TX enable mask.
+
+### Sweep plans (`sweep_plan.py`)
+
+Notebooks and bench scripts declare a `SWEEP` dict with up to three blocks:
+
+- **`freq`** — `lo1_hz`, `lo2_hz` (direct hardware LOs; two independent degrees of freedom).
+- **`power_db`** — per-band keys or `"shared"` (TX attenuation in dB).
+- **`signals`** — per-band file path(s); reloads `transmit_bands` when the path changes.
+
+Each block has `mode: "zip"` (lists advance together by index) or `"grid"` (Cartesian
+product inside the block). **Blocks multiply** — e.g. a 2-point zip `freq` block and a
+3-point grid `power_db` block → 6 sweep points.
+
+Before hardware: `summarize_sweep_plan(BANDS, SWEEP, sweep_defaults_from_config(cfg, BANDS))`
+prints block sizes, total points, and sample rows. Defaults (LO, idle TX atten, signal
+paths) come from config + the `BANDS` wiring list.
+
+At each point `run_planned_sweep` → `retune_lo` (lock-checked) → `set_tx_atten` →
+`transmit_bands` (continuous) → notebook `action` runs ORx `autolevel_orx` + per-ORx
+capture (multiband requires separate ORx captures — see §4.1). Low-level `sweep.run_sweep`
+remains for scripts that build `SweepAxis` setters by hand (`agc_test_*.py`).
 
 ---
 

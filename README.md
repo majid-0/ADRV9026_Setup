@@ -73,6 +73,20 @@ def action(point):
 run_sweep(axes, action)
 ```
 
+Declarative sweep plan (notebooks; per-block zip/grid, preview before run):
+
+```python
+from adrvtrx.sweep_plan import summarize_sweep_plan, run_planned_sweep, sweep_defaults_from_config
+
+SWEEP = {
+    "freq": {"mode": "zip", "lo1_hz": [1.0e9, 1.1e9], "lo2_hz": [0.9e9, 1.0e9]},
+    "power_db": {"mode": "grid", "shared": [13, 14, 15]},
+}
+defaults = sweep_defaults_from_config(cfg, BANDS)
+print(summarize_sweep_plan(BANDS, SWEEP, defaults))
+records = run_planned_sweep(radio, BANDS, SWEEP, action, defaults=defaults, tx_bits=info.tx_bits)
+```
+
 ## Develop / CI
 
 ```bash
@@ -98,7 +112,8 @@ src/adrvtrx/
   capture.py     PerformRx snapshot -> per-channel IQ, save, autolevel_capture AGC
   transmit.py    PerformTx multi-band buffers
   bands.py       Band primitive + single/dual/quad orchestration
-  sweep.py       1-D + nested-grid sweeps
+  sweep.py       Low-level SweepAxis + run_sweep
+  sweep_plan.py  Declarative multi-band sweep plans + summarize_sweep_plan
   experiment.py  session() convenience + status
   cli.py         adrvtrx-program entry point
 config/default.toml   all parameters (DLL path, board, profile, clocks, cals, levels)
