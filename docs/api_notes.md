@@ -14,10 +14,11 @@ Object model: `AdiEvaluationSystem.Instance` → `.platform.board` is an
 
 ---
 
-## 1. ORx leveling — RESOLVED: hardware flags exist (flag-based branch)
+## 1. ORx leveling — RESOLVED: software AGC (hardware flags reject ORx)
 
-ORx is manual-gain (no hardware AGC state machine), BUT the build exposes both a
-**level readback** and **overload/clip indicators**, valid for ORx channels:
+ORx is manual-gain (no hardware AGC state machine). The CHM lists a level readback and
+overload/clip indicators, but the bench shows they do **not** work on ORx (see the
+correction box below). The host-callable signatures the CHM advertises:
 
 - `Adrv9010Rx.RxDecPowerGet(adi_adrv9010_RxChannels_e rxChannel, UInt16 %rxDecPower_mdBFS)`
   → measured DEC power in **milli-dBFS**. Direct level readback.
@@ -29,13 +30,26 @@ ORx is manual-gain (no hardware AGC state machine), BUT the build exposes both a
 - `Adrv9010Rx.RxGainCtrlModeSet(array<adi_adrv9010_RxAgcMode_t> gainMode, Byte n)` /
   `RxGainCtrlModeGet(...)` — gain-control mode (MGC/AGC) for Rx; ORx stays MGC.
 
-**`adi_adrv9010_RxChannels_e` includes RX1–RX4 AND ORX1–ORX4** → all the above
-accept ORx. Channel masks match the init script: ORx1=0x10 … ORx4=0x80.
+**`adi_adrv9010_RxChannels_e` includes RX1–RX4 AND ORX1–ORX4**, and `RxGainSet`
+accepts ORx (the lever we step). Channel masks match the init script: ORx1=0x10 …
+ORx4=0x80.
 
-→ Leveling design: read `RxDecPowerGet` (and/or overload indicators) → step
-`RxGainSet` on the ORx channel → converge to target mdBFS window. IQ-from-capture
-peak/clip remains as a build-independent cross-check, but is no longer the only
-option. AGC target metric: peak-headroom dBFS (decide exact setpoint on hardware).
+> **⚠️ BENCH CORRECTION (overrides the CHM above).** The earlier claim that the
+> overload indicators "accept ORx" is **WRONG**. On hardware:
+> - `GetEmbeddedOverloadIndicators` (+ the `...LsbI/Q` / `...LsbPlusOneI/Q` variants)
+>   and the hardware AGC **reject ORx** ("Invalid Rx Channel") — they are **main-Rx
+>   only**. There is **no hardware clip flag for ORx**.
+> - `RxDecPowerGet` is **range-compressed** on ORx and must **NOT** be used for
+>   leveling (kept only as a raw readback primitive).
+> - ORx **`RxGainGet` returns 0** (unusable) — the gain index must be **tracked in
+>   software**, never read back.
+
+→ Leveling design (implemented): **software AGC on the captured-IQ peak** with a
+**`railed`-sample clip veto** (`railed` is the true clip detector — peak dBFS
+compresses near full scale). `gain.autolevel_orx` (coarse + fine, asymmetric band) →
+`gain.verify_no_clip` (full-signal re-check) → orchestrated by
+`capture.autolevel_capture`, which steps `RxGainSet` on the ORx channel. See
+docs/development_debugging.md §4.9.
 
 ## 2. Capture (snapshot) + deterministic triggering — RESOLVED
 
@@ -107,7 +121,9 @@ profile; confirm effective DAC range against `DacFullScale*` on hardware.
 ---
 
 ## Decisions this locks in for the design
-- ORx leveling = **flag-based** (`RxDecPowerGet` + overload indicators), IQ-clip as backup.
+- ORx leveling = **software AGC on the captured-IQ peak + `railed` clip veto** (ORx has
+  no hardware AGC; overload flags reject ORx; `RxDecPowerGet` is range-compressed; ORx
+  `RxGainGet` returns 0 so the gain index is tracked in software).
 - Capture = `PerformRx` w/ `channelMask` (Rx or ORx), `captureTime_ms`, `TXn_SOF` trigger for alignment.
 - TX = `PerformTx` (continuous overload) with per-channel `int[]`, `channelMask` for multi-band.
 - Quantize TX waveform to signed `2^(Np-1)-1` with `Np` from profile `jesd204Np`.

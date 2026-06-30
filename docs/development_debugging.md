@@ -162,15 +162,37 @@ They override anything the docs imply.
    the floor, so a DEC-power / hardware-AGC loop mis-levels silently. **Level on the
    captured-IQ peak** (`gain.clip_report(...).peak_dbfs`) via `gain.autolevel_orx`.
 
-9. **ORx gain control (software "AGC").** The ORx gain table is only monotonic over index
-   **≈190..255** (~29 dB, ~0.45 dB/index); below ~185 it clamps to max gain (garbage). The
-   reachable level is also capped by TX power — at 10 dB Tx atten even max ORx gain reaches
-   only ~−17 dBFS with the LTE-ish vectors. `gain.autolevel_orx` clamps to
-   `[ORX_GAIN_MIN, ORX_GAIN_MAX]`, levels on the captured peak, and **fails loud**
-   (`converged=False` + reason) when the target is out of reach instead of spinning. The
-   `notebooks/*_sweep.ipynb` notebooks auto-level per sweep point on top of it — verified on
-   hardware (target −20 dBFS held while gain backs off as Tx power rises; too-weak points
-   correctly flagged "pinned at max gain").
+9. **ORx gain control (software AGC).** The ORx gain table is clean & **MONOTONIC from
+   index 185 up to 250** (~0.50 dB/index, `railed==0` the whole way); **255 is the rail**
+   (it clips hard — `railed` jumps and the peak saturates ≈0). The earlier "below ~185
+   clamps to MAX gain (garbage)" note was **WRONG** — 185 is a perfectly good floor, and it
+   is clean & monotonic down to at least there. Three more facts force the AGC into
+   software:
+   - ORx has **no hardware AGC** (it is manual-gain only).
+   - the hardware overload-flag APIs (`GetEmbeddedOverloadIndicators` and the
+     `...LsbI/Q`/`...LsbPlusOneI/Q` variants) **reject ORx** ("Invalid Rx Channel" — they
+     are **main-Rx only**), so they cannot detect ORx clipping.
+   - ORx **`RxGainGet` returns 0** (unusable) — so the AGC tracks the gain index entirely
+     in software and never reads it back.
+
+   So the AGC levels on the **captured-IQ peak** with a **`railed`-sample clip veto**
+   (`railed` is the true clip detector; peak dBFS compresses near full scale), targeting an
+   **asymmetric band** (default −1.0 dBFS, +0.3 toward the rail / −0.6 toward the floor),
+   in three stages:
+   - **A (coarse):** set gain 185, capture, FATAL-check the floor, then one computed jump
+     toward target.
+   - **B (fine):** short-capture trim into band; the clip veto steps down on any `railed>0`;
+     if the signal is below band even at 255 it **accepts 255** (`at_max_gain`, best
+     achievable — not an error).
+   - **C (verify):** re-check at the FULL waveform duration and back the gain off on any
+     clip; bottoming out at 185 still railing is FATAL.
+
+   `gain.autolevel_orx` (A+B) and `gain.verify_no_clip` (C) are pure/callback-driven;
+   `capture.autolevel_capture` orchestrates them against live hardware. On any **FATAL**
+   condition (TX too strong: clips at 185, already in band at 185, or full signal still
+   rails at 185) the orchestrator **disables TX + disconnects + raises `AgcError`**. The
+   notebooks expose this as `USE_AGC`; validate end-to-end on the bench with
+   `scripts/agc_validate.py` (expects gain ~250, `railed==0`, peak in band).
 
 8. **Program sequence** (faithful to the user's working IronPython init), all in
    `radio.program()`: `ConfigFileLoad(profile)` → `InitStructGet()` + edit clocks/masks/LO
@@ -192,8 +214,8 @@ They override anything the docs imply.
 | `radio.py` | `Radio` context manager: connect, `program()`, crash-safe `force_safe`/`safe_state`, `enable_rx/tx`, gain/atten/LO/PLL wrappers, `perform_rx/perform_tx`. |
 | `waveform.py` | Tab-delimited `I⟶Q` load, normalize (÷peak), quantize to Np, float-rescaled save. |
 | `profile.py` | Read `jesd204Np` + sample rates from a `.profile` JSON. |
-| `gain.py` | `clip_report` (peak dBFS, railed count), `peak_window`, software ORx leveling loop. |
-| `capture.py` | `PerformRx` → per-channel IQ by **absolute slot index** (`returned_channel_order`), with a count-mismatch guard. |
+| `gain.py` | `clip_report` (peak dBFS, railed count), `peak_window`, software ORx AGC stages (`autolevel_orx` A+B, `verify_no_clip` C), `AgcError`. |
+| `capture.py` | `PerformRx` → per-channel IQ by **absolute slot index** (`returned_channel_order`), count-mismatch guard, `autolevel_capture` AGC orchestrator + `AgcResult`. |
 | `transmit.py` | `PerformTx` 8-array builder (zero-fill), multi-band. |
 | `bands.py` | `Band` primitive + single/dual/quad orchestration. |
 | `sweep.py` | 1-D + nested-grid parameter sweeps, templated filenames. |
