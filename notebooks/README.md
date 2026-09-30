@@ -9,6 +9,16 @@ have been run end-to-end on hardware.
 | [dual_band_tx_capture.ipynb](dual_band_tx_capture.ipynb) | Transmit two waveforms on two TX channels and capture both ORx in one aligned snapshot. |
 | [single_band_sweep.ipynb](single_band_sweep.ipynb) | Declarative `SWEEP` plan (LO / TX power / signal per block); `summarize_sweep_plan` preview; ORx auto-level + capture at every point. |
 | [dual_band_sweep.ipynb](dual_band_sweep.ipynb) | Same sweep-plan API for two bands; auto-levels each ORx independently; per-ORx capture. |
+| [pa_operating_point.ipynb](pa_operating_point.ipynb) | Search one LO for the TX attenuation at a target PAPR compression, capture at that lock, write one condition row. |
+| [pa_operating_sweep.ipynb](pa_operating_sweep.ipynb) | Signals x LOs: search each pair, then capture every backoff from the lock; writes `TX1_conditions.csv`. |
+| [dpd_replay.ipynb](dpd_replay.ipynb) | Replay DPD files at every saved condition (no AGC, no rescale) and compare against the original captures. |
+| [dpd_linearize_loop.ipynb](dpd_linearize_loop.ipynb) | Online loop at one saved condition; example ILA GMP `step` from `dpd_kit`. |
+
+The last four are single band and follow
+[docs/dpd_workflow_spec.md](../docs/dpd_workflow_spec.md): what each CSV column
+means, what it is referenced to, and how replay and the online loop behave. They
+have not been run on the bench yet; they run end to end against the simulated
+bench in `tests/sim_bench.py`.
 
 **Sweep params:** edit `BANDS` (TX/ORx wiring + default signal path) and `SWEEP`
 (three optional blocks: `freq`, `power_db`, `signals`). Each block sets

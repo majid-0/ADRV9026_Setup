@@ -27,7 +27,7 @@ contradict or extend the documentation. Read this first, then `docs/api_notes.md
 ### Run things
 ```powershell
 $conda = "C:\ProgramData\anaconda3\Scripts\conda.exe"
-& $conda run -n myenv python -m pytest -m "not hardware" -q   # hardware-free unit tests (~75)
+& $conda run -n myenv python -m pytest -m "not hardware" -q   # hardware-free unit tests (~130)
 & $conda run -n myenv python -m ruff check src tests scripts
 & $conda run -n myenv python -m black src tests scripts
 & $conda run -n myenv adrvtrx-program                          # connect + program + status
