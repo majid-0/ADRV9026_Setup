@@ -87,6 +87,30 @@ print(summarize_sweep_plan(BANDS, SWEEP, defaults))
 records = run_planned_sweep(radio, BANDS, SWEEP, action, defaults=defaults, tx_bits=info.tx_bits)
 ```
 
+PA operating point and DPD (single band; full definitions in
+[docs/dpd_workflow_spec.md](docs/dpd_workflow_spec.md)):
+
+```python
+from adrvtrx.compression import find_compression_point
+from adrvtrx.conditions import capture_point
+from adrvtrx.replay import replay_conditions
+from adrvtrx.linearize import linearize
+
+# TX running: search down from a safe attenuation to 3 dB PAPR compression.
+res = find_compression_point(radio, TxChannel.TX1, RxChannel.ORX1, ref, rx_bits=12, fs=fs,
+                             target_compression_db=3.0, start_atten_db=20, atten_min_db=9)
+point = capture_point(radio, RxChannel.ORX1, ref, rx_bits=12, fs=fs, bw_hz=100e6)
+
+# Offline: play your model's DPD file at every saved condition (no AGC, no rescale).
+replay_conditions(radio, "captures/TX1_conditions.csv", lambda row: f"DPD/{row.name}.txt",
+                  tx=TxChannel.TX1, orx=RxChannel.ORX1, tx_bits=12, rx_bits=12, fs=fs,
+                  out_dir="DPD_DUT/gmp", label="dpd_gmp")
+
+# Online: step(x, u, z, it) -> next u, or None to stop. Your model lives in step.
+linearize(radio, condition, x, step, tx=TxChannel.TX1, orx=RxChannel.ORX1,
+          tx_bits=12, rx_bits=12, fs=fs, n_iter=5)
+```
+
 ## Develop / CI
 
 ```bash
@@ -114,6 +138,11 @@ src/adrvtrx/
   bands.py       Band primitive + single/dual/quad orchestration
   sweep.py       Low-level SweepAxis + run_sweep
   sweep_plan.py  Declarative multi-band sweep plans + summarize_sweep_plan
+  metrics.py     PAPR, window compression, NMSE, ACLR, in-band corr, RMS (pure numpy)
+  compression.py TX attenuation search for a target PAPR compression
+  conditions.py  Condition / DUT CSVs, aligned IQ files, capture_point
+  replay.py      Replay stored waveforms (DPD files) at saved conditions
+  linearize.py   Online transmit -> capture -> step() loop
   experiment.py  session() convenience + status
   cli.py         adrvtrx-program entry point
 config/default.toml   all parameters (DLL path, board, profile, clocks, cals, levels)

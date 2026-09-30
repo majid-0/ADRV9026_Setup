@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .metrics import inband_corr
+
 __all__ = ["estimate_delay", "estimate_and_align", "apply_delay", "match_corr"]
 
 
@@ -31,15 +33,7 @@ def match_corr(ref, y, fs=1.0, energy_frac=0.05):
     float in [0, 1]. ``energy_frac`` sets the "occupied" threshold vs the peak bin.
     """
     xa, ya, _ = estimate_and_align(ref, y, fs)
-    m = min(len(xa), len(ya))
-    if m == 0:
-        return 0.0
-    a = np.fft.fft(np.asarray(xa[:m], dtype=np.complex128))
-    b = np.fft.fft(np.asarray(ya[:m], dtype=np.complex128))
-    mask = np.abs(a) > energy_frac * np.abs(a).max()
-    am, bm = a[mask], b[mask]
-    den = (np.linalg.norm(am) * np.linalg.norm(bm)) or 1.0
-    return float(np.abs(np.vdot(am, bm)) / den)
+    return inband_corr(xa, ya, energy_frac)
 
 
 def _apply_fractional_delay_fft(x, frac_delay):

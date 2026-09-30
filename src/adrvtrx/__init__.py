@@ -10,9 +10,35 @@ from ._enums import RxChannel, RxTrigSource, TxChannel, TxTrigSource
 from .align import apply_delay, estimate_and_align, estimate_delay, match_corr
 from .bands import Band, make_bands, run_bands
 from .capture import AgcResult, autolevel_capture, measure_delay
+from .compression import CompressionResult, find_compression_point, search_tx_compression
+from .conditions import (
+    CSV_FIELDS,
+    DUT_FIELDS,
+    ConditionLog,
+    DutRecord,
+    OperatingCondition,
+    PointCapture,
+    capture_point,
+    condition_name,
+    load_aligned_iq,
+    load_conditions,
+    load_dut_records,
+    save_aligned_iq,
+)
 from .config import Config, lo_for_tx, load_config
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
+from .linearize import LinearizeResult, linearize
+from .metrics import (
+    aclr_db,
+    inband_corr,
+    nmse_db,
+    papr_db,
+    period_metrics,
+    rms_dbfs,
+    window_compression_db,
+)
 from .profile import ProfileInfo, read_profile
+from .replay import replay_conditions, stored_tx
 from .sweep import SweepAxis, run_sweep, sweep_points
 from .sweep_plan import (
     SweepPlanSummary,
@@ -72,6 +98,32 @@ __all__ = [
     "format_point_label",
     "max_power_db",
     "sweep_defaults_from_config",
+    "papr_db",
+    "window_compression_db",
+    "nmse_db",
+    "aclr_db",
+    "inband_corr",
+    "rms_dbfs",
+    "period_metrics",
+    "CompressionResult",
+    "search_tx_compression",
+    "find_compression_point",
+    "CSV_FIELDS",
+    "DUT_FIELDS",
+    "OperatingCondition",
+    "DutRecord",
+    "ConditionLog",
+    "PointCapture",
+    "capture_point",
+    "condition_name",
+    "load_conditions",
+    "load_dut_records",
+    "save_aligned_iq",
+    "load_aligned_iq",
+    "replay_conditions",
+    "stored_tx",
+    "linearize",
+    "LinearizeResult",
 ]
 
 
