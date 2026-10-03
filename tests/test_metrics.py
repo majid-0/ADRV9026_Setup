@@ -5,7 +5,9 @@ import pytest
 
 from adrvtrx.align import match_corr
 from adrvtrx.metrics import (
+    PA_CLIP_SLOPE,
     aclr_db,
+    gain_compression_db,
     inband_corr,
     nmse_db,
     papr_db,
@@ -146,9 +148,86 @@ def test_period_metrics_keys_and_corr_reference():
         "aclr_lower_dbc",
         "aclr_upper_dbc",
         "rms_dbfs",
+        "gain_compression_db",
+        "amam_top_slope",
+        "pa_clipped",
     }
     assert m["delay_ns"] == pytest.approx(12.5 / FS * 1e9)
     assert m["papr_compression_db"] == pytest.approx(m["papr_in_db"] - m["papr_out_db"])
     other = period_metrics(x, y, fs=FS, bw_hz=BW, rx_bits=12, delay_samples=0, corr_ref=y)
     assert other["corr"] == pytest.approx(1.0)
     assert other["nmse_db"] == m["nmse_db"]
+
+
+def _clipper(x, level):
+    return np.where(np.abs(x) < level, x, level * x / np.maximum(np.abs(x), 1e-300))
+
+
+def test_gain_compression_linear_pa():
+    x = make_signal()
+    comp, slope = gain_compression_db(x, 2.5 * np.exp(0.3j) * x)
+    assert comp == pytest.approx(0.0, abs=1e-9)
+    assert slope == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("drive", [0.5, 1.0, 1.5, 2.0])
+def test_gain_compression_matches_rapp(drive):
+    """Power gain at the peak samples relative to the small-signal gain, Rapp p = 2."""
+    x = make_signal()
+    comp, _ = gain_compression_db(x, rapp(drive * x))
+    a = np.abs(x) / np.abs(x).max()
+    top = a >= 0.975
+    expected = -10 * np.log10(
+        np.mean(np.abs(rapp(drive * a[top])) ** 2 / drive**2) / np.mean(a[top] ** 2)
+    )
+    assert comp == pytest.approx(expected, abs=0.05)
+
+
+def test_top_slope_falls_with_drive():
+    x = make_signal()
+    slopes = [gain_compression_db(x, rapp(d * x))[1] for d in (0.5, 1.0, 1.5, 2.0)]
+    assert all(a > b for a, b in zip(slopes, slopes[1:]))
+
+
+def test_hard_clipper_has_a_flat_top_and_is_flagged():
+    x = make_signal()
+    y = _clipper(x, 0.7)
+    comp, slope = gain_compression_db(x, y)
+    assert slope == pytest.approx(0.0, abs=1e-9)
+    assert comp > 2.5
+    m = period_metrics(x, y, fs=FS, bw_hz=BW, rx_bits=12, delay_samples=0)
+    assert m["pa_clipped"] is True
+    assert m["amam_top_slope"] < PA_CLIP_SLOPE
+
+
+def test_pa_clipped_threshold_is_a_parameter():
+    x = make_signal()
+    y = rapp(1.5 * x)  # top slope about 0.19
+    assert not period_metrics(x, y, fs=FS, bw_hz=BW, rx_bits=12, delay_samples=0)["pa_clipped"]
+    m = period_metrics(x, y, fs=FS, bw_hz=BW, rx_bits=12, delay_samples=0, min_top_slope=0.3)
+    assert m["pa_clipped"]
+
+
+def test_gain_compression_is_scale_and_phase_invariant():
+    x = make_signal()
+    y = rapp(1.5 * x)
+    assert gain_compression_db(x, y) == pytest.approx(gain_compression_db(x, 37j * y))
+    assert gain_compression_db(x, y) == pytest.approx(gain_compression_db(5 * x, y))
+
+
+def test_gain_compression_repeats_across_noisy_captures():
+    """Same waveform, independent noise at -45 dB: within the 0.2 dB lock tolerance."""
+    x = make_signal()
+    y = rapp(1.5 * x)
+    rms = np.sqrt(np.mean(np.abs(y) ** 2))
+    rng = np.random.default_rng(3)
+    readings = []
+    for _ in range(5):
+        noise = (rng.normal(size=len(x)) + 1j * rng.normal(size=len(x))) / np.sqrt(2)
+        readings.append(gain_compression_db(x, y + 10 ** (-45 / 20) * rms * noise)[0])
+    assert max(readings) - min(readings) < 0.2
+
+
+def test_gain_compression_empty_and_zero():
+    assert all(np.isnan(v) for v in gain_compression_db([], []))
+    assert all(np.isnan(v) for v in gain_compression_db(np.zeros(16), np.zeros(16)))

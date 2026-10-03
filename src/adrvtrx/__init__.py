@@ -29,7 +29,9 @@ from .config import Config, lo_for_tx, load_config
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
 from .linearize import LinearizeResult, linearize
 from .metrics import (
+    PA_CLIP_SLOPE,
     aclr_db,
+    gain_compression_db,
     inband_corr,
     nmse_db,
     papr_db,
@@ -100,6 +102,8 @@ __all__ = [
     "sweep_defaults_from_config",
     "papr_db",
     "window_compression_db",
+    "gain_compression_db",
+    "PA_CLIP_SLOPE",
     "nmse_db",
     "aclr_db",
     "inband_corr",
