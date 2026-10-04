@@ -116,10 +116,12 @@ linearize(radio, condition, x, step, tx=TxChannel.TX1, orx=RxChannel.ORX1,
 ```
 
 Live DPD in one call chain (what `notebooks/dpd_linearize_loop.ipynb` does): find
-the operating point, then iterative ILA with the built-in numpy GMP. No DPD
-waveform with a peak above `peak_limit_dbm` is ever transmitted (full scale =
-the original input peak = 10 dBm); the input backoff grows from 0.2 dB until the
-peak fits, and the loop stops if 4 dB is not enough.
+the operating point, then iterative ILA with the built-in numpy GMP. Every capture
+is scaled by the iteration-0 (no DPD) output peak, and each pass aims the output
+peak a fixed 0.15 dB below it (`target_backoff_db`), so the target does not slide.
+No DPD waveform with a peak above `peak_limit_dbm` is ever transmitted (full
+scale = the original input peak = 10 dBm). A peak guard adds backoff only when
+needed, and the loop stops if 4 dB in total is not enough.
 
 ```python
 from adrvtrx.operating_point import find_operating_point
@@ -129,11 +131,12 @@ from adrvtrx.dpd import IlaStep, iteration_table
 op = find_operating_point(radio, TxChannel.TX1, RxChannel.ORX1, signal, tx_bits=12, rx_bits=12,
                           fs=fs, freq_hz=2_400_000_000, bw_mhz=100, target_compression_db=3.0,
                           start_atten_db=20, atten_min_db=9, save_dir="DPD_DUT/ila_gmp")
-step = IlaStep(lambda: GMP(5, 5, 2), n_train=8192, peak_limit_dbm=9.9)
+step = IlaStep(lambda: GMP(5, 5, 2), n_train=8192, target_backoff_db=0.15, peak_limit_dbm=9.9)
 res = linearize(radio, op.condition, op.x, step, tx=TxChannel.TX1, orx=RxChannel.ORX1,
                 tx_bits=12, rx_bits=12, fs=fs, n_iter=4)
 for row in iteration_table(res.records, step.history):
-    print(row["iteration"], row["aclr_lower_dbc"], row["aclr_upper_dbc"], row["dpd_peak_dbm"])
+    print(row["iteration"], row["aclr_lower_dbc"], row["aclr_upper_dbc"], row["output_peak_db"],
+          row["dpd_peak_dbm"])
 ```
 
 How it works, with diagrams: [docs/dpd_pass.md](docs/dpd_pass.md) (one DPD pass,

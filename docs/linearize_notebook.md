@@ -34,7 +34,7 @@ flowchart TD
         S11 -->|no| S13["capture_point: one aligned capture"]
         S13 --> S14["OperatingCondition row<br/>reference, capture, CSV row to SAVE_DIR"]
     end
-    S14 --> STEP["5. step = IlaStep(GMP(K, MEMORY, CROSS))"]
+    S14 --> STEP["5. step = IlaStep(GMP(K, MEMORY, CROSS))<br/>output target TARGET_BACKOFF_DB below iteration 0"]
     SAVED --> STEP
     STEP --> L0
     subgraph LOOP["6. linearize: LO, attenuation, ORx gain applied once; TX off when it ends"]
@@ -44,8 +44,8 @@ flowchart TD
         L2 -->|yes| E1["stop: railed"]
         L2 -->|no| L3{"N_ITER captures done?"}
         L3 -->|yes| E2["stop: n_iter"]
-        L3 -->|no| L4["DPD pass: u = step(x, u, z, it)"]
-        L4 --> L5{"DPD peak at most PEAK_LIMIT_DBM<br/>with a margin up to MAX_MARGIN_DB?"}
+        L3 -->|no| L4["DPD pass: u = step(x, u, z, it)<br/>z on the iteration-0 scale, aim at the target"]
+        L4 --> L5{"DPD peak at most PEAK_LIMIT_DBM<br/>with target + guard up to MAX_MARGIN_DB?"}
         L5 -->|no| E3["stop: step returned None<br/>nothing over the limit is sent"]
         L5 -->|yes| L1
     end
@@ -96,7 +96,14 @@ flowchart TD
         converge prints a warning and the loop runs where it stopped.
    - `"csv"`: the saved row is used as it is. No search and no AGC.
 5. **The DPD step.** `IlaStep(lambda: GMP(K, MEMORY, CROSS), ...)`. A fresh GMP
-   is fitted on every pass.
+   is fitted on every pass. The first capture (iteration 0, no DPD) sets the
+   **anchor**, its peak. Every later capture is divided by that same peak, so
+   the output level each pass reached stays visible. Each pass aims the output
+   peak `TARGET_BACKOFF_DB` (0.15 dB) below the anchor. That is a rule set once,
+   not a backoff that grows on each pass. The peak guard adds backoff on top only
+   when the DPD peak would be above `PEAK_LIMIT_DBM`. The table reports the
+   target and the guard separately. Why and how much:
+   [dpd_pass.md §9](dpd_pass.md#9-predistort-at-the-target-with-the-peak-check-limit_peak).
 6. **The loop.** `linearize` applies the condition once: LO1, the TX
    attenuation and the ORx gain. The ORx AGC does not run again, so the
    iterations are comparable. Iteration 0 transmits `x` (no DPD). Each
@@ -105,17 +112,34 @@ flowchart TD
    `u`. It stops when:
    - `N_ITER` captures are done (`n_iter`);
    - the ORx rails (`railed`; the gain is not re-levelled during the loop);
-   - no margin up to `MAX_MARGIN_DB` keeps the DPD peak at or below
-     `PEAK_LIMIT_DBM` (`step returned None`). That waveform is never sent.
+   - no backoff (target + guard) up to `MAX_MARGIN_DB` keeps the DPD peak at or
+     below `PEAK_LIMIT_DBM` (`step returned None`). That waveform is never sent.
 
    TX is turned off when the loop ends, whatever happened.
-7. **Per-iteration table.** One row per capture: ACLR lower, upper and worst,
-   NMSE, gain compression, margin, DPD peak, PAPR expansion, `tx_clipped`, and
-   the post-inverse fit error. Written to `{SAVE_DIR}/{LABEL}_steps.csv`.
-8. **Plots.** ACLR lower and upper per iteration (with the worst value
-   labelled), NMSE, gain compression, the transmitted peak against the limit
-   (with the margin used), and the spectrum of `x`, iteration 0 and the last
-   iteration, with the adjacent channels shaded.
+7. **Per-iteration table.** One row per capture:
+   - ACLR lower, upper and worst, and NMSE;
+   - the output peak relative to iteration 0 (it should sit near
+     `-TARGET_BACKOFF_DB` on every DPD iteration);
+   - gain and PAPR compression from `x` to the capture (the PA's at iteration 0,
+     what is left after it), and the PA's PAPR compression on its real input
+     `u`;
+   - the DPD's PAPR expansion and DPD peak, and the target and guard backoff;
+   - `tx_clipped` and the post-inverse fit error.
+
+   Written to `{SAVE_DIR}/{LABEL}_steps.csv`.
+8. **Plots.** Per iteration:
+   - ACLR lower and upper, with the worst value labelled;
+   - NMSE;
+   - the output peak against the target;
+   - gain and PAPR compression left;
+   - the PAPR expansion against the PA's PAPR compression;
+   - the transmitted peak against the limit, labelled with target + guard.
+
+   Then the spectrum of `x`, iteration 0 and the last iteration, with the
+   adjacent channels shaded. With a fixed target, ACLR is usually best after
+   pass 2 or 3 and can then drift a little worse
+   ([dpd_pass.md, after convergence](dpd_pass.md#what-to-expect-offline)).
+   Every `u` is saved, so the best one can be replayed.
 9. **Safe state and disconnect.**
 
 ## Parameters
@@ -146,8 +170,8 @@ flowchart TD
 | `K`, `MEMORY`, `CROSS` | `5`, `5`, `2` | GMP nonlinear order, memory depth, cross-term memory (130 coefficients) |
 | `N_TRAIN` | `8192` | Post-inverse training block, centred on the peak of `z` |
 | `PEAK_LIMIT_DBM` | `9.9` | Hard limit on the transmitted DPD peak. Full scale = the original input peak = 10 dBm |
-| `PEAK_MARGIN_DB` | `0.2` | First input backoff the auto margin tries |
-| `MAX_MARGIN_DB` | `4.0` | Largest input backoff. If even this exceeds the limit, the loop stops |
+| `TARGET_BACKOFF_DB` | `0.15` | Output peak target, in dB below the iteration-0 (no DPD) output peak. Set once; does not grow per pass. The smallest target whose final ACLR was within 0.5 dB of the best in the 2.4 GHz / 100 MHz sweep ([dpd_pass.md](dpd_pass.md#what-to-expect-offline)) |
+| `MAX_MARGIN_DB` | `4.0` | Largest total backoff (target + guard). If even this exceeds the limit, the loop stops |
 | `SAVE_DIR` | `DPD_DUT/ila_gmp` | Where every file of the run goes |
 | `LABEL` | `ila_gmp` | Prefix of the loop files |
 | `OUTPUT_OVERSAMPLE` | `2` | Periods per capture, so one aligned period can be cut out |
