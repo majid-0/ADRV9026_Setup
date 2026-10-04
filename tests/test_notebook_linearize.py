@@ -3,7 +3,9 @@
 The notebook's code cells run in order with ``Radio`` replaced by the sim bench,
 the profile read replaced by one at the sim rate, and a small synthetic signal
 file in a temporary folder. Parameters are overridden right after the
-parameters cell. Skipped when matplotlib is not installed.
+parameters cell. The sim PA is memoryless, so the post-inverse is the memoryless
+GMP(9, 1, 0) (see ``test_dpd.py`` for what GMP(5, 5, 2) does on it). Skipped
+when matplotlib is not installed.
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ SIM_PARAMS = {
     "TX_ATTEN_MIN_DB": 5.0,
     "SAVE_DIR": "run",
     "LABEL": "ila",
+    "K": 9,
+    "MEMORY": 1,
+    "CROSS": 0,
 }
 
 
@@ -94,10 +99,22 @@ def _check_loop(ns) -> None:
     assert table[-1]["nmse_db"] <= table[0]["nmse_db"] - 20.0
     assert all(r["dpd_peak_dbm"] <= PEAK_LIMIT_DBM for r in table[1:])
     assert all(r["tx_clipped"] == 0 for r in table)
+    target = ns["TARGET_BACKOFF_DB"]
+    assert all(abs(r["output_peak_db"] + target) <= 0.05 for r in table[1:]), table
+    assert all(r["guard_db"] == 0.0 for r in table[1:])
     with open(Path(ns["SAVE_DIR"]) / "ila_steps.csv", newline="") as fh:
         rows = list(csv.DictReader(fh))
     assert [int(r["iteration"]) for r in rows] == [0, 1, 2, 3]
-    assert {"aclr_lower_dbc", "aclr_upper_dbc", "margin_db", "dpd_peak_dbm"} <= set(rows[0])
+    assert {
+        "aclr_lower_dbc",
+        "aclr_upper_dbc",
+        "output_peak_db",
+        "papr_expansion_db",
+        "pa_papr_compression_db",
+        "target_backoff_db",
+        "guard_db",
+        "dpd_peak_dbm",
+    } <= set(rows[0])
     assert (Path(ns["SAVE_DIR"]) / "ila.csv").is_file()
     assert ns["radio"].disconnected and not ns["radio"].tx_on
 

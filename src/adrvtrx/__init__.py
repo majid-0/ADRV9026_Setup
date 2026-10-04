@@ -28,6 +28,7 @@ from .conditions import (
 from .config import Config, lo_for_tx, load_config
 from .dpd import (
     FULL_SCALE_DBM,
+    TARGET_BACKOFF_DB,
     IlaStep,
     PeakLimit,
     iteration_table,
@@ -144,6 +145,7 @@ __all__ = [
     "GMP",
     "peak_block",
     "FULL_SCALE_DBM",
+    "TARGET_BACKOFF_DB",
     "peak_dbm",
     "normalize_pair",
     "PeakLimit",
