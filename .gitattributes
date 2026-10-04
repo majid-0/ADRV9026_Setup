@@ -3,3 +3,6 @@
 
 # Treat captured/waveform data as text too (tab-delimited IQ).
 *.iq text eol=lf
+
+# Binary test fixtures.
+*.npz binary

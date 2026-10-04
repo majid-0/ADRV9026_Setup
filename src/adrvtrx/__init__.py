@@ -26,7 +26,17 @@ from .conditions import (
     save_aligned_iq,
 )
 from .config import Config, lo_for_tx, load_config
+from .dpd import (
+    FULL_SCALE_DBM,
+    IlaStep,
+    PeakLimit,
+    iteration_table,
+    limit_peak,
+    normalize_pair,
+    peak_dbm,
+)
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
+from .gmp import GMP, peak_block
 from .linearize import LinearizeResult, linearize
 from .metrics import (
     PA_CLIP_SLOPE,
@@ -39,6 +49,7 @@ from .metrics import (
     rms_dbfs,
     window_compression_db,
 )
+from .operating_point import OperatingPoint, find_operating_point
 from .profile import ProfileInfo, read_profile
 from .replay import replay_conditions, stored_tx
 from .sweep import SweepAxis, run_sweep, sweep_points
@@ -128,6 +139,17 @@ __all__ = [
     "stored_tx",
     "linearize",
     "LinearizeResult",
+    "OperatingPoint",
+    "find_operating_point",
+    "GMP",
+    "peak_block",
+    "FULL_SCALE_DBM",
+    "peak_dbm",
+    "normalize_pair",
+    "PeakLimit",
+    "limit_peak",
+    "IlaStep",
+    "iteration_table",
 ]
 
 

@@ -21,6 +21,8 @@ htmlcov/
 *.iq
 captures/
 data/
+# ...except the small committed test fixtures.
+!tests/data/
 
 # Extracted vendor docs (regenerate from CHM; keep curated docs/api_notes.md)
 chm_extracted/

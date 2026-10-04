@@ -198,15 +198,32 @@ def load_aligned_iq(path: str | Path) -> np.ndarray:
 
 
 class ConditionLog:
-    """CSV writer for records. The header is written on open; each row is flushed."""
+    """CSV writer for records. The header is written on open; each row is flushed.
 
-    def __init__(self, path: str | Path, fields: tuple[str, ...] = CSV_FIELDS):
+    With ``append=True`` an existing, non-empty file is kept and rows are added
+    after it; its header must be exactly ``fields`` (``ValueError`` otherwise).
+    """
+
+    def __init__(
+        self, path: str | Path, fields: tuple[str, ...] = CSV_FIELDS, *, append: bool = False
+    ):
         self.path = Path(path)
         self.fields = tuple(fields)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.path, "w", newline="")
+        keep = append and self.path.is_file() and self.path.stat().st_size > 0
+        if keep:
+            with open(self.path, newline="") as fh:
+                header = tuple(next(csv.reader(fh), ()))
+            if header != self.fields:
+                raise ValueError(
+                    f"{self.path}: cannot append, its columns differ from the record's "
+                    f"(missing {sorted(set(self.fields) - set(header))}, "
+                    f"extra {sorted(set(header) - set(self.fields))})"
+                )
+        self._file = open(self.path, "a" if keep else "w", newline="")
         self._writer = csv.DictWriter(self._file, fieldnames=list(self.fields))
-        self._writer.writeheader()
+        if not keep:
+            self._writer.writeheader()
         self._file.flush()
 
     def append(self, record, **extra: Any) -> None:
