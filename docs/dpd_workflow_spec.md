@@ -11,6 +11,17 @@ PA clip guard on the AM/AM top slope (`min_top_slope`). Every capture row and
 every search step records PAPR compression, gain compression and top slope. The
 PAPR lock stays the default, so existing notebooks behave as before.
 
+**`feat/linearize-lock-gmp`:** a one-notebook live DPD flow. New modules
+`gmp` (a numpy GMP fitted by block least squares, §5.6), `dpd` (peak units,
+`normalize_pair`, the peak limit and the ILA step, §5.7) and `operating_point`
+(transmit, lock, backoff, capture and CSV row in one call, §5.8).
+`dpd_linearize_loop.ipynb` finds the operating point (or reuses a CSV row) and
+runs iterative ILA with the built-in GMP, never transmitting a DPD waveform
+whose peak is above a hard limit (9.9 dBm; full scale = 10 dBm). `ConditionLog`
+can append to an existing CSV. `linearize` is unchanged. Readable walkthroughs:
+[dpd_pass.md](dpd_pass.md) (one DPD pass) and
+[linearize_notebook.md](linearize_notebook.md) (the whole notebook).
+
 This adds a PA characterization and DPD workflow to `adrvtrx`. It comes from the
 ReplicatingScalability bench scripts (`compression_search.py`, `conditions.py`,
 `dpd_playback.py` and the Single/Multi Operation notebooks).
@@ -33,11 +44,15 @@ ReplicatingScalability bench scripts (`compression_search.py`, `conditions.py`,
 4. **Linearize.** Either:
    - **Offline replay:** play the DPD file for each CSV row at that row's saved
      condition, capture, and log the result.
-   - **Online loop:** at one saved condition, repeat transmit → capture → align
-     → user `step()` → next waveform.
+   - **Online loop:** at one saved condition (or one found in the same
+     notebook), repeat transmit → capture → align → `step()` → next waveform.
+     The reference `step` is ILA with the built-in GMP (§5.7).
 
-`adrvtrx` never imports a model library (no `dpd_kit`, no torch). The only
-interfaces are files and a Python callable.
+`adrvtrx` imports no external model library (no `dpd_kit`, no torch, no
+TensorFlow); one small numpy GMP ships as the reference DPD for the sample loop
+(`adrvtrx.gmp`, `adrvtrx.dpd`). Other models still plug in through files (the
+replay) or a Python callable (the loop's `step`, or any model with `fit` and
+`predict` inside `IlaStep`).
 
 **This PR is single-band.** Dual band is covered in §9.
 
@@ -179,7 +194,8 @@ CSVs on `name`.
 
 ## 5. API
 
-New modules: `metrics`, `compression`, `conditions`, `replay`, `linearize`.
+New modules: `metrics`, `compression`, `conditions`, `replay`, `linearize`,
+and on `feat/linearize-lock-gmp` `gmp`, `dpd`, `operating_point`.
 All new public names are exported from `adrvtrx/__init__.py`. Hardware
 functions follow the existing rules: TX must already be running where stated,
 nothing reads the ORx gain back, and TX is disabled in a `finally` block.
@@ -293,7 +309,8 @@ class OperatingCondition: ...            # §4.1, to_row / from_row as today
 class DutRecord: ...                     # §4.2
 
 class ConditionLog:                      # CSV writer, flushes every row
-    def __init__(self, path, fields=CSV_FIELDS): ...
+    def __init__(self, path, fields=CSV_FIELDS, *, append=False): ...
+        # append=True keeps an existing file with exactly these columns
     def append(self, record): ...        # OperatingCondition or DutRecord
 
 load_conditions(path) -> list[OperatingCondition]
@@ -382,14 +399,131 @@ linearize(radio, condition, x, step, *, tx, orx, tx_bits, rx_bits, fs,
    `{name}_{label}_it{k}_u.txt`, `{name}_{label}_it{k}_z.txt` and `{label}.csv`
    (DUT columns plus `iteration`).
 
-The example `step` in `dpd_linearize_loop.ipynb` scales like the offline study:
-it peak-normalizes `z`, rotates it onto `x`, fits the post-inverse `z → u` and
-predistorts `x` with its peak 0.2 dB below the training peak. Normalizing `z` by
-its least-squares gain instead asks the PA for peaks above saturation, and the
-fitted inverse diverges.
+`linearize` knows nothing about the model. The reference step is
+`adrvtrx.dpd.IlaStep` (§5.7), used by `dpd_linearize_loop.ipynb`. It scales
+like the offline study: it peak-normalizes `z`, rotates it onto `x`, fits the
+post-inverse `z → u` and predistorts `x` with an input backoff of at least
+0.2 dB, grown until the DPD peak meets the limit. Normalizing `z` by its
+least-squares gain instead asks the PA for peaks above saturation, and the
+fitted inverse diverges. Any other algorithm (DLA, one-shot fit) is just
+another `step`.
 
-The DPD algorithm (ILA, DLA, one-shot fit) is entirely the user's `step`.
-Nothing model-specific lives in `adrvtrx`.
+### 5.6 `adrvtrx.gmp` (pure)
+
+```python
+class GMP:
+    def __init__(self, K, N, M, causal=False): ...
+    n_coeffs: int        # N*(K*(1+2M)+1); fewer when causal
+    memory: int          # N + M samples back, including the current one
+    lookahead: int       # M, or 0 when causal
+    coef: np.ndarray | None
+    def basis(self, u, start=0, stop=None) -> np.ndarray   # rows start:stop
+    def fit(self, u, target, block=None, ridge=0.0) -> GMP
+    def predict(self, u, chunk=65536) -> np.ndarray
+
+peak_block(x, n) -> tuple[int, int]   # n samples centred on argmax|x|, clamped
+```
+
+- Basis, the same as dpd_kit `GMP.unified(K, N, M)`: aligned
+  `u(n-l)|u(n-l)|^k` (k = 0..K, l = 0..N-1), lagging `u(n-l)|u(n-l-m)|^k` and
+  leading `u(n-l)|u(n-l+m)|^k` (k = 1..K, m = 1..M). `causal=True` drops the
+  leading terms with `l < m` (they read a future sample). Samples outside the
+  signal read as zero; a block's rows equal the full signal's rows.
+- `fit`: least squares on the rows `block = (start, stop)` (default all).
+  Each column is divided by its norm before the solve and the coefficients are
+  scaled back; `ridge` adds `ridge·‖w‖²` on the scaled coefficients.
+- `predict` builds the basis `chunk` samples at a time, so a 1M-sample signal
+  fits in memory.
+- Regression: on the TX1 2.4 GHz / 100 MHz capture, with the
+  `research/gmp_baseline` normalization and an 8192-sample block on the input
+  peak, it reproduces the `results.csv` full-signal NMSE of forward and inverse
+  K5 N3 M1, K3 N3 M1 and K5 N5 M2 to 0.001 dB.
+
+### 5.7 `adrvtrx.dpd` (pure)
+
+```python
+FULL_SCALE_DBM = 10.0
+peak_dbm(s) -> float                     # 10 + 20*log10(max|s|)
+normalize_pair(x, y, rotate=True) -> (x_n, y_n)
+    # x/max|x|, y/max|y|, y rotated by the phase of vdot(x, y)
+
+@dataclass
+class PeakLimit:
+    waveform: np.ndarray
+    margin_db: float
+    peak_dbm: float
+    ok: bool
+    tries: list[tuple[float, float]]     # (margin_db, peak_dbm) evaluated
+
+limit_peak(dpd, x, *, peak_limit_dbm=9.9, start_margin_db=0.2,
+    max_margin_db=4.0, tol_db=0.01, coarse_step_db=0.25) -> PeakLimit
+
+class IlaStep:                           # step(x, u, z, it) for linearize
+    def __init__(self, model_factory, *, n_train=8192, peak_limit_dbm=9.9,
+        start_margin_db=0.2, max_margin_db=4.0, tol_db=0.01,
+        coarse_step_db=0.25, verbose=False): ...
+    history: list[dict]   # iteration, post_inverse_nmse_db, margin_db,
+                          # dpd_peak_dbm, papr_expansion_db, ok
+    reason: str           # why the last call returned None
+    model                 # the last fitted post-inverse
+
+iteration_table(records, history) -> list[dict]
+    # one row per capture: iteration, nmse_db, aclr_lower_dbc, aclr_upper_dbc,
+    # aclr_worst_dbc, gain_compression_db, papr_compression_db,
+    # papr_expansion_db, tx_clipped, railed, margin_db, dpd_peak_dbm,
+    # post_inverse_nmse_db (NaN at iteration 0)
+```
+
+- Units: a waveform normalized to DAC full scale; 1.0 = the original input
+  peak = 10 dBm.
+- `limit_peak`: the smallest input backoff `m ≥ start_margin_db` with
+  `peak_dbm(dpd(x·10^(-m/20))) ≤ peak_limit_dbm`. No monotonicity is assumed:
+  `coarse_step_db` steps up to `max_margin_db`, then bisection to `tol_db` in
+  the first step that meets the limit. The returned margin was evaluated and
+  met the limit. `ok=False` when no margin up to `max_margin_db` does.
+- `IlaStep.__call__(x, u, z, it)`: `normalize_pair(x, z)`; fit a fresh
+  `model_factory()` model `z_n → u` on `peak_block(z_n, n_train)`, with `u`
+  **as is** (DAC units, so the DPD output is in DAC units and the peak check is
+  real); `limit_peak(model.predict, x_n)`. Returns the next `u`, or `None`
+  (the loop stops; nothing over the limit is sent) with `reason` set.
+- Each pass aims for an output peak `margin` dB below the one just measured,
+  so the drive steps down by about the margin per pass.
+
+Walkthrough with a diagram: [dpd_pass.md](dpd_pass.md).
+
+### 5.8 `adrvtrx.operating_point`
+
+```python
+@dataclass
+class OperatingPoint:
+    condition: OperatingCondition
+    point: PointCapture
+    search: CompressionResult
+    ref: np.ndarray                      # TX codes of the reference
+    x: np.ndarray                        # ref / full_scale(tx_bits)
+    agc: AgcResult | None                # the AGC after a backoff
+    csv_path: Path | None
+
+find_operating_point(radio, tx, orx, signal, *, tx_bits, rx_bits, fs,
+    freq_hz, bw_mhz, target_compression_db, start_atten_db, atten_min_db,
+    signal_name="signal.txt", lock_on="papr", min_top_slope=None,
+    window_s=1e-4, <search + AGC tolerances>, max_iterations=24,
+    backoff_db=0, oversample=2, lo="LO1", save_dir=None, csv_name=None,
+    on_step=None) -> OperatingPoint
+```
+
+1. TX off, `start_atten_db`, `retune_lo(lo, freq_hz)`, then transmit `signal`
+   (normalized and quantized by `prepare_tx`).
+2. `find_compression_point` (AGC at the start, then the search; §5.2).
+3. `backoff_db > 0`: attenuation `min(lock + backoff, 41.95)`, then
+   `autolevel_capture` there (as in `pa_operating_sweep.ipynb`).
+4. `capture_point` (`pa_clipped` with `min_top_slope` or `PA_CLIP_SLOPE`).
+5. TX disabled in `finally`.
+6. The `OperatingCondition` row, named by `condition_name`. With `save_dir`:
+   `{signal_stem}_in.txt`, `{name}_out.txt`, and the row appended to
+   `csv_name` (default `{TX}_conditions.csv`).
+
+The radio is left at the condition's attenuation and ORx gain.
 
 ---
 
@@ -400,7 +534,7 @@ Nothing model-specific lives in `adrvtrx`.
 | `pa_operating_point.ipynb` | SingleOperationCompressionSweep | One LO and one signal. Runs `find_compression_point`, captures at the lock with `capture_point`, and writes one CSV row plus files. Plots the search history and the peak window. `LOCK_ON` (`papr` default, or `gain`) and `MIN_TOP_SLOPE` switch the lock metric and the clip guard; every step prints both compressions and the top slope |
 | `pa_operating_sweep.ipynb` | MultiOperationCompressionSweep | Loops over signals × LOs. Runs the search per pair, then captures each backoff with an AGC before every one. Writes the capture CSV. The loop stays in the notebook so the procedure is visible. Same `LOCK_ON` / `MIN_TOP_SLOPE` switches; also plots gain compression and top slope against backoff |
 | `dpd_replay.ipynb` | MultiOperationDpdPlayback | `replay_conditions` with a `waveform_for` that loads the user's DPD files. Also shows the gain compression left after the DPD |
-| `dpd_linearize_loop.ipynb` | new | `linearize` at one condition, with an example ILA `step` written in the notebook using `dpd_kit` GMP (the path is a parameter) |
+| `dpd_linearize_loop.ipynb` | new | The live DPD flow in one notebook. `CONDITION_SOURCE = "lock"` finds the operating point with `find_operating_point` (PAPR or gain lock, clip guard, optional backoff, CSV row); `"csv"` reuses a saved row. Then `linearize` with `IlaStep(lambda: GMP(K, MEMORY, CROSS))`, the hard peak limit `PEAK_LIMIT_DBM` and the auto margin. Prints and writes the per-iteration table (`{LABEL}_steps.csv`: ACLR lower/upper, NMSE, gain compression, margin, DPD peak, PAPR expansion, `tx_clipped`) and plots ACLR, NMSE, gain compression, the DPD peak against the limit, and the spectrum. Walkthrough: [linearize_notebook.md](linearize_notebook.md) |
 
 Each notebook has the usual structure: parameters, imports/config/profile,
 connect/program, run, plots, then safe-state and disconnect.
@@ -430,6 +564,16 @@ models:
 | `test_find_compression_point.py` | On the sim bench, lands within ±tol and leaves the radio at the result |
 | `test_replay.py` | Pre-flight lists missing files and wrong lengths. Retunes only when the frequency changes. Applies the saved attenuation and gain without AGC. Transmits u as stored (asserts the codes). z is aligned to u and the metrics are against x. `tx_clipped` is counted. TX is disabled even if the replay raises |
 | `test_linearize.py` | With an ideal inverse-Rapp `step`, NMSE improves after iteration 0. `None` stops the loop. Stops on rail. Files and CSV written. TX disabled on exception |
+| `test_gmp.py` | Coefficient count (non-causal = dpd_kit `GMP.unified`, causal). Exact recovery of a synthetic GMP's coefficients on a block. Column scaling gives the plain least-squares answer; ridge shrinks. Chunked `predict` = one chunk. A causal model reads no future sample. Block rows = full rows. `peak_block` placement and clamping |
+| `test_dpd.py` | `peak_dbm` (10 dBm at full scale). `normalize_pair` removes gain and phase. `limit_peak`: smallest margin within `tol_db`, keeps the start margin when enough, flags an unreachable limit, finds the first good bracket of a non-monotonic peak. `IlaStep` fits the normalized, rotated `z` to `u` as is and returns `None` over the limit (the loop stops before sending). On the sim bench through `linearize` (GMP 5,5,2, 4 iterations) and on the real-signal fixture with a forward-model DUT: NMSE improves by ≥ 20 dB, the worst ACLR of the last iteration is ≥ 20 dB better than iteration 0 and no iteration is more than 0.3 dB worse than the one before, every DPD peak ≤ 9.9 dBm, `tx_clipped` = 0 |
+| `test_operating_point.py` | `find_operating_point` on the sim bench: PAPR lock without backoff, backoff with the AGC (more ORx gain, less compression), gain lock with the clip guard, files written and rows appended, a CSV with other columns refused, TX disabled when the search raises |
+| `test_notebook_linearize.py` | Runs `dpd_linearize_loop.ipynb` cell by cell on the sim bench: PAPR lock, gain lock with `MIN_TOP_SLOPE = 0.08`, and a saved CSV row. Same ACLR, NMSE and peak checks. Skipped without matplotlib |
+
+**Real-signal fixture.** `tests/data/tx1_2400mhz_100bw_excerpt.npz` (about
+0.8 MB): 65 536 samples of `x` and the aligned `y` of the TX1 2.4 GHz / 100 MHz
+capture, centred on the input peak, complex64. The DUT in `test_dpd.py` is a
+GMP(5, 5, 2) fitted `x → y` on it, with its input clamped at the fixture's
+peak so the polynomial does not extrapolate.
 
 `make lint` (ruff + black, line length 100, py39) and `make test` must pass.
 
@@ -468,3 +612,6 @@ existing CSVs keep loading.
 5. §5.5: the `step(x, u, z, it)` signature and the stop rules.
 6. §6: sweep loop kept in the notebook, not a library function.
 7. §9: dual band deferred.
+8. §5.7: the post-inverse target is `u` as is (DAC units), the 9.9 dBm limit,
+   the auto margin, and the stop when the limit cannot be met.
+9. §5.8: the operating point in one call; TX off in `finally`; CSV rows appended.

@@ -12,7 +12,7 @@ have been run end-to-end on hardware.
 | [pa_operating_point.ipynb](pa_operating_point.ipynb) | Search one LO for the TX attenuation at a target PAPR compression, capture at that lock, write one condition row. |
 | [pa_operating_sweep.ipynb](pa_operating_sweep.ipynb) | Signals x LOs: search each pair, then capture every backoff from the lock; writes `TX1_conditions.csv`. |
 | [dpd_replay.ipynb](dpd_replay.ipynb) | Replay DPD files at every saved condition (no AGC, no rescale) and compare against the original captures. |
-| [dpd_linearize_loop.ipynb](dpd_linearize_loop.ipynb) | Online loop at one saved condition; example ILA GMP `step` from `dpd_kit`. |
+| [dpd_linearize_loop.ipynb](dpd_linearize_loop.ipynb) | Live DPD: find the operating point here (or reuse a CSV row), then iterative ILA with the built-in GMP under a hard DPD peak limit; per-iteration ACLR / NMSE / peak table and plots. Walkthrough: [docs/linearize_notebook.md](../docs/linearize_notebook.md). |
 
 The last four are single band and follow
 [docs/dpd_workflow_spec.md](../docs/dpd_workflow_spec.md): what each CSV column
