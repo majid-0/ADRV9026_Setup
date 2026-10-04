@@ -397,9 +397,9 @@ Nothing model-specific lives in `adrvtrx`.
 
 | Notebook | Replaces | What it does |
 |---|---|---|
-| `pa_operating_point.ipynb` | SingleOperationCompressionSweep | One LO and one signal. Runs `find_compression_point`, captures at the lock with `capture_point`, and writes one CSV row plus files. Plots the search history and the peak window |
-| `pa_operating_sweep.ipynb` | MultiOperationCompressionSweep | Loops over signals × LOs. Runs the search per pair, then captures each backoff with an AGC before every one. Writes the capture CSV. The loop stays in the notebook so the procedure is visible |
-| `dpd_replay.ipynb` | MultiOperationDpdPlayback | `replay_conditions` with a `waveform_for` that loads the user's DPD files |
+| `pa_operating_point.ipynb` | SingleOperationCompressionSweep | One LO and one signal. Runs `find_compression_point`, captures at the lock with `capture_point`, and writes one CSV row plus files. Plots the search history and the peak window. `LOCK_ON` (`papr` default, or `gain`) and `MIN_TOP_SLOPE` switch the lock metric and the clip guard; every step prints both compressions and the top slope |
+| `pa_operating_sweep.ipynb` | MultiOperationCompressionSweep | Loops over signals × LOs. Runs the search per pair, then captures each backoff with an AGC before every one. Writes the capture CSV. The loop stays in the notebook so the procedure is visible. Same `LOCK_ON` / `MIN_TOP_SLOPE` switches; also plots gain compression and top slope against backoff |
+| `dpd_replay.ipynb` | MultiOperationDpdPlayback | `replay_conditions` with a `waveform_for` that loads the user's DPD files. Also shows the gain compression left after the DPD |
 | `dpd_linearize_loop.ipynb` | new | `linearize` at one condition, with an example ILA `step` written in the notebook using `dpd_kit` GMP (the path is a parameter) |
 
 Each notebook has the usual structure: parameters, imports/config/profile,
