@@ -121,7 +121,7 @@ Errors:
 |---|---|
 | `ServerUnavailable` (`ConnectionError`) | No server on the port, or no key file |
 | `BoardBusy` (`RuntimeError`) | `wait=False` and the board is owned, or the queue `timeout` passed |
-| `LeaseRevoked` (`RuntimeError`) | The job was ended by `kick`, `safe`, a heartbeat timeout, or server stop. Every later call raises it |
+| `LeaseRevoked` (`RuntimeError`) | The job was ended by `kick`, `safe`, a heartbeat timeout, the idle limit, or server stop. Every later call raises it |
 | `ServerConnectionLost` (`ConnectionError`) | The connection dropped during the job (server killed or restarted). The job must be run again |
 | `RemoteError` (`RuntimeError`) | A hardware call raised in the server. The remote traceback is in the message. Built-in exception types (`ValueError`, `KeyError`, ...) are raised as that type |
 
@@ -142,6 +142,15 @@ the job holds the board.
   rejected, not run.
 - A client that disconnects while waiting is removed from the queue.
 - Server start-up counts as busy: jobs queue until programming has finished.
+- **Hold.** `adrvtrx-server safe` holds the queue: after it, no queued job gets
+  the board until `adrvtrx-server resume` (`client.server_resume()`). Waiting
+  jobs keep waiting (their `timeout` still applies; `wait=False` fails with
+  "board held"). `status` shows `held since T, by safe`. `kick` does not hold:
+  the next job starts as soon as TX is safe.
+- **Idle limit.** A job that makes no hardware call for `idle_timeout_s`
+  (default 1800 s; 0 turns it off), whatever the TX state, is released:
+  `safe_state`, logged as `idle_release`, and its next call raises
+  `LeaseRevoked` ("idle ..."). Heartbeats do not count as calls.
 
 ### 4.1 TX playback RAM (loaded signals)
 
@@ -188,7 +197,7 @@ between two jobs means the calibrations ran again.
   by the watchdog killing the server process.
 - The heartbeat proves the client process is alive, not that its script is
   making progress. A script blocked in Python (for example on `input()`) still
-  heartbeats; use `kick`.
+  heartbeats; the idle limit releases it after `idle_timeout_s`, or use `kick`.
 - After a server restart, running jobs get `ServerConnectionLost`; nothing is
   replayed. The board is re-programmed from the config.
 - Large `perform_tx` buffers are pickled over localhost; the .NET conversion
@@ -206,8 +215,9 @@ Every path ends in `safe_state()` on all TX channels.
 | Job ends, raises, or Ctrl+C in the client | `with` exit → release → `safe_state` → next job | immediate |
 | Client force-killed | the OS closes its socket → server sees the drop → `safe_state` → next job | immediate (after a call in progress) |
 | Client alive but stuck (frozen process, debugger pause, sleep) | no heartbeat for `heartbeat_timeout_s` (10 s) while TX is enabled → lease revoked → `safe_state` | 10 s |
-| `adrvtrx-server kick` | current lease revoked → `safe_state`; that client's next call raises `LeaseRevoked`. Replaces STOP files | immediate |
-| `adrvtrx-server safe` | skips the queue: `safe_state` runs next on the hardware thread (ahead of queued calls); the current lease is revoked so its next call cannot re-enable TX | immediate (after a call in progress) |
+| Job makes no hardware call (stuck in Python, forgotten notebook) | idle limit: no call for `idle_timeout_s` (30 min), any TX state → lease released → `safe_state`; its next call raises `LeaseRevoked` | 30 min |
+| `adrvtrx-server kick` | current lease revoked → `safe_state`; that client's next call raises `LeaseRevoked`; the next job then starts. Replaces STOP files | immediate |
+| `adrvtrx-server safe` | skips the queue: `safe_state` runs next on the hardware thread (ahead of queued calls); the current lease is revoked so its next call cannot re-enable TX; the queue is **held** (no job gets the board) until `adrvtrx-server resume` | immediate (after a call in progress) |
 | `adrvtrx-server safe --direct` | server unreachable: this process connects to the board itself and runs `force_safe`. Refused while a live server answers, unless `--force` | connect time |
 | `adrvtrx-server stop`, Ctrl+C or SIGTERM to the server, supervisor gone, unhandled server error | lease revoked → `safe_state` → `disconnect` → exit | immediate |
 | Server force-killed or crashed | **watchdog**: the supervisor sees the child exit, runs `force_safe` in a fresh process with a fresh board connection, then restarts the server | seconds |
@@ -251,6 +261,9 @@ program  #12 at 2026-10-07T09:58:40 (ADRV9025Init_StdUseCase98_LinkSharing.profi
 error    -
 ```
 
+After `adrvtrx-server safe` a line `held     since T, by safe (queue waits
+for `adrvtrx-server resume`)` follows `state`, and `owner` is `-`.
+
 Board values are the last commanded ones (LO, attenuation, gain, enables),
 refreshed from a live `Radio.status()` read when the hardware thread is idle.
 
@@ -271,6 +284,7 @@ and pings are not.
 | `state_dir` | `""` | Holds the auth key `server.key`. Blank: `%LOCALAPPDATA%\adrvtrx` on Windows, `$XDG_STATE_HOME/adrvtrx` or `~/.local/state/adrvtrx` elsewhere |
 | `log_dir` | `""` | Blank: `<state_dir>/logs` |
 | `heartbeat_timeout_s` | `10` | Revoke a silent lease after this long while TX is enabled |
+| `idle_timeout_s` | `1800` | Release a job that made no hardware call this long, any TX state (heartbeats do not count); `0` = off |
 | `call_timeout_s` | `{ default = 60, program = 600 }` | Per-method limit before the watchdog treats the server as stuck. `startup` (connect + force_safe + program) falls back to `program` |
 | `ping_interval_s` | `1` | Supervisor ping period |
 | `ping_timeout_s` | `15` | No ping answer this long: server is stuck |
@@ -292,9 +306,12 @@ On POSIX it is written with mode `0600`.
 adrvtrx-server run    [--config PATH] [--backend real|fake|MODULE:ATTR] [--no-program]
 adrvtrx-server status [--config PATH] [--json]
 adrvtrx-server safe   [--config PATH] [--direct [--force] [--backend ...]]
+adrvtrx-server resume [--config PATH]
 adrvtrx-server kick   [--config PATH]
 adrvtrx-server stop   [--config PATH]
 ```
+
+- `safe` holds the queue (§4); `resume` lets the queued jobs run again.
 
 - `--backend real` (default) is `adrvtrx.radio:Radio`. `--backend fake` is
   `adrvtrx.fake:FakeRadio`, the simulated board of §9.1, for dry runs and
@@ -411,8 +428,11 @@ Close every notebook and script that builds its own `Radio`.
    the owner's name, pid, host and start time.
 6. **Client killed.** While the script holds TX on, `taskkill /F /PID <pid>`.
    The carrier disappears within a second; `status` shows TX off.
-7. **Kick and safe.** While TX is on: `adrvtrx-server kick` (TX off; the
-   script's next call raises `LeaseRevoked`). Repeat with `adrvtrx-server safe`.
+7. **Kick and safe.** Start a second job so one is waiting. While TX is on:
+   `adrvtrx-server kick` (TX off; the script's next call raises `LeaseRevoked`;
+   the waiting job starts). Repeat with `adrvtrx-server safe`: TX off, the
+   script's next call raises, and the waiting job does **not** start; `status`
+   shows `held ... by safe`. `adrvtrx-server resume`: the waiting job starts.
 8. **Heartbeat.** While TX is on, freeze the script (Resource Monitor →
    Suspend process, or pause it in a debugger). TX goes off after about 10 s.
 9. **Watchdog.** With TX on at 41.95 dB attenuation, kill the server process
@@ -454,7 +474,8 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | queue | FIFO order, `wait=False`, queue timeout, waiting client disconnects |
 | client killed | a client process killed with TX on → `safe_state`, next job proceeds |
 | heartbeat | silent client with TX on → revoked after the timeout |
-| kick / safe | lease revoked, TX safe, the job's next call raises `LeaseRevoked` |
+| kick / safe | lease revoked, TX safe, the job's next call raises `LeaseRevoked`; `safe` holds the queue (waiters wait, `wait=False` fails, timeouts apply) until `resume`; `kick` does not |
+| idle limit | a job without hardware calls is released even while it heartbeats; `idle_timeout_s = 0` turns it off |
 | watchdog | server process killed → fresh-process `force_safe`, restart; stuck call → killed, safe, restarted |
 | single instance | a second `run` is refused without touching the board |
 | safe --direct | forces safe through the fake backend; refused while a server answers |

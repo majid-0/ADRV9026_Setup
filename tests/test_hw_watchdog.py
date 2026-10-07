@@ -178,8 +178,12 @@ def test_status_safe_kick_cli(bench):
         assert out.returncode == 0 and 'kicked "cli job"' in out.stdout
         radio.release()
         out = server_cli("safe", "--config", cfg, env=env)
-        assert out.returncode == 0 and "TX forced safe" in out.stdout
-        assert "TX       off" in server_cli("status", "--config", cfg, env=env).stdout
+        assert out.returncode == 0 and "TX forced safe" in out.stdout and "HELD" in out.stdout
+        status = server_cli("status", "--config", cfg, env=env).stdout
+        assert "TX       off" in status and "held     since" in status and "by safe" in status
+        out = server_cli("resume", "--config", cfg, env=env)
+        assert out.returncode == 0 and "queue resumed" in out.stdout
+        assert "held     since" not in server_cli("status", "--config", cfg, env=env).stdout
     finally:
         sup.close()
 

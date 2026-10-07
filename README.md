@@ -184,10 +184,15 @@ Emergency stop:
 
 ```bash
 adrvtrx-server safe            # TX safe now, ahead of everything; ends the current job
-adrvtrx-server kick            # end the current job (TX safe); its next call raises
+                               # and HOLDS the queue (no job starts) until:
+adrvtrx-server resume          # let the queued jobs run again
+adrvtrx-server kick            # end the current job (TX safe); the next job starts
 adrvtrx-server stop            # TX safe, disconnect, exit
 adrvtrx-server safe --direct   # server unreachable: connect to the board and force safe
 ```
+
+A job that makes no hardware call for 30 minutes (`[server] idle_timeout_s`)
+is released and TX forced safe, even if its process is alive.
 
 If the server prints `TX STATE UNKNOWN`, switch off the PA supply.
 

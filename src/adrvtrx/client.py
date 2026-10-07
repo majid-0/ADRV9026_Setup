@@ -57,6 +57,7 @@ __all__ = [
     "server_safe",
     "server_kick",
     "server_stop",
+    "server_resume",
     "server_config",
     "tx_signal_ids",
 ]
@@ -342,13 +343,21 @@ def server_status(config=None, *, live: bool = True) -> dict[str, Any]:
 
 
 def server_safe(config=None, *, wait_s: float = 10.0) -> dict[str, Any]:
-    """Force TX safe now (ahead of queued calls) and end the current job."""
+    """Force TX safe now (ahead of queued calls), end the current job, hold the queue.
+
+    No queued job gets the board until :func:`server_resume`.
+    """
     return _control("safe", config, timeout=wait_s + 10.0, wait_s=wait_s)
 
 
 def server_kick(config=None, *, wait_s: float = 10.0) -> dict[str, Any]:
     """End the current job (its next call raises :class:`LeaseRevoked`); TX safe."""
     return _control("kick", config, timeout=wait_s + 10.0, wait_s=wait_s)
+
+
+def server_resume(config=None) -> dict[str, Any]:
+    """Release the hold that ``safe`` put on the queue (``{"resumed": bool, ...}``)."""
+    return _control("resume", config)
 
 
 def server_stop(config=None) -> dict[str, Any]:

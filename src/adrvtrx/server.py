@@ -204,7 +204,8 @@ class _Lease:
     id: str
     client: dict[str, Any]
     since: float
-    last_seen: float
+    last_seen: float  # any message (calls and heartbeats)
+    last_call: float = 0.0  # hardware calls only (the idle limit)
     in_flight: int = 0
     ended: str | None = None
     revoked: bool = False
@@ -217,6 +218,7 @@ class _Lease:
             "since": iso(self.since),
             "held_s": round(time.time() - self.since, 1),
             "last_seen_s": round(now - self.last_seen, 1),
+            "idle_s": round(now - self.last_call, 1),
         }
 
 
@@ -346,6 +348,8 @@ class HardwareServer:
         self._owner: _Lease | None = None
         self._ending = False  # the owner's end-of-lease safe_state has not run yet
         self._waiters: deque[_Waiter] = deque()
+        #: Set by ``safe``: no queued job gets the board until ``resume``.
+        self._held: dict[str, Any] | None = None
         self._stop = threading.Event()
         #: Set by a signal handler (a plain assignment: Event.set could deadlock there).
         self.signal_stop: str | None = None
@@ -363,6 +367,7 @@ class HardwareServer:
             "safe": self._op_safe,
             "kick": self._op_kick,
             "stop": self._op_stop,
+            "resume": self._op_resume,
             "config": lambda _s, _m: self.config,
             "session": self._op_session,
             "loaded": lambda _s, _m: self.tx_ram_status(),
@@ -591,6 +596,11 @@ class HardwareServer:
         owner = self._owner
         if self.state == "starting":
             return "adrvtrx-server is starting (programming the board)"
+        if self._held is not None and owner is None:
+            return (
+                f"board held since {self._held['since']} by `adrvtrx-server safe` "
+                f"({len(self._waiters)} waiting; `adrvtrx-server resume` releases it)"
+            )
         if owner is None:
             return f"board busy ({len(self._waiters)} job(s) waiting)"
         c = owner.client
@@ -609,7 +619,12 @@ class HardwareServer:
         with self._cond:
             if self.state == "stopping":
                 raise _OpError("busy", "adrvtrx-server is stopping")
-            free = self.state == "ready" and self._owner is None and not self._ending
+            free = (
+                self.state == "ready"
+                and self._owner is None
+                and not self._ending
+                and self._held is None
+            )
             if not wait and not (free and not self._waiters):
                 raise _OpError("busy", self._busy_message())
             self._waiters.append(me)
@@ -625,10 +640,11 @@ class HardwareServer:
                         and self.state == "ready"
                         and self._owner is None
                         and not self._ending
+                        and self._held is None
                     ):
                         self._waiters.popleft()
                         now = time.monotonic()
-                        lease = _Lease(uuid.uuid4().hex[:12], session.client, time.time(), now)
+                        lease = _Lease(uuid.uuid4().hex[:12], session.client, time.time(), now, now)
                         self._owner = session.lease = lease
                         break
                     if not told:
@@ -689,7 +705,7 @@ class HardwareServer:
 
         with self._cond:
             lease.in_flight += 1
-            lease.last_seen = time.monotonic()
+            lease.last_seen = lease.last_call = time.monotonic()
         try:
             job = self.hw.submit(
                 method, lambda: self._invoke(method, args, kwargs, session.client), check=check
@@ -698,7 +714,7 @@ class HardwareServer:
         finally:
             with self._cond:
                 lease.in_flight -= 1
-                lease.last_seen = time.monotonic()
+                lease.last_seen = lease.last_call = time.monotonic()
         error = job.error
         self.log.write(
             "call",
@@ -942,6 +958,10 @@ class HardwareServer:
 
     def _op_safe(self, session: _Session, message: dict[str, Any]) -> dict[str, Any]:
         who = describe_client(session.client)
+        with self._cond:  # hold the queue first: no waiting job may slip in
+            if self._held is None:
+                self._held = {"since": iso(time.time()), "by": "safe", "client": session.client}
+            held = dict(self._held)
         owner = self._current_owner()
         job = None
         if owner is not None:
@@ -956,8 +976,18 @@ class HardwareServer:
             "error": None if job.error is None else repr(job.error),
             "revoked": None if owner is None else owner.info(),
             "busy_with": self.hw.busy_info(),
+            "held": held,
         }
         self.log.write("safe", client=session.client, **summarize(result))
+        return result
+
+    def _op_resume(self, session: _Session, _message: dict[str, Any]) -> dict[str, Any]:
+        with self._cond:
+            held, self._held = self._held, None
+            waiting = len(self._waiters)
+            self._cond.notify_all()
+        result = {"resumed": held is not None, "held": held, "waiting": waiting}
+        self.log.write("resume", client=session.client, **summarize(result))
         return result
 
     def _op_kick(self, session: _Session, message: dict[str, Any]) -> dict[str, Any]:
@@ -997,6 +1027,7 @@ class HardwareServer:
             if job.wait(5.0) and job.error is None:
                 source = "live"
         with self._cond:
+            held = None if self._held is None else dict(self._held)
             owner = self._owner.info() if self._owner is not None else None
             waiting = [
                 {**w.client, "waiting_s": round(time.time() - w.since, 1)} for w in self._waiters
@@ -1016,6 +1047,7 @@ class HardwareServer:
                 "backend": self.backend_name,
             },
             "state": self.state,
+            "held": held,
             "owner": owner,
             "queue": waiting,
             "hardware": self.hw.busy_info(),
@@ -1078,16 +1110,22 @@ class HardwareServer:
 
     def _monitor(self) -> None:
         timeout = float(self.settings.heartbeat_timeout_s)
+        idle_limit = float(self.settings.idle_timeout_s)
         while not self._stop.wait(min(0.25, timeout / 4)):
             with self._cond:
                 lease = self._owner
                 if lease is None or lease.ended is not None or lease.in_flight:
                     continue
-                silent = time.monotonic() - lease.last_seen
+                now = time.monotonic()
+                silent, idle = now - lease.last_seen, now - lease.last_call
             if silent > timeout and self.cache.tx_live:
                 self._end_lease(
                     lease, f"no heartbeat for {silent:.1f} s while TX was enabled", revoked=True
                 )
+            elif idle_limit > 0 and idle > idle_limit:
+                reason = f"idle: no hardware call for {idle:.0f} s (idle_timeout_s {idle_limit:g})"
+                self.log.write("idle_release", client=lease.client, lease=lease.id, idle_s=idle)
+                self._end_lease(lease, reason, revoked=True)
 
 
 # -- fresh-process force safe ---------------------------------------------------------------
@@ -1447,6 +1485,12 @@ def format_status(st: dict[str, Any]) -> str:
         f"restarts {srv['restarts']}, {'supervised' if srv['supervised'] else 'NOT supervised'}",
         f"state    {st['state']} (backend {srv['backend']})",
     ]
+    held = st.get("held")
+    if held:
+        lines.append(
+            f"held     since {held['since']}, by {held['by']} "
+            f"(queue waits for `adrvtrx-server resume`)"
+        )
     owner = st["owner"]
     if owner:
         lines.append(
@@ -1519,7 +1563,7 @@ def _parser() -> argparse.ArgumentParser:
         default="real",
         help="real (the board, default), fake (simulated, no DLL) or module:attr",
     )
-    sub = parser.add_subparsers(dest="cmd", metavar="{run,status,safe,kick,stop}")
+    sub = parser.add_subparsers(dest="cmd", metavar="{run,status,safe,resume,kick,stop}")
     sub.required = True
     p = sub.add_parser("run", parents=[common, backend], help="start the supervised server")
     p.add_argument("--no-program", action="store_true", help="connect + force safe only")
@@ -1530,6 +1574,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="--direct even if a server answers")
     sub.add_parser("kick", parents=[common], help="end the current job (TX safe)")
     sub.add_parser("stop", parents=[common], help="stop the server (TX safe, disconnect)")
+    sub.add_parser("resume", parents=[common], help="let queued jobs run again after `safe`")
     p = sub.add_parser("_child", parents=[common, backend])
     p.add_argument("--no-program", action="store_true")
     p.add_argument("--supervised", action="store_true")
@@ -1577,7 +1622,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _control_main(cfg: Config, args: argparse.Namespace) -> int:
-    from .client import server_kick, server_safe, server_status, server_stop
+    from .client import server_kick, server_resume, server_safe, server_status, server_stop
 
     try:
         if args.cmd == "status":
@@ -1589,6 +1634,7 @@ def _control_main(cfg: Config, args: argparse.Namespace) -> int:
             print(
                 ("TX forced safe" if res["done"] else "safe_state QUEUED (hardware busy)")
                 + (f"; ended job \"{revoked['name']}\" pid {revoked['pid']}" if revoked else "")
+                + "; queue HELD until `adrvtrx-server resume`"
             )
             if not res["done"]:
                 print(f"hardware busy with {res['busy_with']}; the watchdog handles a stuck call")
@@ -1600,6 +1646,14 @@ def _control_main(cfg: Config, args: argparse.Namespace) -> int:
         elif args.cmd == "stop":
             res = server_stop(cfg)
             print(f"server pid {res['pid']} stopping (TX safe, disconnect)")
+        elif args.cmd == "resume":
+            res = server_resume(cfg)
+            if res["resumed"]:
+                print(
+                    f"queue resumed ({res['waiting']} waiting; held since {res['held']['since']})"
+                )
+            else:
+                print("queue was not held")
     except (ServerUnavailable, ServerConnectionLost, TimeoutError) as exc:
         print(f"adrvtrx-server: {exc}", file=sys.stderr)
         if args.cmd == "safe":

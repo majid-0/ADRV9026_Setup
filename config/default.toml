@@ -87,6 +87,7 @@ port = 55600                # localhost port; the ADS9 itself is on 55556
 state_dir = ""              # holds the auth key server.key; "" = %LOCALAPPDATA%\adrvtrx
 log_dir = ""                # JSONL command log; "" = <state_dir>\logs
 heartbeat_timeout_s = 10    # silent client while TX is enabled -> TX safe, lease revoked
+idle_timeout_s = 1800       # job with no hardware call this long -> TX safe, released; 0 = off
 # Per-call limit before the watchdog kills, forces safe and restarts the server.
 call_timeout_s = { default = 60, program = 600 }
 ping_interval_s = 1         # supervisor -> server liveness ping

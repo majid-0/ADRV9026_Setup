@@ -24,6 +24,7 @@ from adrvtrx.client import (
     RemoteRadio,
     hardware,
     server_kick,
+    server_resume,
     server_safe,
     server_status,
 )
@@ -311,7 +312,16 @@ def test_emergency_safe_skips_the_queue_during_a_job(tmp_path):
         busy.join(10)
         with pytest.raises(LeaseRevoked, match="forced safe"):
             holder.enable_tx(int(TxChannel.TX1))
+        # the queue is held: the waiting job does not get the board until resume
+        time.sleep(0.5)
+        st = srv.status(live=False)
+        assert st["owner"] is None and len(st["queue"]) == 1 and st["held"]["by"] == "safe"
+        assert waiting.is_alive()
+        with pytest.raises(BoardBusy, match="held"):
+            hardware("impatient", wait=False, config=cfg)
+        assert server_resume(cfg)["resumed"] is True
         waiting.join(10)
+        assert not waiting.is_alive() and srv.status(live=False)["held"] is None
         holder.release()
 
 
@@ -432,3 +442,56 @@ def test_programming_identity_counts_every_programming(cfg):
         assert server_status(cfg)["programming"]["program_count"] == 3
     with running_server(cfg, program=False):  # not programmed: the last record stands
         assert server_status(cfg)["programming"]["program_count"] == 3
+
+
+def test_kick_does_not_hold_the_queue(server, cfg):
+    got = []
+    holder = hardware("holder", config=cfg)
+    waiter = threading.Thread(target=lambda: got.append(hardware("next", config=cfg)))
+    waiter.start()
+    wait_until(lambda: len(server.status(live=False)["queue"]) == 1, what="queued")
+    server_kick(cfg)
+    waiter.join(10)
+    assert got and got[0].active and server.status(live=False)["held"] is None
+    got[0].release()
+    holder.release()
+
+
+def test_a_held_queue_still_honours_the_wait_timeout(server, cfg):
+    assert server_safe(cfg)["held"]["by"] == "safe"  # no job: TX safe and the queue held
+    with pytest.raises(BoardBusy, match="timed out.*held"):
+        hardware("late", timeout=0.5, config=cfg)
+    assert "held" in server_status(cfg) and server_status(cfg)["held"] is not None
+    assert server_resume(cfg)["resumed"] is True
+    assert server_resume(cfg)["resumed"] is False  # nothing left to resume
+    with hardware("after", wait=False, config=cfg) as radio:
+        assert radio.active
+
+
+def test_an_idle_job_is_released_even_while_it_heartbeats(tmp_path):
+    cfg = load_config(write_config(tmp_path, heartbeat_timeout_s=0.4, idle_timeout_s=1.0))
+    with running_server(cfg) as srv:
+        radio = hardware("idler", config=cfg)  # heartbeats every 0.1 s
+        radio.perform_tx(tx_buffers(), int(TxChannel.TX1))
+        for _ in range(4):  # calls keep it busy
+            time.sleep(0.4)
+            radio.get_lo("LO1")
+        assert srv.status(live=False)["owner"]["name"] == "idler"
+        wait_until(lambda: srv.status(live=False)["owner"] is None, 5, what="idle release")
+        assert board(srv)["tx_mask"] == 0
+        with pytest.raises(LeaseRevoked, match="idle"):
+            radio.get_lo("LO1")
+        radio.release()
+    files = cfg.server.log_path.glob("*.jsonl")
+    events = [json.loads(line)["event"] for f in files for line in f.read_text().splitlines()]
+    assert "idle_release" in events
+
+
+def test_the_idle_limit_can_be_switched_off(tmp_path):
+    cfg = load_config(write_config(tmp_path, idle_timeout_s=0))
+    assert cfg.server.idle_timeout_s == 0
+    with running_server(cfg) as srv:
+        with hardware("patient", config=cfg) as radio:
+            time.sleep(1.5)
+            assert srv.status(live=False)["owner"]["name"] == "patient"
+            radio.get_lo("LO1")

@@ -123,6 +123,8 @@ class ServerConfig:
     state_dir: str = ""  # "" -> default_state_dir()
     log_dir: str = ""  # "" -> <state_dir>/logs
     heartbeat_timeout_s: float = 10.0
+    #: Release a job that made no hardware call this long (heartbeats do not count). 0 = off.
+    idle_timeout_s: float = 1800.0
     call_timeout_s: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CALL_TIMEOUTS_S))
     ping_interval_s: float = 1.0
     ping_timeout_s: float = 15.0

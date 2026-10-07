@@ -57,6 +57,7 @@ def test_server_section_defaults_and_overrides(tmp_path):
     cfg = load_config()
     assert cfg.server.port == 55600 and cfg.server.port != cfg.board.port
     assert cfg.server.heartbeat_timeout_s == 10
+    assert cfg.server.idle_timeout_s == 1800
     assert cfg.server.timeout_for("program") == 600
     assert cfg.server.timeout_for("startup") == 600  # falls back to program
     assert cfg.server.timeout_for("perform_rx") == 60
