@@ -96,6 +96,8 @@ class RemoteRadio:
         self.bridge = NumpyBridge()
         self._heartbeat_s = max(0.05, float(grant["heartbeat_timeout_s"]) / 4.0)
         self._release_timeout_s = float(grant.get("release_timeout_s", 60.0))
+        #: Identity of the board's programming when last seen (see :meth:`session_info`).
+        self.programming: dict[str, Any] | None = grant.get("programming")
         self._end: str | None = None  # why this job no longer holds the board
         self._revoked = False
         self._stop_heartbeat = threading.Event()
@@ -202,6 +204,21 @@ class RemoteRadio:
         if error.get("kind") == "revoked":
             self._mark_revoked(str(error.get("message")))
         raise_error(error)
+
+    def session_info(self) -> dict[str, Any]:
+        """This job and the board's programming identity, read from the server now.
+
+        ``programming`` holds ``program_count`` (per board, across server
+        restarts), ``program_id`` (new on every programming), ``programmed_at``
+        and ``profile``. Record it with each measurement: a different
+        ``program_id`` means the board was re-programmed (calibrations re-ran).
+        """
+        with self._lock:
+            if self._end is not None and not self._revoked:
+                raise RuntimeError(f"job {self.name!r} no longer holds the board: {self._end}")
+            info = request(self._conn, {"op": "session"})
+        self.programming = info.get("programming")
+        return info
 
     def print_status(self) -> dict:
         """Print :meth:`status` here (the same report as ``Radio.print_status``)."""

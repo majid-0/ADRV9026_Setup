@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -413,3 +414,21 @@ def test_verify_status_works_in_process_and_remote(server, cfg):
     assert verify_status(local) == expected
     with hardware("verify", config=cfg) as radio:
         assert verify_status(radio) == expected
+
+
+def test_programming_identity_counts_every_programming(cfg):
+    with running_server(cfg):
+        first = server_status(cfg)["programming"]
+        assert first["program_count"] == 1
+        assert first["profile"] == Path(cfg.profile_name).name
+        with hardware("reprogram", config=cfg) as radio:
+            assert radio.programming == first
+            assert radio.session_info()["programming"] == first
+            radio.program()  # calibrations run again
+            again = radio.session_info()["programming"]
+        assert again["program_count"] == 2 and again["program_id"] != first["program_id"]
+        assert again["programmed_at"] >= first["programmed_at"]
+    with running_server(cfg):  # a new server process on the same board keeps counting
+        assert server_status(cfg)["programming"]["program_count"] == 3
+    with running_server(cfg, program=False):  # not programmed: the last record stands
+        assert server_status(cfg)["programming"]["program_count"] == 3

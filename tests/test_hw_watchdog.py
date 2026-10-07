@@ -76,11 +76,17 @@ def test_killed_server_is_forced_safe_from_a_fresh_process_and_restarted(bench):
         second = sup.wait_ready(60, pid_not=old_pid)
         assert second["server"]["restarts"] == 1
         assert "crashed" in second["server"]["last_error"]
+        # the restart re-programmed the board: a client can tell from the identity
+        before, after = first["programming"], second["programming"]
+        assert after["program_count"] == before["program_count"] + 1
+        assert after["program_id"] != before["program_id"]
+        assert after["programmed_at"] >= before["programmed_at"]
         new_pid = second["server"]["pid"]
         assert _safe_from(fake_events(state), [old_pid, new_pid], killed_at)  # fresh process
         assert "TX forced safe" in sup.output()
         with hardware("after", config=sup.config) as radio:
             assert radio.rx_tx_enable_get()[1] == 0
+            assert radio.session_info()["programming"] == after
     finally:
         sup.close()
     assert sup.proc.returncode == 0

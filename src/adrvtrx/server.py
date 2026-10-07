@@ -321,6 +321,8 @@ class HardwareServer:
         self.supervised = supervised
         self.restarts = restarts
         self.last_error = last_error
+        #: Identity of the board's current programming (see :meth:`_note_programmed`).
+        self.programming: dict[str, Any] | None = None
         self.log = log or JsonlLog(self.settings.log_path, "server")
         self.radio: Any = None
         self.hw = HardwareThread(self.settings.timeout_for)
@@ -352,6 +354,7 @@ class HardwareServer:
             "kick": self._op_kick,
             "stop": self._op_stop,
             "config": lambda _s, _m: self.config,
+            "session": self._op_session,
         }
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -395,6 +398,9 @@ class HardwareServer:
             if self._program:
                 self.radio.program()
                 self._refresh("program")
+                self._note_programmed()
+            else:
+                self.programming = self._read_programming()  # the board keeps its last one
         except Exception as exc:
             self.last_error = f"startup failed: {exc!r}"
             self.log.write("startup_failed", error=repr(exc))
@@ -646,6 +652,7 @@ class HardwareServer:
             "config": self.config,
             "heartbeat_timeout_s": self.settings.heartbeat_timeout_s,
             "release_timeout_s": self.settings.timeout_for("safe_state") + 5.0,
+            "programming": self.programming,
         }
 
     def _active_lease(self, session: _Session) -> _Lease:
@@ -717,11 +724,66 @@ class HardwareServer:
         else:
             result = getattr(radio, method)(*args, **kwargs)
         self._refresh(method, args, kwargs, result)
+        if method == "program":
+            self._note_programmed()
         if method == "perform_rx":
             from .capture import capture_arrays
 
             result = capture_arrays(result)
         return result
+
+    # -- programming identity ------------------------------------------------------------
+
+    @property
+    def _programming_path(self) -> Path:
+        board = f"{self.config.board.ip}_{self.config.board.port}".replace(":", "_")
+        return self.settings.state_path / f"programming-{board}.json"
+
+    def _read_programming(self) -> dict[str, Any] | None:
+        try:
+            return json.loads(self._programming_path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _note_programmed(self) -> None:
+        """Record a (re)programming of the board: calibrations ran again.
+
+        ``program_count`` is kept per board in the state directory, so it keeps
+        counting across server restarts (watchdog included); ``program_id`` is new
+        on every programming. Clients record these with their measurements to
+        tell whether the board was re-programmed between two jobs.
+        """
+        previous = self._read_programming() or {}
+        info = {
+            "program_count": int(previous.get("program_count", 0)) + 1,
+            "program_id": uuid.uuid4().hex[:12],
+            "programmed_at": iso(time.time()),
+            "profile": Path(self.config.profile_name).name,
+            "board": f"{self.config.board.ip}:{self.config.board.port}",
+            "server_pid": os.getpid(),
+        }
+        path = self._programming_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(info))
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.log.write("programming_not_saved", error=repr(exc))
+        self.programming = info
+        self.log.write("programmed", **info)
+
+    def _op_session(self, session: _Session, _message: dict[str, Any]) -> dict[str, Any]:
+        lease = session.lease
+        return {
+            "job": session.client.get("name"),
+            "lease": None if lease is None else lease.id,
+            "active": lease is not None and lease.ended is None,
+            "server_pid": os.getpid(),
+            "server_started": iso(self.started),
+            "restarts": self.restarts,
+            "programming": self.programming,
+        }
 
     def _op_heartbeat(self, session: _Session, _message: dict[str, Any]) -> dict[str, Any]:
         lease = self._active_lease(session)
@@ -842,6 +904,7 @@ class HardwareServer:
             "queue": waiting,
             "hardware": self.hw.busy_info(),
             "board": self.cache.snapshot(),
+            "programming": self.programming,
             "source": source,
             "readback": readback,
         }
@@ -1293,6 +1356,13 @@ def format_status(st: dict[str, Any]) -> str:
     pll = board["pll_lock"]
     pll_text = f"0x{pll:X}" if isinstance(pll, int) else (pll or "-")
     lines.append(f"PLL      {pll_text} [{st['source']}]")
+    prog = st.get("programming")
+    lines.append(
+        f"program  #{prog['program_count']} at {prog['programmed_at']} ({prog['profile']}), "
+        f"id {prog['program_id']}"
+        if prog
+        else "program  -"
+    )
     lines.append(f"error    {srv['last_error'] or '-'}")
     return "\n".join(lines)
 
