@@ -13,6 +13,7 @@ from adrvtrx.conditions import (
     DutRecord,
     OperatingCondition,
     capture_point,
+    condition_keys,
     condition_name,
     load_aligned_iq,
     load_conditions,
@@ -65,8 +66,11 @@ def _condition(**kw) -> OperatingCondition:
     return OperatingCondition(**base)
 
 
-def test_capture_columns_are_unchanged():
-    assert CSV_FIELDS == tuple(LEGACY.splitlines()[0].split(","))
+NEW_COLUMNS = ("lock_on", "gain_compression_db", "amam_top_slope", "pa_clipped")
+
+
+def test_capture_columns_keep_the_legacy_order_and_add_the_new_ones_last():
+    assert CSV_FIELDS == tuple(LEGACY.splitlines()[0].split(",")) + NEW_COLUMNS
 
 
 def test_dut_columns_extend_capture_columns():
@@ -84,6 +88,34 @@ def test_legacy_csv_loads(tmp_path):
         corr=0.9972,
         in_file="new40MHz256QAM_CFRed_in.txt",
     )
+
+
+def test_legacy_csv_gets_defaults_for_the_new_columns(tmp_path):
+    path = tmp_path / "TX1_conditions.csv"
+    path.write_text(LEGACY)
+    (row,) = load_conditions(path)
+    assert row.lock_on == "papr"
+    assert math.isnan(row.gain_compression_db) and math.isnan(row.amam_top_slope)
+    assert row.pa_clipped is False
+
+
+def test_new_columns_round_trip(tmp_path):
+    cond = _condition(
+        lock_on="gain", gain_compression_db=4.02, amam_top_slope=0.1534, pa_clipped=True
+    )
+    with ConditionLog(tmp_path / "c.csv") as log:
+        log.append(cond)
+    text = (tmp_path / "c.csv").read_text().splitlines()[1]
+    assert text.endswith(",gain,4.02,0.153,true")
+    (back,) = load_conditions(tmp_path / "c.csv")
+    assert back.lock_on == "gain" and back.pa_clipped is True
+    assert back.gain_compression_db == 4.02 and back.amam_top_slope == 0.153
+
+
+def test_condition_keys_carry_the_lock_metric():
+    keys = condition_keys(_condition(lock_on="gain"))
+    assert keys["lock_on"] == "gain"
+    assert "gain_compression_db" not in keys  # measured per capture, not a condition
 
 
 def test_round_trip(tmp_path):
@@ -154,6 +186,8 @@ def test_capture_point_aligns_and_scores():
     frac = pc.delay_samples - np.floor(pc.delay_samples)
     assert frac == pytest.approx(DELAY, abs=0.02)
     assert pc.metrics["corr"] > 0.99
+    assert np.isfinite(pc.metrics["gain_compression_db"])
+    assert np.isfinite(pc.metrics["amam_top_slope"])
     truth = radio.pa_period(ref)
     assert nmse_db(truth, pc.y_aligned) < -35
     assert pc.clip.railed_samples == 0

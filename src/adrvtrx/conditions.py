@@ -10,12 +10,16 @@ Columns are defined in ``docs/dpd_workflow_spec.md`` section 4.
 
 IQ files are normalized float ``I<TAB>Q`` (1.0 = full scale), the same layout
 as :func:`adrvtrx.waveform.save_tab_iq_float`.
+
+The columns ``lock_on``, ``gain_compression_db``, ``amam_top_slope`` and
+``pa_clipped`` come last and have defaults, so CSVs written before they existed
+still load (``papr``, NaN, NaN, false).
 """
 
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +29,7 @@ from ._enums import RxChannel
 from .align import estimate_and_align
 from .capture import capture
 from .gain import ClipReport, clip_report
-from .metrics import period_metrics
+from .metrics import PA_CLIP_SLOPE, period_metrics
 from .waveform import full_scale, load_tab_iq
 
 __all__ = [
@@ -45,9 +49,9 @@ __all__ = [
 ]
 
 _INT_FIELDS = frozenset({"freq_hz", "bw_mhz", "backoff_db", "orx_gain", "railed", "tx_clipped"})
-_BOOL_FIELDS = frozenset({"converged"})
-_STR_FIELDS = frozenset({"name", "signal", "ref_file", "in_file", "out_file"})
-_FLOAT_FMT = {"delay_samples": ".2f", "delay_ns": ".1f", "corr": ".4f"}
+_BOOL_FIELDS = frozenset({"converged", "pa_clipped"})
+_STR_FIELDS = frozenset({"name", "signal", "ref_file", "in_file", "out_file", "lock_on"})
+_FLOAT_FMT = {"delay_samples": ".2f", "delay_ns": ".1f", "corr": ".4f", "amam_top_slope": ".3f"}
 
 
 def _format(key: str, value: Any) -> str:
@@ -78,12 +82,18 @@ class _Row:
 
     @classmethod
     def from_row(cls, row: dict[str, str]):
-        return cls(**{f.name: _parse(f.name, row[f.name]) for f in fields(cls)})
+        """Columns the row does not have keep their defaults (older CSVs)."""
+        return cls(**{f.name: _parse(f.name, row[f.name]) for f in fields(cls) if f.name in row})
 
 
 @dataclass
 class OperatingCondition(_Row):
-    """One initial capture. ``compression_db`` is the search result at the lock."""
+    """One initial capture. ``compression_db`` is the search result at the lock.
+
+    ``lock_on`` is the metric the search locked on (``papr`` or ``gain``), so
+    ``compression_db`` is that metric. ``gain_compression_db``, ``amam_top_slope``
+    and ``pa_clipped`` are measured on this capture (see ``metrics.period_metrics``).
+    """
 
     name: str
     signal: str
@@ -109,6 +119,10 @@ class OperatingCondition(_Row):
     railed: int
     in_file: str
     out_file: str
+    lock_on: str = "papr"
+    gain_compression_db: float = float("nan")
+    amam_top_slope: float = float("nan")
+    pa_clipped: bool = False
 
 
 @dataclass
@@ -147,12 +161,16 @@ class DutRecord(_Row):
     ref_file: str
     in_file: str
     out_file: str
+    lock_on: str = "papr"
+    gain_compression_db: float = float("nan")
+    amam_top_slope: float = float("nan")
+    pa_clipped: bool = False
 
 
 CSV_FIELDS = tuple(f.name for f in fields(OperatingCondition))
 DUT_FIELDS = tuple(f.name for f in fields(DutRecord))
 
-_CONDITION_KEYS = CSV_FIELDS[: CSV_FIELDS.index("converged") + 1]
+_CONDITION_KEYS = (*CSV_FIELDS[: CSV_FIELDS.index("converged") + 1], "lock_on")
 
 
 def condition_name(tx, backoff_db: int, freq_hz: int, bw_mhz: int) -> str:
@@ -162,7 +180,7 @@ def condition_name(tx, backoff_db: int, freq_hz: int, bw_mhz: int) -> str:
 
 
 def condition_keys(condition: OperatingCondition) -> dict[str, Any]:
-    """The condition columns (``name`` .. ``converged``) of a capture row."""
+    """The condition columns (``name`` .. ``converged``, and ``lock_on``) of a capture row."""
     return {k: getattr(condition, k) for k in _CONDITION_KEYS}
 
 
@@ -213,7 +231,9 @@ class ConditionLog:
 
 
 def _load(csv_path: str | Path, cls):
-    required = {f.name for f in fields(cls)}
+    required = {
+        f.name for f in fields(cls) if f.default is MISSING and f.default_factory is MISSING
+    }
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
         header = set(reader.fieldnames or ())
@@ -223,7 +243,8 @@ def _load(csv_path: str | Path, cls):
 
 
 def load_conditions(csv_path: str | Path) -> list[OperatingCondition]:
-    """Read a capture CSV. Extra columns are ignored; missing ones raise ``ValueError``."""
+    """Read a capture CSV. Extra columns are ignored; a missing column without a
+    default raises ``ValueError``."""
     return _load(csv_path, OperatingCondition)
 
 
@@ -252,6 +273,7 @@ def capture_point(
     bw_hz: float,
     oversample: int = 2,
     metric_ref=None,
+    min_top_slope: float = PA_CLIP_SLOPE,
 ) -> PointCapture:
     """Capture ``oversample`` periods, align one period to ``ref``, compute the metrics.
 
@@ -259,7 +281,7 @@ def capture_point(
     report is on the raw capture. The period is aligned to ``ref`` (the waveform
     being transmitted, in TX codes). Metrics are against ``metric_ref`` when given
     (the original input during replay), otherwise against ``ref``; ``corr`` is
-    always against ``ref``.
+    always against ``ref``. ``pa_clipped`` uses ``min_top_slope``.
     """
     ref = np.asarray(ref)
     capture_ms = oversample * len(ref) / float(fs) * 1e3
@@ -277,5 +299,6 @@ def capture_point(
         rx_bits=rx_bits,
         delay_samples=delay,
         corr_ref=ref,
+        min_top_slope=min_top_slope,
     )
     return PointCapture(y_aligned=y_al, delay_samples=float(delay), clip=rep, metrics=metrics)

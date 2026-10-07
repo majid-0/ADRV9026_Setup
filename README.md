@@ -99,6 +99,10 @@ from adrvtrx.linearize import linearize
 # TX running: search down from a safe attenuation to 3 dB PAPR compression.
 res = find_compression_point(radio, TxChannel.TX1, RxChannel.ORX1, ref, rx_bits=12, fs=fs,
                              target_compression_db=3.0, start_atten_db=20, atten_min_db=9)
+# Or lock on 4 dB of gain compression at the peaks, and never let the PA clip:
+res = find_compression_point(radio, TxChannel.TX1, RxChannel.ORX1, ref, rx_bits=12, fs=fs,
+                             target_compression_db=4.0, comp_tol_db=0.2, lock_on="gain",
+                             min_top_slope=0.08, start_atten_db=20, atten_min_db=9)
 point = capture_point(radio, RxChannel.ORX1, ref, rx_bits=12, fs=fs, bw_hz=100e6)
 
 # Offline: play your model's DPD file at every saved condition (no AGC, no rescale).
@@ -138,8 +142,8 @@ src/adrvtrx/
   bands.py       Band primitive + single/dual/quad orchestration
   sweep.py       Low-level SweepAxis + run_sweep
   sweep_plan.py  Declarative multi-band sweep plans + summarize_sweep_plan
-  metrics.py     PAPR, window compression, NMSE, ACLR, in-band corr, RMS (pure numpy)
-  compression.py TX attenuation search for a target PAPR compression
+  metrics.py     PAPR, window / gain compression, AM/AM top slope, NMSE, ACLR, corr, RMS
+  compression.py TX attenuation search for a target PAPR or gain compression
   conditions.py  Condition / DUT CSVs, aligned IQ files, capture_point
   replay.py      Replay stored waveforms (DPD files) at saved conditions
   linearize.py   Online transmit -> capture -> step() loop
