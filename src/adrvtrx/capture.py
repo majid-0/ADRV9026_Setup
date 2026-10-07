@@ -124,6 +124,15 @@ def tx_for_orx(orx: RxChannel, tx_to_orx) -> TxChannel | None:
     return None
 
 
+def orx_for_tx(tx: TxChannel, tx_to_orx) -> RxChannel | None:
+    """The ORx input that observes ``tx``, per the tx_to_orx map (e.g. ``"TX1_ORX1"``)."""
+    for entry in tx_to_orx:
+        tx_part, _, orx_part = entry.partition("_")
+        if tx_part == tx.name:
+            return RxChannel[orx_part]
+    return None
+
+
 def auto_sof_trigger(channel_mask, tx_to_orx, default=RxTrigSource.IMMEDIATE) -> RxTrigSource:
     """SOF trigger of the lowest TX tied to any requested ORx; ``default`` if none.
 

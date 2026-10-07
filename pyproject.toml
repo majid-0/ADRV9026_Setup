@@ -31,6 +31,7 @@ dev = [
 [project.scripts]
 adrvtrx-program = "adrvtrx.cli:main"
 adrvtrx-server = "adrvtrx.server:main"
+adrvtrx = "adrvtrx.cli:tool_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
