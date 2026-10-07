@@ -252,12 +252,72 @@ adrvtrx-server stop   [--config PATH]
 ```
 
 - `--backend real` (default) is `adrvtrx.radio:Radio`. `--backend fake` is
-  `adrvtrx.fake:FakeRadio`: a `Radio` over a simulated DLL (no pythonnet, no
-  board) with a simple TX → PA → ORx loopback, for dry runs and tests. Set
-  `ADRVTRX_FAKE_STATE` to a file to persist its register state across
-  processes.
+  `adrvtrx.fake:FakeRadio`, the simulated board of §9.1, for dry runs and
+  tests.
 - When `ADRVTRX_FORBID_HARDWARE` is set (the test suite sets it), `Radio`
   refuses to load the real DLL and the server refuses `--backend real`.
+
+### 9.1 The fake backend
+
+`FakeRadio` is the real `Radio` over a simulated DLL (no pythonnet, no board):
+every `Radio` code path runs, only the bottom layer is simulated. It keeps the
+register state (connection, programmed flag, enables, attenuation, gains,
+LOs), rejects `TxAttenSet` before programming like the device, requires the
+eight bridge-built arrays in `PerformTx`, and returns the full
+`rxInitChannelMask` set from `PerformRx`, with the TX waveform looped back on
+the ORx mapped to it. Its sample rate and bit widths come from the config's
+profile (10 MSPS / 12 bits if the profile is not on the machine).
+
+| Environment variable | Effect |
+|---|---|
+| `ADRVTRX_FAKE_STATE=<file.json>` | Register state shared across processes (the board keeps its registers when a client dies); every register write is logged to `<file>.events.jsonl`; creating `<file>.refuse` makes `Connect` fail |
+| `ADRVTRX_FAKE_DELAYS='{"PerformRx": 30}'` | Seconds per DLL call, to simulate slow or stuck calls |
+| `ADRVTRX_FAKE_PA=rich` or `=<file.json / .toml>` | The PA model below; a file holds parameters, `preset = "rich"` starts from the rich values |
+
+PA model (`adrvtrx.fake.PaModel`), applied to one period of the looping TX
+waveform (circular), at the TX's LO frequency `f`, with `df = (f − f0_hz)` in GHz:
+
+1. `v = x / full_scale · drive · 10^((G − atten)/20)`, with
+   `G = gain_db + gain_slope_db_per_ghz·df + gain_curve_db_per_ghz2·df² + drift`.
+2. `w = pre_taps ∗ v` (FIR: linear memory before the nonlinearity).
+3. Rapp: `g = w / (1 + (|w|/sat)^(2p))^(1/2p)`,
+   `sat = 10^((sat_db + sat_slope_db_per_ghz·df + drift_sat_fraction·drift)/20)`,
+   `p = smoothness`; then AM/PM `g ·= exp(j·am_pm_deg·π/180·|g/sat|²)`.
+4. Nonlinear memory: `g += g · Σₘ nl_memory[m−1]·|g[n−m]/sat|²` (bounded,
+   taken after compression).
+5. `y = post_taps ∗ g`, delayed by `delay_samples`. Memory taps after the
+   first are scaled by `1 + memory_slope_per_ghz·df`.
+6. ORx: `y · orx_level · full_scale · 10^((gain_index − 210)·0.5/20)` plus
+   complex noise of `noise_codes` per I and Q, rounded and clipped at the rail.
+
+Drift in dB: `drift_db_per_hour` × hours since the fake board was created,
+plus `drift_step_db` once `drift_step_after_s` seconds have passed, plus the
+number in `drift_file` (read at every capture: drift on demand). `seed` (or
+`FakeRadio(seed=...)`) makes captures repeatable.
+
+| Parameter | Default (simple) | `rich` |
+|---|---|---|
+| `drive` | 6.0 | 5.35 |
+| `smoothness` | 2.0 | 1.6 |
+| `f0_hz` | 2.2e9 | 2.2e9 |
+| `gain_db`, `gain_slope_db_per_ghz`, `gain_curve_db_per_ghz2` | 0, 0, 0 | 0, −1.5, −0.5 |
+| `sat_db`, `sat_slope_db_per_ghz` | 0, 0 | 0, 0.6 |
+| `am_pm_deg` | 0 | 12 |
+| `pre_taps` | [1] | [1, 0.22, −0.08] |
+| `post_taps` | [1] | [1, −0.12, 0.04] |
+| `nl_memory` | [] | [0.15, 0.08, 0.04] |
+| `memory_slope_per_ghz` | 0 | 0.35 |
+| `delay_samples`, `orx_level`, `noise_codes` | 5, 0.73, 0.5 | same |
+| `drift_db_per_hour`, `drift_step_db`, `drift_step_after_s`, `drift_file`, `drift_sat_fraction` | 0, 0, 0, "", 0.5 | same |
+| `seed` | none | none |
+
+The simple default is the memoryless Rapp the server tests were written
+against. On the rich model at 491.52 MSPS, a 3.5 dB gain-compression lock
+(`find_compression_point(..., lock_on="gain")`, start 15 dB, floor 7 dB)
+converges at about 12.0 / 11.0 / 9.3 dB at 1.6 / 2.2 / 2.8 GHz for a
+100 MHz signal; a GMP(5, 3, 2) post-inverse fit reaches about −45 dB NMSE
+(−20 dB without one); a memoryless fit stays near −28 dB at 100 MHz and
+−35 dB at 40 MHz.
 
 Generic replay of saved conditions:
 
@@ -341,5 +401,7 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | watchdog | server process killed → fresh-process `force_safe`, restart; stuck call → killed, safe, restarted |
 | single instance | a second `run` is refused without touching the board |
 | safe --direct | forces safe through the fake backend; refused while a server answers |
+| programming identity | `program_count` / `program_id` change on a client re-program, a new server and a watchdog restart |
+| fake PA | default = simple Rapp; rich model: gain lock converges at two LOs with different attenuations, GMP fit beats no DPD and needs memory, drift (file, rate, step), seed, parameter files |
 | existing modules | transmit, capture, compression, replay, operating point, linearize and sweep give the same results on a `RemoteRadio` as in-process |
 | replay CLI | end to end on the fake: summary, per-label CSVs, missing files reported before the board is taken |
