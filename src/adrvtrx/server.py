@@ -315,8 +315,10 @@ class HardwareServer:
         last_error: str | None = None,
         log: JsonlLog | None = None,
         echo: bool = True,
+        token: str = "",
     ):
         self.config = config
+        self.token = token  # set by the supervisor; echoed in every ping
         self.echo = echo  # print ready / stopped lines for the console
         self.settings: ServerConfig = config.server
         self._backend = backend
@@ -974,7 +976,12 @@ class HardwareServer:
         return {"stopping": True, "pid": os.getpid()}
 
     def _op_ping(self, _session: _Session, _message: dict[str, Any]) -> dict[str, Any]:
-        return {"pid": os.getpid(), "state": self.state, "hw": self.hw.busy_info()}
+        return {
+            "pid": os.getpid(),
+            "token": self.token,
+            "state": self.state,
+            "hw": self.hw.busy_info(),
+        }
 
     def _op_status(self, session: _Session, message: dict[str, Any]) -> dict[str, Any]:
         st = self.status(live=bool(message.get("live", True)))
@@ -1218,14 +1225,17 @@ class Supervisor:
         last_error: str | None = None
         ever_ready = False
         while True:
-            extra = ["--supervised", "--restarts", str(len(restarts))]
+            # The pid of a venv's python.exe on Windows is a launcher's, not the
+            # server's: pings are matched to this spawn by a token instead.
+            token = uuid.uuid4().hex
+            extra = ["--supervised", "--restarts", str(len(restarts)), "--token", token]
             if not self.program:
                 extra.append("--no-program")
             if last_error:
                 extra += ["--last-error", last_error]
             self.child = subprocess.Popen(self._cmd("_child", *extra), stdin=subprocess.PIPE)
             self.log.write("spawn", child=self.child.pid, restarts=len(restarts))
-            outcome, detail, ready = self._watch(self.child)
+            outcome, detail, ready = self._watch(self.child, token)
             ever_ready = ever_ready or ready
             code = self.child.returncode
             self.log.write("child_end", outcome=outcome, detail=detail, exit_code=code)
@@ -1266,7 +1276,7 @@ class Supervisor:
             if not _sleep(backoff):
                 return EXIT_OK
 
-    def _watch(self, child: subprocess.Popen) -> tuple[str, str, bool]:
+    def _watch(self, child: subprocess.Popen, token: str) -> tuple[str, str, bool]:
         s = self.settings
         spawned = time.monotonic()
         last_ok: float | None = None
@@ -1287,7 +1297,7 @@ class Supervisor:
                         _close(conn)
                     conn = None
                 now = time.monotonic()
-                if reply is not None and reply.get("pid") == child.pid:
+                if reply is not None and reply.get("token") == token:
                     last_ok = now
                     ready = ready or reply.get("state") == "ready"
                     hw = reply.get("hw")
@@ -1335,6 +1345,11 @@ class Supervisor:
         self.log.write("kill", child=child.pid)
         self._say(f"killing server process {child.pid}")
         child.kill()
+        try:  # a server orphaned behind a launcher sees EOF and stops itself safely
+            if child.stdin is not None:
+                child.stdin.close()
+        except OSError:
+            pass
         try:
             child.wait(10)
         except subprocess.TimeoutExpired:
@@ -1520,6 +1535,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--supervised", action="store_true")
     p.add_argument("--restarts", type=int, default=0)
     p.add_argument("--last-error", default=None)
+    p.add_argument("--token", default="")
     p = sub.add_parser("_force-safe", parents=[common, backend])
     p.add_argument("--retries", type=int, default=None)
     return parser
@@ -1649,6 +1665,7 @@ def _child_main(cfg: Config, args: argparse.Namespace) -> int:
         supervised=args.supervised,
         restarts=args.restarts,
         last_error=args.last_error,
+        token=args.token,
     )
     try:
         server.start()
