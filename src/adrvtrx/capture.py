@@ -124,6 +124,15 @@ def tx_for_orx(orx: RxChannel, tx_to_orx) -> TxChannel | None:
     return None
 
 
+def orx_for_tx(tx: TxChannel, tx_to_orx) -> RxChannel | None:
+    """The ORx input that observes ``tx``, per the tx_to_orx map (e.g. ``"TX1_ORX1"``)."""
+    for entry in tx_to_orx:
+        tx_part, _, orx_part = entry.partition("_")
+        if tx_part == tx.name:
+            return RxChannel[orx_part]
+    return None
+
+
 def auto_sof_trigger(channel_mask, tx_to_orx, default=RxTrigSource.IMMEDIATE) -> RxTrigSource:
     """SOF trigger of the lowest TX tied to any requested ORx; ``default`` if none.
 
@@ -201,7 +210,7 @@ def capture(
     # ORx INPUT bits -- an ORx front-end reads zeros until its enable bit is set.
     # Absolute set (preserving TX) so a prior capture's ORx enable can't leak in.
     orx_bits = sum(int(ch) for ch in wanted if is_orx(ch))
-    radio.rx_tx_enable((rx_init & 0x0F) | orx_bits, radio._en_tx)
+    radio.set_rx_enable((rx_init & 0x0F) | orx_bits)
     raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
 
     # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
@@ -365,6 +374,17 @@ def autolevel_capture(
             result.reason = vr.reason
 
     return result
+
+
+def capture_arrays(raw) -> list[np.ndarray]:
+    """A PerformRx result as plain ``int32`` numpy arrays ``[ch0_I, ch0_Q, ...]``.
+
+    Same layout and indexing as the DLL result, so :func:`extract_channels`
+    reads either. Used where the .NET object cannot travel (the hardware server).
+    """
+    n = _result_len(raw)
+    items = raw if n is None else (raw[k] for k in range(n))
+    return [np.fromiter(a, dtype=np.int32) for a in items]
 
 
 def _result_len(raw) -> int | None:

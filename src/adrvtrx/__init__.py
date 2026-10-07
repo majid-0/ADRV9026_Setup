@@ -156,9 +156,13 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Lazily expose the hardware-facing Radio so importing the package stays light."""
+    """Lazily expose Radio and the hardware-server client so importing stays light."""
     if name == "Radio":
         from .radio import Radio
 
         return Radio
+    if name in ("hardware", "RemoteRadio"):
+        from . import client
+
+        return getattr(client, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

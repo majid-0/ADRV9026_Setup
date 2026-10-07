@@ -51,3 +51,30 @@ def test_absolute_profile_name_is_respected():
         {"dll": {"install_dir": "C:/x"}, "profile": {"name": "C:/abs/my.profile"}}
     )
     assert cfg.profile_path == Path("C:/abs/my.profile")
+
+
+def test_server_section_defaults_and_overrides(tmp_path):
+    cfg = load_config()
+    assert cfg.server.port == 55600 and cfg.server.port != cfg.board.port
+    assert cfg.server.heartbeat_timeout_s == 10
+    assert cfg.server.idle_timeout_s == 1800
+    assert cfg.server.timeout_for("program") == 600
+    assert cfg.server.timeout_for("startup") == 600  # falls back to program
+    assert cfg.server.timeout_for("perform_rx") == 60
+
+    cfg = Config.from_dict(
+        {
+            "dll": {"install_dir": "C:/x"},
+            "server": {
+                "port": 50001,
+                "state_dir": str(tmp_path),
+                "call_timeout_s": {"perform_rx": 5},
+                "not_a_key": 1,
+            },
+        }
+    )
+    assert cfg.server.port == 50001
+    assert cfg.server.timeout_for("perform_rx") == 5
+    assert cfg.server.timeout_for("program") == 600  # defaults kept
+    assert cfg.server.authkey_path == tmp_path / "server.key"
+    assert cfg.server.log_path == tmp_path / "logs"

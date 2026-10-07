@@ -13,9 +13,12 @@ matches the working init script, e.g. ``PllFrequencyGet(pll, 0)[1]``.
 from __future__ import annotations
 
 import atexit
+import os
 import signal
 from types import FrameType
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from . import _enums
 from ._enums import RxChannel, RxTrigSource, TxChannel, TxTrigSource
@@ -25,6 +28,9 @@ if TYPE_CHECKING:
     from ._clr import ClrBridge
 
 MAX_TX_ATTEN_DB = 41.95  # ADRV902x TxAtten table max (~42 dB)
+
+#: When set (the test suite sets it), :class:`Radio` refuses to load the real DLL.
+FORBID_HARDWARE_ENV = "ADRVTRX_FORBID_HARDWARE"
 
 
 class Radio:
@@ -54,6 +60,11 @@ class Radio:
     @property
     def bridge(self) -> ClrBridge:
         if self._bridge is None:
+            if os.environ.get(FORBID_HARDWARE_ENV):
+                raise RuntimeError(
+                    f"{FORBID_HARDWARE_ENV} is set: refusing to load the real DLL "
+                    "(inject a fake bridge or backend)"
+                )
             from ._clr import ClrBridge
 
             self._bridge = ClrBridge(self.config.dll).load()
@@ -92,6 +103,10 @@ class Radio:
                 self.board.Client.Disconnect()
             finally:
                 self._connected = False
+
+    def is_connected(self) -> bool:
+        """True while the link to the ADS9 is up (``IsConnected``); never raises."""
+        return self._is_connected()
 
     def _is_connected(self) -> bool:
         try:
@@ -175,6 +190,10 @@ class Radio:
     def disable_tx(self) -> None:
         """Clear the Tx enable mask (stops playback), keep Rx enabled."""
         self.rx_tx_enable(self._en_rx, 0)
+
+    def set_rx_enable(self, mask: int) -> None:
+        """Set the absolute Rx/ORx enable mask, keep the current TX state."""
+        self.rx_tx_enable(int(mask), self._en_tx)
 
     def rx_tx_enable_get(self) -> tuple[int, int]:
         """Read the live ``(rxChannelMask, txChannelMask)`` enable state from hardware."""
@@ -461,15 +480,31 @@ class Radio:
     ) -> None:
         """Load per-channel sample buffers and start playback (looping if continuous).
 
-        Mirrors the ADI sample: disable TX, load the buffers, then enable the TX
-        channels so playback runs.
+        ``tx_data`` is the PerformTx ``ArrayList`` (``transmit.build_tx_data``), or
+        the same buffers as numpy: a sequence of integer arrays (or a 2-D array)
+        ``[Tx1_I, Tx1_Q, ..., Tx4_I, Tx4_Q]``, converted here. Mirrors the ADI
+        sample: disable TX, load the buffers, then enable the TX channels so
+        playback runs.
         """
+        tx_data = self._dotnet_tx_data(tx_data)
         self.disable_tx()
         self.board.PerformTx(
             self._tx_trig(trig), tx_data, int(channel_mask), 1 if continuous else 0
         )
         self.enable_tx(int(channel_mask))
         self._tx_live = True
+
+    def _dotnet_tx_data(self, tx_data):
+        """Numpy TX buffers -> the .NET ArrayList of Int32[]; anything else unchanged."""
+        is_numpy = isinstance(tx_data, np.ndarray) or (
+            isinstance(tx_data, (list, tuple))
+            and len(tx_data) > 0
+            and all(isinstance(a, np.ndarray) for a in tx_data)
+        )
+        if not is_numpy:
+            return tx_data
+        b = self.bridge
+        return b.array_list([b.int_array(np.asarray(a).astype(np.int64).tolist()) for a in tx_data])
 
 
 # -- module helpers ------------------------------------------------------------
