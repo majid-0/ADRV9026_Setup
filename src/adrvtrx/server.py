@@ -708,7 +708,7 @@ class HardwareServer:
             result = None
             method = "safe_state"
         elif method == "connect":
-            is_connected = getattr(radio, "_is_connected", None)
+            is_connected = getattr(radio, "is_connected", None)
             if is_connected is not None and not is_connected():
                 radio.connect()
                 radio.force_safe()

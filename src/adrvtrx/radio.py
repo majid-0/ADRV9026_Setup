@@ -104,6 +104,10 @@ class Radio:
             finally:
                 self._connected = False
 
+    def is_connected(self) -> bool:
+        """True while the link to the ADS9 is up (``IsConnected``); never raises."""
+        return self._is_connected()
+
     def _is_connected(self) -> bool:
         try:
             return bool(self.link.IsConnected())

@@ -27,6 +27,7 @@ from adrvtrx.client import (
     server_status,
 )
 from adrvtrx.config import load_config
+from adrvtrx.experiment import verify_status
 from adrvtrx.fake import FakeRadio
 from adrvtrx.radio import MAX_TX_ATTEN_DB, Radio
 from adrvtrx.server import HardwareServer, PortInUse
@@ -79,6 +80,7 @@ CALLS = [
     ("get_lo", ("LO1",), {}),
     ("retune_lo", ("LO2", 900_000_000), {"settle_poll": 3}),
     ("pll_lock_status", (), {}),
+    ("is_connected", (), {}),
     ("enable_rx", (0x10,), {}),
     ("set_rx_enable", (0x1F,), {}),
     ("perform_tx", (tx_buffers(), int(TxChannel.TX1)), {"continuous": True}),
@@ -395,3 +397,19 @@ def test_every_call_is_logged(server, cfg):
     assert calls[-1]["client"]["name"] == "logged" and "dur_s" in calls[-1]
     events = [r["event"] for r in records]
     assert "acquire" in events and "release" in events
+
+
+def test_verify_status_works_in_process_and_remote(server, cfg):
+    local = FakeRadio(cfg, seed=1)
+    local._safe_hooks_installed = True
+    local.connect()
+    local.program()
+    expected = {
+        "connected": True,
+        "lo1_hz": cfg.lo.lo1_hz,
+        "lo2_hz": cfg.lo.lo2_hz,
+        "pll_lock_status": 0xF,
+    }
+    assert verify_status(local) == expected
+    with hardware("verify", config=cfg) as radio:
+        assert verify_status(radio) == expected
