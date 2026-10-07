@@ -102,6 +102,62 @@ class OrxAgcConfig:
     db_per_index: float = 0.50
 
 
+#: Per-method hardware-call limits before the watchdog treats the server as stuck.
+DEFAULT_CALL_TIMEOUTS_S = {"default": 60.0, "program": 600.0}
+
+
+def default_state_dir() -> Path:
+    """Per-user directory for the hardware server's key and logs."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "adrvtrx"
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "adrvtrx"
+
+
+@dataclass
+class ServerConfig:
+    """``[server]``: the hardware server (``adrvtrx-server``, docs/hw_server.md)."""
+
+    port: int = 55600
+    state_dir: str = ""  # "" -> default_state_dir()
+    log_dir: str = ""  # "" -> <state_dir>/logs
+    heartbeat_timeout_s: float = 10.0
+    call_timeout_s: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CALL_TIMEOUTS_S))
+    ping_interval_s: float = 1.0
+    ping_timeout_s: float = 15.0
+    start_timeout_s: float = 60.0
+    restart_limit: int = 3
+    restart_window_s: float = 600.0
+    restart_backoff_s: float = 2.0
+    force_safe_timeout_s: float = 120.0
+    connect_retries: int = 3
+    connect_retry_delay_s: float = 5.0
+
+    @property
+    def state_path(self) -> Path:
+        if self.state_dir:
+            return Path(os.path.expanduser(os.path.expandvars(self.state_dir)))
+        return default_state_dir()
+
+    @property
+    def log_path(self) -> Path:
+        if self.log_dir:
+            return Path(os.path.expanduser(os.path.expandvars(self.log_dir)))
+        return self.state_path / "logs"
+
+    @property
+    def authkey_path(self) -> Path:
+        return self.state_path / "server.key"
+
+    def timeout_for(self, method: str) -> float:
+        """Call limit for ``method``; ``startup`` falls back to ``program``, then ``default``."""
+        t = self.call_timeout_s
+        if method not in t and method == "startup":
+            method = "program"
+        return float(t.get(method, t.get("default", DEFAULT_CALL_TIMEOUTS_S["default"])))
+
+
 @dataclass
 class Config:
     dll: DllConfig
@@ -116,6 +172,7 @@ class Config:
     levels: LevelsConfig = field(default_factory=LevelsConfig)
     orx_agc: OrxAgcConfig = field(default_factory=OrxAgcConfig)
     profile_name: str = "ADRV9025Init_StdUseCase102_LinkSharing.profile"
+    server: ServerConfig = field(default_factory=ServerConfig)
 
     @property
     def profile_path(self) -> Path:
@@ -155,6 +212,7 @@ class Config:
             levels=_levels_from(data.get("levels", {})),
             orx_agc=_orx_agc_from(data.get("orx_agc", {})),
             profile_name=profile.get("name", cls.profile_name),
+            server=_server_from(data.get("server", {})),
         )
 
 
@@ -166,6 +224,17 @@ def _orx_agc_from(raw: dict[str, Any]) -> OrxAgcConfig:
     """
     known = {f.name for f in fields(OrxAgcConfig)}
     return OrxAgcConfig(**{k: v for k, v in raw.items() if k in known})
+
+
+def _server_from(raw: dict[str, Any]) -> ServerConfig:
+    """Build ServerConfig, ignoring unknown keys; ``call_timeout_s`` extends the defaults."""
+    known = {f.name for f in fields(ServerConfig)}
+    kwargs = {k: v for k, v in raw.items() if k in known}
+    if "call_timeout_s" in kwargs:
+        timeouts = dict(DEFAULT_CALL_TIMEOUTS_S)
+        timeouts.update({k: float(v) for k, v in kwargs["call_timeout_s"].items()})
+        kwargs["call_timeout_s"] = timeouts
+    return ServerConfig(**kwargs)
 
 
 def _levels_from(raw: dict[str, Any]) -> LevelsConfig:
