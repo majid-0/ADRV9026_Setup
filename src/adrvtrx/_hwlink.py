@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 import enum
+import hashlib
 import inspect
 import json
 import os
@@ -112,6 +113,31 @@ def public_methods() -> tuple[str, ...]:
             continue
         names.append(name)
     return tuple(sorted(names))
+
+
+# -- TX buffer identity ----------------------------------------------------------------
+
+
+def tx_buffer_ids(tx_data) -> list[dict[str, Any]] | None:
+    """Identity of each TX channel's buffer in a PerformTx payload, or None if unknown.
+
+    ``tx_data`` is the eight arrays ``[Tx1_I, Tx1_Q, ..., Tx4_I, Tx4_Q]``. Returns
+    one ``{"hash", "n", "zeros"}`` per TX channel; ``hash`` is over the int32 I
+    and Q samples, so a client can compute it for buffers it has not sent.
+    """
+    try:
+        arrays = [np.asarray(a) for a in tx_data]
+    except TypeError:
+        return None
+    if len(arrays) != 8 or any(a.ndim != 1 for a in arrays):
+        return None
+    ids = []
+    for k in range(4):
+        i = arrays[2 * k].astype(np.int32)
+        q = arrays[2 * k + 1].astype(np.int32)
+        digest = hashlib.sha1(i.tobytes() + b"|" + q.tobytes()).hexdigest()[:16]
+        ids.append({"hash": digest, "n": int(len(i)), "zeros": not (i.any() or q.any())})
+    return ids
 
 
 # -- config, key, connection ----------------------------------------------------------

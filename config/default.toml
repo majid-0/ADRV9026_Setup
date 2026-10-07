@@ -98,3 +98,6 @@ restart_backoff_s = 2       # first restart delay, doubles per restart in the wi
 force_safe_timeout_s = 120  # post-crash force_safe (fresh process) time limit
 connect_retries = 3         # board connection attempts for that force_safe
 connect_retry_delay_s = 5
+# perform_tx with the buffers already in TX RAM only re-enables TX (no reload).
+# Assumes TX RAM survives TX disable: set false if the bench test (docs §10) fails.
+skip_identical_tx_load = true

@@ -104,6 +104,9 @@ class SimRadio:
     def set_rx_enable(self, mask: int) -> None:
         self.rx_tx_enable(mask, self._en_tx)
 
+    def enable_tx(self, mask: int) -> None:
+        self.rx_tx_enable(self._en_rx, self._en_tx | int(mask))
+
     def set_tx_atten(self, channel, atten_db: float) -> None:
         if channel in (TxChannel.TX1, TxChannel.ALL):
             self.atten = float(atten_db)

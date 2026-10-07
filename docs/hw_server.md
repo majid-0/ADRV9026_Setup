@@ -98,6 +98,11 @@ with hardware("TX1 sweep") as radio:          # waits in the queue for the board
 - `bridge` builds numpy arrays instead of .NET arrays, so
   `transmit.transmit_bands` runs unchanged.
 - `print_status()` prints locally from a remote `status()`.
+- `is_connected()` (new public `Radio` method) replaces the private
+  `_is_connected()`, so `experiment.verify_status` works on both.
+- `programming` and `session_info()`: the board's programming identity
+  (§4.2). Record it with every measurement.
+- `loaded_signals()`: what each TX channel's playback RAM holds (§4.1).
 - `release()` (same as leaving the `with` block) ends the job. For a notebook
   that keeps the board across cells: `radio = hardware("nb")` … `radio.release()`.
 - Two lifecycle methods are not passed through literally: `disconnect()` only
@@ -137,6 +142,43 @@ the job holds the board.
   rejected, not run.
 - A client that disconnects while waiting is removed from the queue.
 - Server start-up counts as busy: jobs queue until programming has finished.
+
+### 4.1 TX playback RAM (loaded signals)
+
+Loading a TX signal (`PerformTx`) is the most expensive board step, so the
+server tracks what each TX channel's RAM holds and does not load the same
+buffers twice.
+
+- On every load the server records, per TX channel: `hash` (SHA-1 of the int32
+  I and Q samples, first 16 hex digits), `n`, `zeros`, `in_mask`, `trig`,
+  `continuous`, `loaded_at`, `load_s`, and the job (name, pid, host) that
+  loaded it. `PerformTx` writes all four channels (unused ones as zeros).
+- The record survives lease changes, `safe_state` and TX disable: the RAM is
+  assumed to keep its content while TX is only disabled (**to be confirmed on
+  the bench**, §10 step 13). It is cleared by `program()`, a reconnect, a
+  server or watchdog restart (the new process knows nothing), and a failed
+  load; any other load replaces it.
+- With `[server] skip_identical_tx_load = true` (default), `perform_tx` whose
+  buffers equal the record on **every channel of its mask**, with the same
+  trigger and continuous mode, does not call `PerformTx`: it only restarts
+  playback (TX disabled, then enabled for the mask), exactly what
+  `Radio.perform_tx` does around the load. Logged as `tx_load_skipped`.
+  `status` counts loads and skipped loads. Set it to `false` if step 13 fails.
+- A client can check before sending: `client.tx_signal_ids({TX1: x}, bits)`
+  gives the hashes `transmit_bands` would load (`do_normalize=False` for stored
+  waveforms, as `replay` plays them); compare with
+  `radio.loaded_signals()["channels"]["TX1"]["hash"]`.
+
+### 4.2 Programming identity
+
+Every programming of the board (server start, a client's `program()`, a
+watchdog restart) records `program_count`, `program_id` (new each time),
+`programmed_at`, `profile` and the server pid. `program_count` is kept per
+board (`ip:port`) in `state_dir`, so it keeps counting across server processes;
+a start with `--no-program` keeps the last record. It is in `status`, in
+`RemoteRadio.programming` (at acquire) and `RemoteRadio.session_info()`
+(live). A job records it with its measurements; a different `program_id`
+between two jobs means the calibrations ran again.
 
 ## 5. Limits
 
@@ -204,6 +246,8 @@ LO       LO1 2400000000 Hz, LO2 900000000 Hz
 atten    TX1 15.00, TX2 41.95, TX3 41.95, TX4 41.95 dB
 gains    ORX1 214
 PLL      0xF (all locked) [live]
+TX RAM   TX1 3f2a9c1e n=491520 by "TX1 sweep" at 2026-10-07T10:01:05 (loads 4, skipped 9, skip identical on)
+program  #12 at 2026-10-07T09:58:40 (ADRV9025Init_StdUseCase98_LinkSharing.profile), id 5d1c0e7a9b21
 error    -
 ```
 
@@ -237,6 +281,7 @@ and pings are not.
 | `force_safe_timeout_s` | `120` | Limit for the fresh-process `force_safe` |
 | `connect_retries` | `3` | Board connection attempts in the fresh-process `force_safe` |
 | `connect_retry_delay_s` | `5` | Delay between those attempts |
+| `skip_identical_tx_load` | `true` | `perform_tx` with the buffers already in TX RAM only restarts playback (§4.1) |
 
 The auth key (32 random bytes) is created by the first `adrvtrx-server run`.
 On POSIX it is written with mode `0600`.
@@ -271,7 +316,7 @@ profile (10 MSPS / 12 bits if the profile is not on the machine).
 | Environment variable | Effect |
 |---|---|
 | `ADRVTRX_FAKE_STATE=<file.json>` | Register state shared across processes (the board keeps its registers when a client dies); every register write is logged to `<file>.events.jsonl`; creating `<file>.refuse` makes `Connect` fail |
-| `ADRVTRX_FAKE_DELAYS='{"PerformRx": 30}'` | Seconds per DLL call, to simulate slow or stuck calls |
+| `ADRVTRX_FAKE_DELAYS='{"PerformRx": 30}'` | Seconds per DLL call, to simulate slow or stuck calls; `"PerformTx_s_per_msample": 2.0` adds a load time proportional to the buffer length (s per million samples per channel) |
 | `ADRVTRX_FAKE_PA=rich` or `=<file.json / .toml>` | The PA model below; a file holds parameters, `preset = "rich"` starts from the rich values |
 
 PA model (`adrvtrx.fake.PaModel`), applied to one period of the looping TX
@@ -384,6 +429,18 @@ Close every notebook and script that builds its own `Radio`.
 12. **Replay.** On a saved conditions CSV:
     `adrvtrx replay --conditions <csv> --states <one state> --dpd input=input --out <dir>`.
     Check `summary.csv` against the original capture's NMSE and ACLR.
+13. **TX RAM.** (a) Load time: in one job, transmit the 40 MHz and then the
+    100 MHz test signal at 41.95 dB attenuation; `loaded_signals()["last_load_s"]`
+    after each (also `load_s` in the log) is the load time; note both.
+    (b) Retention: transmit the 100 MHz signal and capture ORx (reference
+    capture). Then `disable_tx()`, retune the LO and change the attenuation,
+    transmit the same signal again: `status` shows `skipped` + 1 and no new
+    `tx_load`; capture ORx and check it matches the loaded signal (`corr`
+    above 0.99 against the reference, same NMSE as the reference capture).
+    Repeat across a release: end the job (safe_state), start a new one,
+    transmit the same signal (skipped), capture and compare again. **If (b)
+    fails, set `skip_identical_tx_load = false` in `config/default.toml`** (and
+    report it, so the default changes).
 
 ## 11. Tests (`tests/`, no hardware, CI)
 
@@ -402,6 +459,7 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | single instance | a second `run` is refused without touching the board |
 | safe --direct | forces safe through the fake backend; refused while a server answers |
 | programming identity | `program_count` / `program_id` change on a client re-program, a new server and a watchdog restart |
+| TX RAM | per-channel record, survives release and safe_state; identical reload skipped (only re-enables TX), other signal / mode / channel reloads; cleared by program and restart (in-process and watchdog); switch off; fake load time grows with length |
 | fake PA | default = simple Rapp; rich model: gain lock converges at two LOs with different attenuations, GMP fit beats no DPD and needs memory, drift (file, rate, step), seed, parameter files |
 | existing modules | transmit, capture, compression, replay, operating point, linearize and sweep give the same results on a `RemoteRadio` as in-process |
 | replay CLI | end to end on the fake: summary, per-label CSVs, missing files reported before the board is taken |

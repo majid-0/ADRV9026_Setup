@@ -39,6 +39,7 @@ from ._hwlink import (
     receive,
     request,
     resolve_config,
+    tx_buffer_ids,
 )
 from .config import Config
 from .radio import Radio
@@ -57,6 +58,7 @@ __all__ = [
     "server_kick",
     "server_stop",
     "server_config",
+    "tx_signal_ids",
 ]
 
 
@@ -220,6 +222,18 @@ class RemoteRadio:
         self.programming = info.get("programming")
         return info
 
+    def loaded_signals(self) -> dict[str, Any]:
+        """What each TX channel's playback RAM holds now, read from the server.
+
+        ``channels`` maps ``TX1``.. to ``{hash, n, zeros, in_mask, trig, continuous,
+        loaded_at, job, pid, host, load_s}`` (empty after program or a server
+        restart); ``loads`` / ``skipped`` count PerformTx calls made and skipped.
+        Compare ``hash`` with :func:`tx_signal_ids` to know whether a waveform is
+        loaded before sending it.
+        """
+        with self._lock:
+            return request(self._conn, {"op": "loaded"})
+
     def print_status(self) -> dict:
         """Print :meth:`status` here (the same report as ``Radio.print_status``)."""
         return Radio.print_status(self)
@@ -241,6 +255,25 @@ for _name in public_methods():
     if _name not in RemoteRadio.__dict__:
         setattr(RemoteRadio, _name, _forwarder(_name))
 del _name
+
+
+def tx_signal_ids(channel_to_iq, bits: int, *, do_normalize: bool = True) -> dict[str, str]:
+    """``{"TX1": hash, ...}`` of the buffers ``transmit_bands`` would load for these waveforms.
+
+    Same arguments as :func:`adrvtrx.transmit.transmit_bands` (use
+    ``do_normalize=False`` for stored waveforms, as ``replay.transmit_stored``
+    does). Compare with ``radio.loaded_signals()["channels"][...]["hash"]``.
+    """
+    from ._enums import TX_SINGLE
+    from .transmit import build_tx_data, prepare_channel_iq
+
+    channel_iq = {
+        ch: prepare_channel_iq(iq, bits, do_normalize=do_normalize)
+        for ch, iq in channel_to_iq.items()
+    }
+    data, mask = build_tx_data(NumpyBridge(), channel_iq)
+    ids = tx_buffer_ids(data) or []
+    return {ch.name: ids[k]["hash"] for k, ch in enumerate(TX_SINGLE) if mask & int(ch)}
 
 
 def _print_queue(info: dict[str, Any]) -> None:

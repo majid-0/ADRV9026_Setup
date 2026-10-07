@@ -133,6 +133,9 @@ class ServerConfig:
     force_safe_timeout_s: float = 120.0
     connect_retries: int = 3
     connect_retry_delay_s: float = 5.0
+    #: Skip PerformTx when the same buffers are already loaded (TX RAM is assumed
+    #: to survive TX disable; turn off if the hardware acceptance test disproves it).
+    skip_identical_tx_load: bool = True
 
     @property
     def state_path(self) -> Path:

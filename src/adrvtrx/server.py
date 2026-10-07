@@ -61,6 +61,7 @@ from ._hwlink import (
     public_methods,
     request,
     summarize,
+    tx_buffer_ids,
 )
 from .config import Config, ServerConfig, load_config
 from .radio import FORBID_HARDWARE_ENV, MAX_TX_ATTEN_DB
@@ -274,6 +275,9 @@ class _BoardCache:
             }
 
 
+_TX_NAMES = [c.name for c in TX_SINGLE]
+
+
 def _names(channel: Any, singles) -> list[str]:
     return [c.name for c in singles if int(channel) & int(c)]
 
@@ -323,6 +327,10 @@ class HardwareServer:
         self.last_error = last_error
         #: Identity of the board's current programming (see :meth:`_note_programmed`).
         self.programming: dict[str, Any] | None = None
+        #: What each TX channel's playback RAM holds (see :meth:`_perform_tx`).
+        self._ram_lock = threading.Lock()
+        self.tx_ram: dict[str, dict[str, Any]] = {}
+        self.tx_loads = {"loads": 0, "skipped": 0, "last_load_s": None, "load_s_total": 0.0}
         self.log = log or JsonlLog(self.settings.log_path, "server")
         self.radio: Any = None
         self.hw = HardwareThread(self.settings.timeout_for)
@@ -355,6 +363,7 @@ class HardwareServer:
             "stop": self._op_stop,
             "config": lambda _s, _m: self.config,
             "session": self._op_session,
+            "loaded": lambda _s, _m: self.tx_ram_status(),
         }
 
     # -- lifecycle ---------------------------------------------------------------------
@@ -398,6 +407,7 @@ class HardwareServer:
             if self._program:
                 self.radio.program()
                 self._refresh("program")
+                self._clear_tx_ram("program")
                 self._note_programmed()
             else:
                 self.programming = self._read_programming()  # the board keeps its last one
@@ -679,7 +689,9 @@ class HardwareServer:
             lease.in_flight += 1
             lease.last_seen = time.monotonic()
         try:
-            job = self.hw.submit(method, lambda: self._invoke(method, args, kwargs), check=check)
+            job = self.hw.submit(
+                method, lambda: self._invoke(method, args, kwargs, session.client), check=check
+            )
             job.wait()
         finally:
             with self._cond:
@@ -705,10 +717,14 @@ class HardwareServer:
             raise error
         return job.result
 
-    def _invoke(self, method: str, args: tuple, kwargs: dict) -> Any:
+    def _invoke(
+        self, method: str, args: tuple, kwargs: dict, client: dict[str, Any] | None = None
+    ) -> Any:
         """Run one forwarded call on the hardware thread."""
         radio = self.radio
-        if method == "disconnect":
+        if method == "perform_tx":
+            result = self._perform_tx(args, kwargs, client or {})
+        elif method == "disconnect":
             # The server keeps its board connection for the next job; a client's
             # disconnect only leaves TX safe.
             radio.safe_state()
@@ -717,6 +733,7 @@ class HardwareServer:
         elif method == "connect":
             is_connected = getattr(radio, "is_connected", None)
             if is_connected is not None and not is_connected():
+                self._clear_tx_ram("reconnect")
                 radio.connect()
                 radio.force_safe()
                 method = "force_safe"
@@ -725,12 +742,104 @@ class HardwareServer:
             result = getattr(radio, method)(*args, **kwargs)
         self._refresh(method, args, kwargs, result)
         if method == "program":
+            self._clear_tx_ram("program")
             self._note_programmed()
         if method == "perform_rx":
             from .capture import capture_arrays
 
             result = capture_arrays(result)
         return result
+
+    # -- TX playback RAM ----------------------------------------------------------------
+
+    def _perform_tx(self, args: tuple, kwargs: dict, client: dict[str, Any]) -> None:
+        """``perform_tx``, skipping the load when the same buffers are already in TX RAM.
+
+        A skipped load only restarts playback (TX disabled, then enabled for the
+        mask), which assumes the RAM survives TX disable (bench-checked, docs
+        section 10). It needs the same buffers on every channel of the mask, the
+        same trigger and continuous mode, and nothing in between that cleared the
+        RAM (program, reconnect, server restart).
+        """
+        from ._enums import TxTrigSource
+
+        a = _bound_arguments("perform_tx", args, kwargs)
+        mask = int(a.get("channel_mask", 0))
+        mode = {
+            "trig": int(a.get("trig", TxTrigSource.IMMEDIATE)),
+            "continuous": bool(a.get("continuous", True)),
+        }
+        ids = tx_buffer_ids(a.get("tx_data", ()))
+        names = [c.name for c in TX_SINGLE if mask & int(c)]
+        if self.settings.skip_identical_tx_load and ids is not None and names:
+            same = True
+            with self._ram_lock:
+                for k, ch in enumerate(TX_SINGLE):
+                    rec = self.tx_ram.get(ch.name)
+                    if ch.name in names and (
+                        rec is None
+                        or (rec["hash"], rec["n"]) != (ids[k]["hash"], ids[k]["n"])
+                        or (rec["trig"], rec["continuous"]) != (mode["trig"], mode["continuous"])
+                    ):
+                        same = False
+            if same:
+                self.radio.disable_tx()
+                self.radio.enable_tx(mask)
+                if hasattr(self.radio, "_tx_live"):
+                    self.radio._tx_live = True
+                with self._ram_lock:
+                    self.tx_loads["skipped"] += 1
+                self.log.write("tx_load_skipped", client=client, channels=names, mask=mask)
+                return None
+        t0 = time.perf_counter()
+        try:
+            self.radio.perform_tx(*args, **kwargs)
+        except Exception:
+            self._clear_tx_ram("load failed")
+            raise
+        load_s = time.perf_counter() - t0
+        record = {
+            "loaded_at": iso(time.time()),
+            "job": client.get("name"),
+            "pid": client.get("pid"),
+            "host": client.get("host"),
+            "load_s": round(load_s, 4),
+            **mode,
+        }
+        with self._ram_lock:
+            if ids is None:
+                self.tx_ram.clear()
+            else:
+                for k, ch in enumerate(TX_SINGLE):
+                    self.tx_ram[ch.name] = {**ids[k], "in_mask": bool(mask & int(ch)), **record}
+            self.tx_loads["loads"] += 1
+            self.tx_loads["last_load_s"] = round(load_s, 4)
+            self.tx_loads["load_s_total"] = round(self.tx_loads["load_s_total"] + load_s, 4)
+        self.log.write(
+            "tx_load",
+            client=client,
+            channels=names,
+            mask=mask,
+            load_s=round(load_s, 4),
+            hashes=None if ids is None else {n: ids[k]["hash"] for k, n in enumerate(_TX_NAMES)},
+        )
+        return None
+
+    def _clear_tx_ram(self, reason: str) -> None:
+        with self._ram_lock:
+            had = bool(self.tx_ram)
+            self.tx_ram.clear()
+        if had:
+            self.log.write("tx_ram_cleared", reason=reason)
+
+    def tx_ram_status(self) -> dict[str, Any]:
+        """What each TX channel's RAM holds, and load / skipped-load counts."""
+        with self._ram_lock:
+            return {
+                "skip_identical": bool(self.settings.skip_identical_tx_load),
+                **dict(self.tx_loads),
+                "channels": {name: dict(rec) for name, rec in self.tx_ram.items()},
+            }
 
     # -- programming identity ------------------------------------------------------------
 
@@ -905,6 +1014,7 @@ class HardwareServer:
             "hardware": self.hw.busy_info(),
             "board": self.cache.snapshot(),
             "programming": self.programming,
+            "tx_ram": self.tx_ram_status(),
             "source": source,
             "readback": readback,
         }
@@ -1356,6 +1466,16 @@ def format_status(st: dict[str, Any]) -> str:
     pll = board["pll_lock"]
     pll_text = f"0x{pll:X}" if isinstance(pll, int) else (pll or "-")
     lines.append(f"PLL      {pll_text} [{st['source']}]")
+    ram = st.get("tx_ram") or {}
+    held = [
+        f"{name} {rec['hash'][:8]} n={rec['n']} by \"{rec['job']}\" at {rec['loaded_at']}"
+        for name, rec in sorted((ram.get("channels") or {}).items())
+        if rec.get("in_mask")
+    ]
+    lines.append(
+        f"TX RAM   {'; '.join(held) or '-'} (loads {ram.get('loads', 0)}, skipped "
+        f"{ram.get('skipped', 0)}, skip identical {'on' if ram.get('skip_identical') else 'off'})"
+    )
     prog = st.get("programming")
     lines.append(
         f"program  #{prog['program_count']} at {prog['programmed_at']} ({prog['profile']}), "

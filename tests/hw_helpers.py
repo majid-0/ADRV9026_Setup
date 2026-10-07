@@ -57,6 +57,8 @@ def write_config(tmp_path: Path, *, profile: Path | None = None, **server) -> Pa
         if isinstance(value, dict):
             inner = ", ".join(f"{k} = {v}" for k, v in value.items())
             lines.append(f"{key} = {{ {inner} }}")
+        elif isinstance(value, bool):
+            lines.append(f"{key} = {'true' if value else 'false'}")
         elif isinstance(value, str):
             lines.append(f'{key} = "{value}"')
         else:

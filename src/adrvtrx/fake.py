@@ -50,7 +50,9 @@ Set ``ADRVTRX_FAKE_STATE`` to a JSON file to keep the register state across
 processes (the real board keeps its registers when a client dies) and to log
 every register write to ``<file>.events.jsonl``. Creating ``<file>.refuse``
 makes ``Connect`` fail. ``ADRVTRX_FAKE_DELAYS`` is a JSON object of seconds
-per DLL call (for example ``{"PerformRx": 30}``) to simulate slow or stuck calls.
+per DLL call (for example ``{"PerformRx": 30}``) to simulate slow or stuck calls;
+its key ``PerformTx_s_per_msample`` adds a load time proportional to the buffer
+length (seconds per million samples per channel). Program clears the TX RAM.
 """
 
 from __future__ import annotations
@@ -491,6 +493,9 @@ class FakeBoard:
     def perform_tx(self, _trig: Any, tx_data: Any, channel_mask: int, continuous: int) -> None:
         self._require_connected()
         self._delay("PerformTx")
+        per_msample = self.delays.get("PerformTx_s_per_msample", 0.0)
+        if per_msample > 0 and len(tx_data):
+            time.sleep(per_msample * len(tx_data[0]) / 1e6)  # load time grows with length
         if not isinstance(tx_data, NetArrayList):
             raise TypeError(f"PerformTx expects the bridge's ArrayList, got {type(tx_data)}")
         if len(tx_data) != 8 or not all(isinstance(a, NetArray) for a in tx_data):

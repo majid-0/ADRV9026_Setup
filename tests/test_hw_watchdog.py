@@ -68,6 +68,7 @@ def test_killed_server_is_forced_safe_from_a_fresh_process_and_restarted(bench):
         radio.set_tx_atten(TxChannel.TX1, MAX_TX_ATTEN_DB)
         radio.perform_tx(BUFS, int(TxChannel.TX1))
         assert fake_events(state)[-1]["op"] == "RxTxEnableSet"  # TX enabled
+        assert sup.status()["tx_ram"]["channels"]["TX1"]["in_mask"]
         killed_at = time.time()
         kill_pid(old_pid)  # the server child of our own supervisor
         with pytest.raises(ServerConnectionLost):
@@ -81,6 +82,7 @@ def test_killed_server_is_forced_safe_from_a_fresh_process_and_restarted(bench):
         assert after["program_count"] == before["program_count"] + 1
         assert after["program_id"] != before["program_id"]
         assert after["programmed_at"] >= before["programmed_at"]
+        assert second["tx_ram"]["channels"] == {}  # RAM content unknown after a restart
         new_pid = second["server"]["pid"]
         assert _safe_from(fake_events(state), [old_pid, new_pid], killed_at)  # fresh process
         assert "TX forced safe" in sup.output()
