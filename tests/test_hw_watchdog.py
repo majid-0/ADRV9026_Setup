@@ -255,8 +255,13 @@ def test_supervisor_gone_stops_the_server_safely(bench):
         sup.proc.kill()  # our own supervisor; its child must stop by itself
         sup.proc.wait(10)
         wait_until(lambda: sup.status() is None, 30, what="server gone")
-        events = [e for e in fake_events(state) if e["pid"] == child]
-        assert events[-1]["op"] == "Disconnect" and events[-2]["tx"] == 0
+
+        def disconnected():  # it stops answering first, then forces safe and disconnects
+            events = [e for e in fake_events(state) if e["pid"] == child]
+            return events if events and events[-1]["op"] == "Disconnect" else None
+
+        events = wait_until(disconnected, 30, what="server disconnect")
+        assert events[-2]["tx"] == 0
         radio.release()
     finally:
         sup.close()
