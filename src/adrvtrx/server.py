@@ -1274,8 +1274,12 @@ class Supervisor:
             self.child = subprocess.Popen(self._cmd("_child", *extra), stdin=subprocess.PIPE)
             self.log.write("spawn", child=self.child.pid, restarts=len(restarts))
             outcome, detail, ready = self._watch(self.child, token)
-            ever_ready = ever_ready or ready
             code = self.child.returncode
+            # A crash can land between two pings, before one saw "ready": only a
+            # failed start-up (exit 5) or no ping answer at all counts as never ready.
+            if outcome == "crashed" and code != EXIT_STARTUP_FAILED:
+                ready = True
+            ever_ready = ever_ready or ready
             self.log.write("child_end", outcome=outcome, detail=detail, exit_code=code)
             if outcome == "stopped":
                 self._say("server stopped")
