@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 
 from adrvtrx._enums import RxChannel, TxChannel
-from adrvtrx.capture import channel_list, extract_channels, returned_channel_order
+from adrvtrx.capture import (
+    capture_arrays,
+    channel_list,
+    extract_channels,
+    returned_channel_order,
+)
 from adrvtrx.transmit import build_tx_data, prepare_channel_iq
 
 
@@ -104,3 +109,28 @@ def test_extract_channel_not_in_mask_raises():
     raw = [np.array([k]) for k in range(8)]
     with pytest.raises(ValueError):
         extract_channels(raw, order, [RxChannel.ORX2], 16)
+
+
+class _DotNetLike:
+    """Indexable with ``Count`` but no ``len()``, like a pythonnet collection."""
+
+    def __init__(self, arrays):
+        self._arrays = arrays
+        self.Count = len(arrays)
+
+    def __getitem__(self, k):
+        return self._arrays[k]
+
+    def __len__(self):
+        raise TypeError("no len")
+
+
+def test_capture_arrays_gives_int32_numpy_in_the_same_layout():
+    raw = _DotNetLike([[1, 2, 3], [4, 5, 6], [-7, 8, 9], [0, 0, 1]])
+    arrays = capture_arrays(raw)
+    assert len(arrays) == 4
+    assert all(a.dtype == np.int32 for a in arrays)
+    np.testing.assert_array_equal(arrays[2], [-7, 8, 9])
+    order = [RxChannel.RX1, RxChannel.ORX1]
+    out = extract_channels(arrays, order, [RxChannel.ORX1], 12)
+    np.testing.assert_array_equal(out[RxChannel.ORX1].i, [-7, 8, 9])

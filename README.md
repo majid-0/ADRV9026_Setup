@@ -144,6 +144,58 @@ from the captured signals to the next waveform) and
 [docs/linearize_notebook.md](docs/linearize_notebook.md) (the whole notebook).
 `adrvtrx` imports no external model library; the GMP is the reference DPD.
 
+## Hardware server (one process owns the board)
+
+Scripts and notebooks should not each load the DLL and connect: they race for
+the board, and a killed process can leave TX on. Run one server; every other
+process queues for the board through it. Spec, stop paths and the bench
+acceptance test: [docs/hw_server.md](docs/hw_server.md).
+
+```bash
+adrvtrx-server run                    # supervisor + server: connect, force safe, program
+adrvtrx-server run --backend fake     # dry run without the board (ADRVTRX_FAKE_PA=rich for a PA with memory)
+adrvtrx-server status                 # owner, queue, TX, LO, atten, gains, PLL, TX RAM, programming
+```
+
+One job, from any script or notebook:
+
+```python
+from adrvtrx.client import hardware
+
+with hardware("TX1 sweep") as radio:          # waits its turn (wait=False: fail fast)
+    transmit_bands(radio, {TxChannel.TX1: x}, info.tx_bits)
+    res = find_compression_point(radio, ...)   # any module that takes a Radio
+# leaving the block: TX forced safe, the next job starts
+```
+
+`radio` has every `Radio` method. `radio.session_info()` gives the board's
+programming identity (record it with your data) and `radio.loaded_signals()`
+what each TX RAM holds (an identical `perform_tx` only re-enables TX).
+
+Replay saved conditions with any number of DPD files (all files are checked
+before the board is taken):
+
+```bash
+adrvtrx replay --conditions captures/TX1_conditions.csv \
+               --dpd input=input --dpd gmp=DPD/gmp/{name}.txt --out DPD_DUT/run1
+```
+
+Emergency stop:
+
+```bash
+adrvtrx-server safe            # TX safe now, ahead of everything; ends the current job
+                               # and HOLDS the queue (no job starts) until:
+adrvtrx-server resume          # let the queued jobs run again
+adrvtrx-server kick            # end the current job (TX safe); the next job starts
+adrvtrx-server stop            # TX safe, disconnect, exit
+adrvtrx-server safe --direct   # server unreachable: connect to the board and force safe
+```
+
+A job that makes no hardware call for 30 minutes (`[server] idle_timeout_s`)
+is released and TX forced safe, even if its process is alive.
+
+If the server prints `TX STATE UNKNOWN`, switch off the PA supply.
+
 ## Develop / CI
 
 ```bash
@@ -180,12 +232,17 @@ src/adrvtrx/
   gmp.py         Generalized memory polynomial, block least squares (numpy)
   dpd.py         Peak units, normalize_pair, peak limit, ILA step for the loop
   experiment.py  session() convenience + status
-  cli.py         adrvtrx-program entry point
+  cli.py         adrvtrx-program and adrvtrx (replay) entry points
+  server.py      hardware server + supervisor/watchdog (adrvtrx-server)
+  client.py      hardware() -> RemoteRadio, server status / safe / kick / stop
+  _hwlink.py     server <-> client transport, auth key, errors, JSONL log
+  fake.py        simulated board (FakeRadio, PaModel) for dry runs and tests
 config/default.toml   all parameters (DLL path, board, profile, clocks, cals, levels)
 docs/api_notes.md     confirmed DLL API (Task 0)
 docs/dpd_workflow_spec.md   operating point, CSVs, replay and the DPD loop (spec)
 docs/dpd_pass.md            one DPD pass, step by step
 docs/linearize_notebook.md  the live DPD notebook, step by step
+docs/hw_server.md           the hardware server (spec + bench acceptance test)
 ```
 
 ## Hardware bring-up checklist (first run on the bench)

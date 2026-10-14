@@ -8,11 +8,17 @@ that record calls.
 
 from __future__ import annotations
 
+import os
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# No test may reach the real board: Radio refuses to load the real DLL and the
+# hardware server refuses the real backend while this is set. Subprocesses the
+# tests start inherit it. Only tests/test_hardware.py lifts it (``-m hardware``).
+os.environ["ADRVTRX_FORBID_HARDWARE"] = "1"
 
 
 class _TypesFactory:

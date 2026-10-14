@@ -14,6 +14,7 @@ TX is forced safe and the board disconnected at teardown.
 
 from __future__ import annotations
 
+import os
 import socket
 
 import numpy as np
@@ -47,8 +48,14 @@ def hw():
     cfg = load_config()
     if not _reachable(cfg.board.ip, cfg.board.port):
         pytest.skip(f"ADS9 not reachable at {cfg.board.ip}:{cfg.board.port}")
-    with session(cfg) as (radio, info):
-        yield radio, info
+    # conftest forbids the real DLL for every other test; this module is the exception.
+    forbid = os.environ.pop("ADRVTRX_FORBID_HARDWARE", None)
+    try:
+        with session(cfg) as (radio, info):
+            yield radio, info
+    finally:
+        if forbid is not None:
+            os.environ["ADRVTRX_FORBID_HARDWARE"] = forbid
 
 
 def _tone(n: int, freq_hz: float, rate_hz: float) -> np.ndarray:

@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
+import pytest
+
 from adrvtrx._enums import RxChannel, TxChannel
-from adrvtrx.radio import MAX_TX_ATTEN_DB
+from adrvtrx.config import Config, DllConfig
+from adrvtrx.radio import MAX_TX_ATTEN_DB, Radio
 
 
 def _last_atten_item(device):
@@ -108,3 +114,38 @@ def test_safe_state_stops_tx_enable(fake_radio):
     fake_radio.safe_state()
     rx, tx = fake_radio.device.RadioCtrl.RxTxEnableSet.call_args.args
     assert tx == 0  # TX playback stopped
+
+
+def test_set_rx_enable_keeps_tx(fake_radio):
+    fake_radio.enable_tx(int(TxChannel.TX2))
+    fake_radio.set_rx_enable(0x1F)
+    assert (fake_radio._en_rx, fake_radio._en_tx) == (0x1F, int(TxChannel.TX2))
+    rx, tx = fake_radio.device.RadioCtrl.RxTxEnableSet.call_args.args
+    assert (rx, tx) == (0x1F, int(TxChannel.TX2))
+
+
+def test_perform_tx_converts_numpy_buffers(fake_radio):
+    bufs = [np.array([k, -k, 2 * k], dtype=np.int16) for k in range(8)]
+    fake_radio.perform_tx(bufs, int(TxChannel.TX1))
+    _trig, data, mask, cont = fake_radio.board.PerformTx.call_args.args
+    assert data == [[k, -k, 2 * k] for k in range(8)]  # bridge.array_list of int_array
+    assert all(type(v) is int for v in data[1])
+    assert (mask, cont) == (int(TxChannel.TX1), 1)
+
+
+def test_perform_tx_converts_a_2d_array(fake_radio):
+    fake_radio.perform_tx(np.arange(16).reshape(8, 2), int(TxChannel.TX2), continuous=False)
+    _trig, data, _mask, cont = fake_radio.board.PerformTx.call_args.args
+    assert data[3] == [6, 7] and cont == 0
+
+
+def test_perform_tx_passes_dotnet_data_through(fake_radio):
+    marker = object()  # stands in for the .NET ArrayList built by build_tx_data
+    fake_radio.perform_tx(marker, int(TxChannel.TX1))
+    assert fake_radio.board.PerformTx.call_args.args[1] is marker
+
+
+def test_real_dll_is_forbidden_in_tests():
+    radio = Radio(Config(dll=DllConfig(install_dir=Path("C:/nonexistent"))))
+    with pytest.raises(RuntimeError, match="ADRVTRX_FORBID_HARDWARE"):
+        _ = radio.bridge

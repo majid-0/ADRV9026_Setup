@@ -28,9 +28,12 @@ def session(
 
 
 def verify_status(radio: Radio) -> dict:
-    """Read back a quick health summary after programming."""
+    """Read back a quick health summary after programming.
+
+    Works on a ``Radio`` and on a hardware-server ``RemoteRadio`` (public calls only).
+    """
     return {
-        "connected": radio._is_connected(),
+        "connected": radio.is_connected(),
         "lo1_hz": radio.get_lo("LO1"),
         "lo2_hz": radio.get_lo("LO2"),
         "pll_lock_status": radio.pll_lock_status(),

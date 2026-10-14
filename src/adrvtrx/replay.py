@@ -42,6 +42,7 @@ __all__ = [
     "stored_tx",
     "transmit_stored",
     "dut_record",
+    "replay_row",
     "replay_conditions",
 ]
 
@@ -136,6 +137,71 @@ def _preflight(rows, csv_dir: Path, waveform_for) -> dict[str, WaveformSource]:
     return sources
 
 
+def replay_row(
+    radio,
+    row: OperatingCondition,
+    x_codes,
+    source: WaveformSource,
+    *,
+    tx: TxChannel,
+    orx: RxChannel,
+    tx_bits: int,
+    rx_bits: int,
+    fs: float,
+    out_dir: str | Path,
+    label: str = "dpd",
+    oversample: int = 2,
+    lo: str = "LO1",
+    file_scale: float = 1.0,
+    retune: bool = True,
+) -> DutRecord:
+    """Replay one waveform at one saved condition; no CSV of conditions needed.
+
+    ``x_codes`` is the row's reference in TX codes (``load_aligned_iq(ref) *
+    full_scale(tx_bits)``). ``source`` is the normalized waveform, or a path to
+    an ``I<TAB>Q`` file holding ``u * file_scale``. With ``retune`` the LO is
+    set to the row's frequency first, with TX off. Then the row's attenuation
+    and ORx gain are set, ``u`` plays as stored, and one capture is aligned to
+    ``u`` and scored against ``x``. Writes ``{name}_{label}_dut.txt`` (and
+    ``{name}_{label}.txt`` for an array source) in ``out_dir``. TX is left on.
+    """
+    out_dir = Path(out_dir)
+    tx_scale = float(full_scale(tx_bits))
+    if isinstance(source, (str, Path)):
+        u_norm = load_aligned_iq(source) / float(file_scale)
+        in_file = Path(source).name
+    else:
+        u_norm = np.asarray(source)
+        in_file = f"{row.name}_{label}.txt"
+        save_aligned_iq(u_norm * tx_scale, out_dir / in_file, tx_bits)
+    if len(u_norm) != len(x_codes):
+        raise ValueError(
+            f"{row.name}: waveform has {len(u_norm)} samples, reference {len(x_codes)}"
+        )
+    u = stored_tx(u_norm, tx_bits)
+
+    if retune:
+        radio.disable_tx()
+        radio.retune_lo(lo, int(row.freq_hz))
+    radio.set_tx_atten(tx, row.tx_atten_db)
+    radio.set_rx_gain(orx, int(row.orx_gain))
+    transmit_stored(radio, tx, u)
+
+    point = capture_point(
+        radio,
+        orx,
+        u.codes,
+        rx_bits=rx_bits,
+        fs=fs,
+        bw_hz=row.bw_mhz * 1_000_000,
+        oversample=oversample,
+        metric_ref=x_codes,
+    )
+    out_file = f"{row.name}_{label}_dut.txt"
+    save_aligned_iq(point.y_aligned, out_dir / out_file, rx_bits)
+    return dut_record(row, point, x_codes, u, in_file=in_file, out_file=out_file)
+
+
 def replay_conditions(
     radio,
     csv_path: str | Path,
@@ -161,7 +227,8 @@ def replay_conditions(
     Paths are loaded one row at a time. Every reference and every waveform path is
     checked before the first transmission. Rows run sorted by
     ``(freq_hz, bw_mhz, backoff_db)``; the LO is retuned, with TX off, only when
-    the frequency changes. TX is disabled when the replay ends or fails.
+    the frequency changes. TX is disabled when the replay ends or fails. Each
+    row is :func:`replay_row`.
     """
     csv_path = Path(csv_path)
     csv_dir = csv_path.parent
@@ -179,44 +246,24 @@ def replay_conditions(
             for row in rows:
                 if row.in_file not in refs:
                     refs[row.in_file] = load_aligned_iq(csv_dir / row.in_file) * tx_scale
-                x_codes = refs[row.in_file]
-
-                src = sources[row.name]
-                if isinstance(src, Path):
-                    u_norm = load_aligned_iq(src) / float(file_scale)
-                    in_file = src.name
-                else:
-                    u_norm = src
-                    in_file = f"{row.name}_{label}.txt"
-                    save_aligned_iq(u_norm * tx_scale, out_dir / in_file, tx_bits)
-                if len(u_norm) != len(x_codes):
-                    raise ValueError(
-                        f"{row.name}: waveform has {len(u_norm)} samples, "
-                        f"reference {len(x_codes)}"
-                    )
-                u = stored_tx(u_norm, tx_bits)
-
-                if row.freq_hz != current_freq:
-                    radio.disable_tx()
-                    radio.retune_lo(lo, int(row.freq_hz))
-                    current_freq = row.freq_hz
-                radio.set_tx_atten(tx, row.tx_atten_db)
-                radio.set_rx_gain(orx, int(row.orx_gain))
-                transmit_stored(radio, tx, u)
-
-                point = capture_point(
+                record = replay_row(
                     radio,
-                    orx,
-                    u.codes,
+                    row,
+                    refs[row.in_file],
+                    sources[row.name],
+                    tx=tx,
+                    orx=orx,
+                    tx_bits=tx_bits,
                     rx_bits=rx_bits,
                     fs=fs,
-                    bw_hz=row.bw_mhz * 1_000_000,
+                    out_dir=out_dir,
+                    label=label,
                     oversample=oversample,
-                    metric_ref=x_codes,
+                    lo=lo,
+                    file_scale=file_scale,
+                    retune=row.freq_hz != current_freq,
                 )
-                out_file = f"{row.name}_{label}_dut.txt"
-                save_aligned_iq(point.y_aligned, out_dir / out_file, rx_bits)
-                record = dut_record(row, point, x_codes, u, in_file=in_file, out_file=out_file)
+                current_freq = row.freq_hz
                 log.append(record)
                 if on_row is not None:
                     on_row(record)
