@@ -230,7 +230,29 @@ output also stays about 0.1 dB short of the target. A memoryless GMP(9, 1, 0)
 reaches the target there and holds ACLR.
 Damping the update (0.5 or 0.7) or a ridge term only moved the best pass, so
 neither is used. The old sliding target hid this by lowering the drive on every
-pass. The notebook's default `N_ITER = 4` (3 passes) stops near the best pass.
+pass.
+
+**The band limit (`tx_cutoff`).** The drift is the DPD output slowly building up
+content outside the ACLR span, where the loop has no reliable picture of the PA;
+each fit reproduces it and the PA folds it back into the channels. `IlaStep(...,
+tx_cutoff=1.5 * bw / fs)` zeroes every DFT bin of the DPD output above that
+cutoff (the waveform is one cyclic period, so the filter is exact) before the
+peak check, so neither the waveform sent nor the next fit's target carries it.
+Offline, sim bench, GMP(5, 5, 2), 12 captures:
+
+| | best worst ACLR (pass) | last pass |
+|---|---|---|
+| no noise, no band limit | -62.4 dBc (2) | -58.5 dBc |
+| no noise, 1.5 x BW | -61.9 dBc (10) | -61.7 dBc |
+| sim noise, no band limit | -60.7 dBc (2) | -58.5 dBc |
+| sim noise, 1.5 x BW | -60.7 dBc (9) | -59.8 dBc |
+
+On a forward-GMP model of the multi_gc4 2.4 GHz / 100 MHz capture (dpdlab, 32768
+samples, 19 passes) the same limit took GMP(5, 5, 2) from -49.4 dBc at pass 2 and
+-43.3 dBc at the end to -54.5 / -54.4 dBc. The cutoff is a trade: on a hard,
+memoryless saturation the predistorter's spectrum is wider, so 1.5 x BW can cost
+some ACLR at the best pass (0.5 dB here) and 2 x BW may suit better; on the
+capture model 2 x BW still drifted by about 1 dB. It is off by default. The notebook's default `N_ITER = 4` (3 passes) stops near the best pass.
 If more passes are needed, watch the ACLR column and keep the best waveform
 (every `u` is saved).
 
