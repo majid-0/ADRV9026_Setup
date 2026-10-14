@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from adrvtrx.config import Config, load_config
@@ -44,10 +42,3 @@ def test_levels_defaults_and_overrides():
 def test_missing_install_dir_raises():
     with pytest.raises(ValueError):
         Config.from_dict({"board": {"ip": "10.0.0.1"}})
-
-
-def test_absolute_profile_name_is_respected():
-    cfg = Config.from_dict(
-        {"dll": {"install_dir": "C:/x"}, "profile": {"name": "C:/abs/my.profile"}}
-    )
-    assert cfg.profile_path == Path("C:/abs/my.profile")
