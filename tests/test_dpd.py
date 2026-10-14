@@ -17,7 +17,9 @@ its worst ACLR is best after the second pass and then gets worse (-60.7 then
 -60.3 dBc; noise-free 0.6-2 dB per pass after the third). That run is checked
 separately for what it does hold (``test_gmp552_on_the_sim_bench``) and the drift
 is reported in ``docs/dpd_pass.md``; the real-PA fixture uses GMP(5, 5, 2) with
-the full ACLR rule.
+the full ACLR rule. With the DPD output band-limited to the ACLR span
+(``tx_cutoff = 1.5 * BW / FS``) GMP(5, 5, 2) holds its ACLR on the sim
+(``test_tx_cutoff_holds_gmp552_on_the_sim_bench``).
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from adrvtrx.dpd import (
     FULL_SCALE_DBM,
     TARGET_BACKOFF_DB,
     IlaStep,
+    band_limit,
     iteration_table,
     limit_peak,
     normalize_pair,
@@ -447,3 +450,60 @@ def test_peak_guard_on_the_real_pa_model():
     assert all(h["guard_db"] > 0.1 for h in step.history), step.history
     out = [r["output_peak_db"] for r in rows[1:]]
     assert max(out) - min(out) <= OUT_TOL_DB, out
+
+
+# -- band limit (tx_cutoff) ---------------------------------------------------------
+
+
+def test_band_limit_keeps_the_band_and_zeroes_the_rest():
+    n = 1024
+    t = np.arange(n)
+    inside = np.exp(2j * np.pi * 10 / n * t)
+    outside = 0.3 * np.exp(-2j * np.pi * 300 / n * t)
+    np.testing.assert_allclose(band_limit(inside + outside, 0.1), inside, atol=1e-12)
+    for bad in (0.0, -0.1, 0.6, float("nan")):
+        with pytest.raises(ValueError):
+            band_limit(inside, bad)
+
+
+class _Cubic(_Spy):
+    """A post-inverse whose output is wider than its input (a cubic term)."""
+
+    def predict(self, u):
+        u = np.asarray(u)
+        return self.gain * (u + 0.3 * u * np.abs(u) ** 2)
+
+
+def test_step_tx_cutoff_band_limits_the_waveform():
+    x = make_signal()  # occupies +-0.45 BW; the cubic spreads it to +-1.35 BW
+    z = np.tanh(np.abs(x)) * np.exp(1j * np.angle(x))
+    cut = 0.75 * BW / FS
+    f = np.abs(np.fft.fftfreq(len(x)))
+    wide = IlaStep(lambda: _Cubic(0.7), n_train=1024)(x, x, z, 0)
+    spec = np.abs(np.fft.fft(wide)) ** 2
+    assert spec[f > cut].sum() > 1e-6 * spec.sum()
+    step = IlaStep(lambda: _Cubic(0.7), n_train=1024, tx_cutoff=cut)
+    nxt = step(x, x, z, 0)
+    spec = np.abs(np.fft.fft(nxt)) ** 2
+    assert spec[f > cut].sum() <= 1e-20 * spec.sum()
+    (row,) = step.history
+    assert row["ok"] and row["dpd_peak_dbm"] == pytest.approx(peak_dbm(nxt))
+    assert row["dpd_peak_dbm"] <= PEAK_LIMIT_DBM
+    for bad in (0.0, 0.7):
+        with pytest.raises(ValueError):
+            IlaStep(lambda: _Cubic(), tx_cutoff=bad)
+
+
+def test_tx_cutoff_holds_gmp552_on_the_sim_bench():
+    """GMP(5, 5, 2) drifts after its best pass on the sim (module docstring).
+
+    Band-limited to the ACLR span it holds."""
+    _, _, _, plain = _sim_loop(spec=(5, 5, 2), n_iter=8)
+    _, step, _, table = _sim_loop(spec=(5, 5, 2), n_iter=8, tx_cutoff=1.5 * BW / FS)
+    w0 = [row["aclr_worst_dbc"] for row in plain]
+    w = [row["aclr_worst_dbc"] for row in table]
+    assert w0[-1] - min(w0[1:]) > 1.0, w0  # the drift this option is for
+    assert w[-1] - min(w[1:]) <= ACLR_SLACK_DB, w
+    assert w[-1] < w0[-1], (w, w0)
+    assert min(w[1:]) <= w[0] - 25.0, w
+    assert all(h["ok"] and h["dpd_peak_dbm"] <= PEAK_LIMIT_DBM for h in step.history)

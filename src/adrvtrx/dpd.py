@@ -14,7 +14,8 @@ One DPD pass (:class:`IlaStep`), from the last capture to the next waveform:
    **as is** (DAC units), by block least squares on the samples around the
    peak of ``z`` (:func:`adrvtrx.gmp.peak_block`).
 3. :func:`limit_peak`: ``x`` is predistorted through the post-inverse at the
-   output target, ``target_backoff_db`` below the anchor. That backoff is a rule
+   output target, ``target_backoff_db`` below the anchor. With ``tx_cutoff`` set,
+   the DPD output is first band-limited (:func:`band_limit`) to that cutoff. That backoff is a rule
    decided once, not something that grows each pass. The peak guard raises it
    only as far as needed to keep the DPD peak at or below the limit (9.9 dBm by
    default). If no backoff up to the maximum meets it, the pass returns ``None``
@@ -42,6 +43,7 @@ __all__ = [
     "normalize_pair",
     "PeakLimit",
     "limit_peak",
+    "band_limit",
     "ANCHORS",
     "TARGET_BACKOFF_DB",
     "IlaStep",
@@ -190,6 +192,21 @@ def _plain_nmse_db(target: np.ndarray, pred: np.ndarray) -> float:
     return float(10.0 * np.log10(num / den)) if num > 0 else float("-inf")
 
 
+def band_limit(s, cutoff: float) -> np.ndarray:
+    """Zero every DFT bin of ``s`` above ``cutoff`` cycles per sample (``0 < cutoff <= 0.5``).
+
+    ``s`` is one period of the cyclic waveform the TX plays, so this is an exact,
+    zero-phase low-pass. ``1.5 * bw / fs`` keeps the channel and both adjacent
+    channels (the ACLR span).
+    """
+    c = float(cutoff)
+    if not (math.isfinite(c) and 0.0 < c <= 0.5):
+        raise ValueError(f"cutoff is in cycles per sample: 0 < cutoff <= 0.5, got {cutoff}")
+    spec = np.fft.fft(np.asarray(s, dtype=np.complex128))
+    spec[np.abs(np.fft.fftfreq(spec.shape[0])) > c] = 0.0
+    return np.fft.ifft(spec)
+
+
 ANCHORS = ("first", "each")
 
 TARGET_BACKOFF_DB = 0.15
@@ -214,6 +231,12 @@ class IlaStep:
        the anchor. :func:`limit_peak` starts there and adds backoff (the *guard*)
        only while the DPD peak would be above ``peak_limit_dbm``, up to
        ``max_margin_db`` in total. Returns the waveform.
+
+    ``tx_cutoff`` (cycles per sample, off by default) band-limits the DPD output
+    before the peak check, e.g. ``1.5 * bw / fs``. The waveform sent, and so the
+    target of the next fit, then carries nothing outside the ACLR span. Without it
+    a GMP with memory slowly builds up content there on a PA it cannot invert
+    exactly, and the ACLR gets worse after its best pass.
 
     A call with ``it == 0`` starts a run: it takes the anchor from that ``z`` and
     clears ``history`` and ``reason``.
@@ -240,8 +263,15 @@ class IlaStep:
         anchor: str = "first",
         tol_db: float = 0.01,
         coarse_step_db: float = 0.25,
+        tx_cutoff: float | None = None,
         verbose: bool = False,
     ):
+        if tx_cutoff is not None and not (
+            math.isfinite(float(tx_cutoff)) and 0.0 < float(tx_cutoff) <= 0.5
+        ):
+            raise ValueError(
+                f"tx_cutoff is in cycles per sample: 0 < tx_cutoff <= 0.5, got {tx_cutoff}"
+            )
         if anchor not in ANCHORS:
             raise ValueError(f"anchor must be one of {ANCHORS}, got {anchor!r}")
         if not 0.0 <= target_backoff_db <= max_margin_db:
@@ -257,6 +287,7 @@ class IlaStep:
         self.anchor = anchor
         self.tol_db = float(tol_db)
         self.coarse_step_db = float(coarse_step_db)
+        self.tx_cutoff = None if tx_cutoff is None else float(tx_cutoff)
         self.verbose = verbose
         self.history: list[dict[str, Any]] = []
         self.reason = ""
@@ -281,8 +312,15 @@ class IlaStep:
         self.model = model
         fit_nmse = _plain_nmse_db(u, np.asarray(model.predict(z_n), dtype=np.complex128))
 
+        if self.tx_cutoff is None:
+            dpd = model.predict
+        else:
+
+            def dpd(v):
+                return band_limit(model.predict(v), self.tx_cutoff)
+
         lim = limit_peak(
-            model.predict,
+            dpd,
             x_n,
             peak_limit_dbm=self.peak_limit_dbm,
             start_margin_db=self.target_backoff_db,
