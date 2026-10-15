@@ -221,7 +221,18 @@ class RemoteRadio:
                 raise RuntimeError(f"job {self.name!r} no longer holds the board: {self._end}")
             info = request(self._conn, {"op": "session"})
         self.programming = info.get("programming")
+        if info.get("profile_name"):
+            self.config.profile_name = info["profile_name"]  # config follows the board's profile
         return info
+
+    def program(self, profile: str | None = None) -> None:
+        """``Radio.program`` in the server (``profile`` changes the sample rate).
+
+        Afterwards ``config`` (so ``read_profile(radio.config.profile_path)``) and
+        ``programming`` describe the newly programmed board.
+        """
+        self._call("program", (), {} if profile is None else {"profile": str(profile)})
+        self.session_info()
 
     def loaded_signals(self) -> dict[str, Any]:
         """What each TX channel's playback RAM holds now, read from the server.

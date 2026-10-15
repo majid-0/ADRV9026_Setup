@@ -416,6 +416,8 @@ class FakeBoard:
     def program(self) -> None:
         self._require_connected()
         self._delay("Program")
+        # program(profile=...) may have changed the profile: rates and bits follow it
+        self.rate_hz, self.tx_bits, self.rx_bits = _profile_numbers(self.config)
         rc = getattr(self.post_init, "radioCtrlInit", None)
         for name, attr in (("LO1", "lo1PllFreq_Hz"), ("LO2", "lo2PllFreq_Hz")):
             value = getattr(rc, attr, None) if rc is not None else None

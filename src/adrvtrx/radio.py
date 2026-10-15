@@ -207,8 +207,15 @@ class Radio:
 
     # -- programming (mirrors the init script, driven by config) ---------------
 
-    def program(self) -> None:
-        """Reproduce the StdUseCase init sequence from config. See docs/api_notes.md."""
+    def program(self, profile: str | None = None) -> None:
+        """Reproduce the StdUseCase init sequence from config. See docs/api_notes.md.
+
+        ``profile`` (a file name under the install's profiles directory, or an absolute
+        path) becomes the config's profile first: the way to change the sample rate.
+        ``None`` programs with the config's profile.
+        """
+        if profile is not None:
+            self.config.profile_name = str(profile)
         cfg = self.config
         b = self.bridge
         dev = self.device

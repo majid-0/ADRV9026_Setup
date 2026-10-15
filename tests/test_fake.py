@@ -26,6 +26,30 @@ def _radio(**kw) -> FakeRadio:
     return radio
 
 
+DATA = Path(__file__).parent / "data"
+
+
+def test_program_with_a_profile_changes_the_sample_rate_and_clears_tx_ram():
+    radio = _radio()
+    radio.connect()
+    radio.program(profile=str(DATA / "stub_uc98.profile"))
+    board = radio.board_model
+    assert (board.rate_hz, board.tx_bits, board.rx_bits) == (491.52e6, 12, 12)
+    radio.set_tx_atten(TxChannel.TX1, 15.0)
+    transmit_bands(radio, {TxChannel.TX1: 0.5 * np.ones(1024, complex)}, 12)
+    assert "TX1" in board.waves
+
+    radio.program(profile=str(DATA / "stub_uc61.profile"))
+    assert radio.config.profile_path == DATA / "stub_uc61.profile"
+    assert (board.rate_hz, board.tx_bits, board.rx_bits) == (368.64e6, 12, 12)
+    assert not board.waves  # programming clears TX RAM
+    cap = capture(radio, int(RxChannel.ORX1), 1.0, bits=12).channels[RxChannel.ORX1]
+    assert len(cap.i) == 368_640  # 1 ms at the new rate
+
+    radio.program()  # no profile: keeps the current one
+    assert radio.config.profile_path == DATA / "stub_uc61.profile"
+
+
 def test_program_and_status_run_the_real_radio_code():
     radio = _radio()
     radio.connect()

@@ -426,6 +426,26 @@ def test_verify_status_works_in_process_and_remote(server, cfg):
         assert verify_status(radio) == expected
 
 
+def test_a_client_changes_the_profile_and_its_config_follows(cfg):
+    from adrvtrx.profile import read_profile
+
+    data = Path(__file__).parent / "data"
+    with running_server(cfg) as srv:
+        with hardware("rate change", config=cfg) as radio:
+            radio.set_tx_atten(TxChannel.TX1, 20.0)
+            radio.perform_tx(tx_buffers(), int(TxChannel.TX1))
+            assert radio.loaded_signals()["channels"]
+            radio.program(profile=str(data / "stub_uc61.profile"))
+            assert read_profile(radio.config.profile_path).orx_rate_khz == 368_640
+            assert radio.programming["profile"] == "stub_uc61.profile"
+            assert radio.programming["program_count"] == 2
+            assert not radio.loaded_signals()["channels"]  # TX RAM cleared by the program
+        assert server_status(cfg)["programming"]["profile"] == "stub_uc61.profile"
+        assert srv.radio.board_model.rate_hz == 368.64e6
+        with hardware("next job", config=cfg) as radio:  # a new lease sees the board's profile
+            assert radio.config.profile_path == data / "stub_uc61.profile"
+
+
 def test_programming_identity_counts_every_programming(cfg):
     with running_server(cfg):
         first = server_status(cfg)["programming"]

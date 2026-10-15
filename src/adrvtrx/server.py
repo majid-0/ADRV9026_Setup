@@ -910,6 +910,7 @@ class HardwareServer:
             "server_started": iso(self.started),
             "restarts": self.restarts,
             "programming": self.programming,
+            "profile_name": self.config.profile_name,
         }
 
     def _op_heartbeat(self, session: _Session, _message: dict[str, Any]) -> dict[str, Any]:

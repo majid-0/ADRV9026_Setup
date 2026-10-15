@@ -102,6 +102,9 @@ with hardware("TX1 sweep") as radio:          # waits in the queue for the board
   `_is_connected()`, so `experiment.verify_status` works on both.
 - `programming` and `session_info()`: the board's programming identity
   (§4.2). Record it with every measurement.
+- `program(profile=...)` reprograms the board with another profile (another
+  sample rate, §4.2); afterwards `config` (so `read_profile(radio.config.profile_path)`)
+  and `programming` describe the new profile.
 - `loaded_signals()`: what each TX channel's playback RAM holds (§4.1).
 - `release()` (same as leaving the `with` block) ends the job. For a notebook
   that keeps the board across cells: `radio = hardware("nb")` … `radio.release()`.
@@ -188,6 +191,13 @@ a start with `--no-program` keeps the last record. It is in `status`, in
 `RemoteRadio.programming` (at acquire) and `RemoteRadio.session_info()`
 (live). A job records it with its measurements; a different `program_id`
 between two jobs means the calibrations ran again.
+
+**Profile.** `program(profile=...)` (a file name under the install's profiles
+directory, or an absolute path) makes that profile the server's: the
+programming identity records it, `status` shows it, and the next lease's
+`config` carries it. Programming clears TX RAM (§4.1). A watchdog restart
+programs with the config file's profile again; the new `program_id` and
+`profile` show it, so a client that needs another profile programs it again.
 
 ## 5. Limits
 
