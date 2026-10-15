@@ -88,6 +88,13 @@ def test_coupling_zero_decouples_the_bands():
     assert _compression(radio, TX1) == pytest.approx(a, abs=1e-9)
 
 
+def test_a_spec_file_may_carry_comment_keys(tmp_path):
+    spec = tmp_path / "preset.json"
+    spec.write_text('{"_about": "fitted to ...", "shared": [["TX1", "TX4"]], "coupling": 0.3}')
+    pa = PaModel.from_spec(str(spec))
+    assert pa.shared == [["TX1", "TX4"]] and pa.coupling == 0.3
+
+
 def test_per_band_overrides_and_their_validation():
     radio = _radio({**SHARED, "bands": {"TX4": {"smoothness": 0.8, "drive": 3.0}}})
     assert radio.board_model.pa.for_tx("TX4").smoothness == 0.8

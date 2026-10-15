@@ -231,7 +231,10 @@ class PaModel:
 
     @classmethod
     def from_spec(cls, spec) -> PaModel:
-        """``None`` / ``""`` / ``"simple"``, ``"rich"``, a dict, or a ``.json`` / ``.toml`` file."""
+        """``None`` / ``""`` / ``"simple"``, ``"rich"``, a dict, or a ``.json`` / ``.toml`` file.
+
+        Keys starting with ``_`` are comments (JSON has none), e.g. ``"_about"``.
+        """
         if isinstance(spec, PaModel):
             return spec
         if spec is None or str(spec).strip() in ("", "simple"):
@@ -250,6 +253,7 @@ class PaModel:
                 params = tomllib.loads(path.read_text())
             else:
                 params = json.loads(path.read_text())
+        params = {k: v for k, v in params.items() if not str(k).startswith("_")}
         preset = params.pop("preset", "simple")
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(params) - known)
