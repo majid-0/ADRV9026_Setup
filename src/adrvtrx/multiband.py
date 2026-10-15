@@ -1,0 +1,994 @@
+"""Several TX bands at once: compression search, operating point and saving.
+
+On the dual-band bench, TX1 and TX4 drive one PA, so each band's gain compression depends on
+every band's attenuation. This module locks every band to its own compression target together,
+backs them off together and saves one case folder.
+
+:func:`search_multiband_compression` is hardware-free (``set_atten``, ``set_gain`` and
+``measure`` per band, like :func:`adrvtrx.compression.search_tx_compression`). One step sets
+every band's attenuation and ORx gain and takes one reading per band; a band whose ORx is not
+leveled moves only its ORx gain and is measured again before its reading counts. Moves
+(``method``):
+
+* ``"walk"``: every band by the single-band rule (one coarse step toward the target, then fine
+  steps sized to its error, 1 dB of compression assumed per dB).
+* ``"slopes"``: one coarse step, then a slope matrix ``J`` (how much each band's compression
+  moves per dB of each band's attenuation) learnt from the steps taken: it starts from each
+  band's own slope (its last two readings, no cross terms) and every step corrects it with what
+  happened (Broyden), so a cross-band effect is learnt when it exists. The move solves
+  ``J @ da = target - c``. When a step made a band's error grow, the next step falls back to the
+  walk and ``J`` starts again from the own slopes.
+
+Both: moves capped at ``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
+gain follows the predicted output peak (the drive change minus the compression change); a band
+never goes below its ``atten_min_db`` (a band that needs more drive than that stops there, the
+others go on); clip guard per band (``min_top_slope``); at most ``max_steps`` steps, then the
+step with the smallest worst-band error is kept.
+
+:func:`find_multiband_operating_point` runs it on hardware (a :class:`~adrvtrx.radio.Radio` or
+the hardware server's ``RemoteRadio``): retune, play every TX in one ``PerformTx``, ORx AGC per
+band, the search, then per backoff every band ``+k`` dB, ORx AGC per band, one capture per band
+and the caller's ``check`` on them. The steps are separate functions too (:func:`play_bands`,
+:func:`lock_bands`, :func:`capture_case`) for a campaign that runs them as separate jobs.
+:class:`CaseWriter` saves a case folder (write-once).
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from ._enums import RxChannel, TxChannel
+from .align import estimate_and_align
+from .capture import autolevel_capture, capture
+from .compression import _quantize_atten
+from .conditions import save_aligned_iq
+from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
+from .metrics import PA_CLIP_SLOPE, gain_compression_db, period_metrics, window_compression_db
+from .radio import MAX_TX_ATTEN_DB
+from .transmit import transmit_bands
+from .waveform import prepare_tx
+
+__all__ = [
+    "METHODS",
+    "BandSpec",
+    "BandLock",
+    "MultibandSearch",
+    "BandCapture",
+    "CaseResult",
+    "search_multiband_compression",
+    "play_bands",
+    "measure_band",
+    "lock_bands",
+    "capture_case",
+    "find_multiband_operating_point",
+    "case_name",
+    "CaseWriter",
+]
+
+METHODS = ("slopes", "walk")
+
+
+@dataclass
+class BandSpec:
+    """One band: its path, carrier, signal and compression target.
+
+    ``signal`` is the complex waveform at any scale (it is normalized and quantized to TX codes).
+    ``atten_min_db`` is the band's hard limit: the search never goes below it.
+    """
+
+    tx: TxChannel
+    orx: RxChannel
+    lo: str
+    freq_hz: int
+    bw_mhz: float
+    signal: Any
+    target_db: float = 4.0
+    atten_start_db: float = 20.0
+    atten_min_db: float = 10.0
+    signal_name: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.tx.name if hasattr(self.tx, "name") else str(self.tx)
+
+
+@dataclass
+class BandLock:
+    """One band at the end of the search.
+
+    ``status``: ``converged``, ``at limit`` (needs more drive than its limit allows),
+    ``clip-limited`` (the PA clips before the target) or ``not converged``.
+    """
+
+    name: str
+    atten_db: float
+    orx_gain: int
+    compression_db: float
+    papr_compression_db: float
+    top_slope: float
+    peak_dbfs: float
+    railed: int
+    floor_db: float
+    status: str
+
+
+@dataclass
+class MultibandSearch:
+    """The search.
+
+    ``steps`` counts steps (one reading per band each); ``captures`` counts every capture, ORx
+    re-leveling included. ``history`` has one row per band per reading.
+    """
+
+    converged: bool
+    reason: str
+    method: str
+    bands: list[BandLock]
+    steps: int
+    captures: int
+    fatal: bool = False
+    history: list[dict] = field(default_factory=list)
+
+
+def _fine_step(error_db: float, fine: float, coarse: float) -> float:
+    steps = max(1, math.floor((abs(error_db) + 1e-6) / fine))
+    return min(coarse, steps * fine)
+
+
+def search_multiband_compression(
+    set_atten: Callable[[int, float], None],
+    set_gain: Callable[[int, int], None],
+    measure: Callable[[int], tuple],
+    *,
+    targets_db: Sequence[float],
+    start_attens_db: Sequence[float],
+    atten_mins_db: Sequence[float],
+    orx_gains: Sequence[int],
+    names: Sequence[str] | None = None,
+    method: str = "slopes",
+    coarse_step_db: float = 2.5,
+    fine_step_db: float = 0.2,
+    comp_tol_db: float = 0.1,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    gain_min: int = ORX_GAIN_MIN,
+    gain_max: int = ORX_GAIN_MAX,
+    db_per_index: float = ORX_DB_PER_INDEX,
+    atten_max_db: float = MAX_TX_ATTEN_DB,
+    max_steps: int = 20,
+    max_relevel: int = 6,
+    min_top_slope: float | None = PA_CLIP_SLOPE,
+    slope_bounds: tuple[float, float] = (0.2, 1.5),
+    on_step: Callable[[list[dict]], None] | None = None,
+) -> MultibandSearch:
+    """Lock every band within ``±comp_tol_db`` of its target together (see the module docstring).
+
+    ``measure(i)`` -> ``(peak_dbfs, railed, compression_db, extra)`` for band ``i``, ``extra``
+    holding ``papr_compression_db`` and ``top_slope``. ``on_step(rows)`` gets each step's rows
+    (one per band).
+    The radio is left at the returned attenuations and gains.
+    """
+    if method not in METHODS:
+        raise ValueError(f"method must be one of {METHODS}, got {method!r}")
+    n = len(targets_db)
+    if not (len(start_attens_db) == len(atten_mins_db) == len(orx_gains) == n):
+        raise ValueError(
+            "targets, start attenuations, limits and ORx gains need one value per band"
+        )
+    names = list(names) if names is not None else [f"band{i + 1}" for i in range(n)]
+    targets = np.asarray(targets_db, dtype=float)
+    band_lo, band_hi = target_dbfs - tol_down_db, target_dbfs + tol_up_db
+    smin, smax = slope_bounds
+    nan = float("nan")
+
+    def clamp_gain(g: float) -> int:
+        return int(min(max(int(round(g)), gain_min), gain_max))
+
+    floor = np.array([_quantize_atten(m) for m in atten_mins_db])
+    for i, s in enumerate(start_attens_db):
+        if floor[i] > s:
+            raise ValueError(f"{names[i]}: limit {floor[i]} dB is above the start {s} dB")
+    a = np.array(
+        [_quantize_atten(min(max(s, f), atten_max_db)) for s, f in zip(start_attens_db, floor)]
+    )
+    g = [clamp_gain(x) for x in orx_gains]
+    clip_floor = [False] * n
+    history: list[dict] = []
+    captures = 0
+    jac: np.ndarray | None = None
+    prev: tuple[np.ndarray, np.ndarray] | None = None
+    prev_err: np.ndarray | None = None
+    first = True
+    best: dict | None = None
+    last: dict | None = None
+
+    def apply() -> None:
+        for i in range(n):
+            set_atten(i, float(a[i]))
+            set_gain(i, int(g[i]))
+
+    def band_locks(readings, err) -> list[BandLock]:
+        out = []
+        for i, r in enumerate(readings):
+            if r["leveled"] and abs(err[i]) <= comp_tol_db:
+                status = "converged"
+            elif clip_floor[i] and err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9:
+                status = "clip-limited"
+            elif err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9:
+                status = "at limit"
+            else:
+                status = "not converged"
+            out.append(
+                BandLock(
+                    names[i],
+                    float(a[i]),
+                    int(g[i]),
+                    r["comp"],
+                    r["papr"],
+                    r["slope"],
+                    r["peak"],
+                    r["railed"],
+                    float(floor[i]),
+                    status,
+                )
+            )
+        return out
+
+    def finish(
+        converged: bool, reason: str, readings, err, *, fatal: bool = False
+    ) -> MultibandSearch:
+        apply()
+        return MultibandSearch(
+            converged,
+            reason,
+            method,
+            band_locks(readings, err),
+            len({h["step"] for h in history}),
+            captures,
+            fatal,
+            history,
+        )
+
+    for step in range(max_steps):
+        apply()
+        readings = []
+        for i in range(n):
+            for _ in range(max_relevel + 1):
+                peak, railed, comp, *rest = measure(i)
+                captures += 1
+                extra = dict(rest[0]) if rest and rest[0] is not None else {}
+                peak, railed, comp = float(peak), int(railed), float(comp)
+                leveled = railed == 0 and band_lo <= peak <= band_hi
+                cold = (not leveled) and railed == 0 and peak < band_lo and g[i] >= gain_max
+                row = {
+                    "step": step,
+                    "band": names[i],
+                    "atten_db": float(a[i]),
+                    "orx_gain": int(g[i]),
+                    "peak_dbfs": peak,
+                    "railed": railed,
+                    "gain_compression_db": comp,
+                    "papr_compression_db": float(extra.get("papr_compression_db", nan)),
+                    "top_slope": float(extra.get("top_slope", nan)),
+                    "leveled": leveled,
+                    "error_db": float(targets[i] - comp),
+                    "move_db": 0.0,
+                    "action": "",
+                    "slopes": "",
+                }
+                if leveled or cold:
+                    break
+                if (railed > 0 or peak > band_hi) and g[i] <= gain_min:
+                    row["action"] = "ORx clips at minimum gain: TX atten up one fine step, stop"
+                    history.append(row)
+                    a[i] = _quantize_atten(min(atten_max_db, a[i] + fine_step_db))
+                    readings.append(
+                        {
+                            "comp": comp,
+                            "papr": row["papr_compression_db"],
+                            "slope": row["top_slope"],
+                            "peak": peak,
+                            "railed": railed,
+                            "leveled": False,
+                        }
+                    )
+                    unread = {
+                        "comp": nan,
+                        "papr": nan,
+                        "slope": nan,
+                        "peak": nan,
+                        "railed": 0,
+                        "leveled": False,
+                    }
+                    readings += [unread] * (n - len(readings))
+                    err = targets - np.array([r["comp"] for r in readings])
+                    return finish(
+                        False,
+                        f"{names[i]}: ORx still clips at minimum gain",
+                        readings,
+                        err,
+                        fatal=True,
+                    )
+                if railed > 0 or peak > band_hi:
+                    k = (
+                        1
+                        if (railed > 0 and not peak > band_hi)
+                        else max(1, round((peak - target_dbfs) / db_per_index))
+                    )
+                    g[i] = clamp_gain(g[i] - k)
+                    row["action"] = f"ORx gain -{k}"
+                else:
+                    k = max(1, round((target_dbfs - peak) / db_per_index))
+                    g[i] = clamp_gain(g[i] + k)
+                    row["action"] = f"ORx gain +{k}"
+                history.append(row)
+                set_gain(i, int(g[i]))
+            readings.append(
+                {
+                    "comp": comp,
+                    "papr": row["papr_compression_db"],
+                    "slope": row["top_slope"],
+                    "peak": peak,
+                    "railed": railed,
+                    "leveled": leveled or cold,
+                    "row": row,
+                }
+            )
+        c = np.array([r["comp"] for r in readings])
+        err = targets - c
+        trusted = all(r["leveled"] for r in readings)
+        clipped = [
+            min_top_slope is not None
+            and r["leveled"]
+            and math.isfinite(r["slope"])
+            and r["slope"] < min_top_slope
+            for r in readings
+        ]
+        worst = float(np.max(np.abs(err)))
+        if trusted and not any(clipped) and (best is None or worst < best["worst"]):
+            best = {
+                "worst": worst,
+                "a": a.copy(),
+                "g": list(g),
+                "readings": readings,
+                "err": err.copy(),
+            }
+        last = {"readings": readings, "err": err}
+
+        within = [r["leveled"] and abs(e) <= comp_tol_db for r, e in zip(readings, err)]
+        stuck = [e > comp_tol_db and a[i] <= floor[i] + 1e-9 for i, e in enumerate(err)]
+        if not any(clipped) and all(w or s for w, s in zip(within, stuck)):
+            rows = [r["row"] for r in readings]
+            for row in rows:
+                row["action"] = "converged" if all(within) else row["action"] or "done"
+            history.extend(rows)
+            if on_step:
+                on_step(rows)
+            if all(within):
+                return finish(True, "every band within tolerance", readings, err)
+            held = ", ".join(names[i] for i, s in enumerate(stuck) if s)
+            return finish(
+                False,
+                f"{held} at the attenuation limit below target; the others within tolerance",
+                readings,
+                err,
+            )
+
+        # -- moves ----------------------------------------------------------------------
+        mv = np.zeros(n)
+        fixed = [False] * n
+        actions = [""] * n
+        for i in range(n):
+            if clipped[i]:
+                over = -err[i]
+                up = _fine_step(over, fine_step_db, coarse_step_db) if over > 0 else fine_step_db
+                new = _quantize_atten(min(atten_max_db, a[i] + up))
+                floor[i] = max(floor[i], new)
+                clip_floor[i] = True
+                mv[i], fixed[i] = new - a[i], True
+                actions[i] = f"clip guard (top slope {readings[i]['slope']:.3f})"
+            elif stuck[i]:
+                fixed[i], actions[i] = True, "at limit"
+        free = [i for i in range(n) if not fixed[i]]
+        grew = (
+            prev_err is not None
+            and not first
+            and any(
+                abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > comp_tol_db for i in free
+            )
+        )
+        use_walk = method == "walk" or grew or not trusted
+        if method == "slopes" and trusted and prev is not None and not first:
+            da, dc = a - prev[0], c - prev[1]
+            if jac is None or grew:
+                own = np.array([(-dc[i] / da[i]) if abs(da[i]) > 1e-9 else 0.5 for i in range(n)])
+                jac = np.diag(-np.clip(own, smin, smax))
+            elif float(da @ da) > 1e-12:
+                jac = jac + np.outer(dc - jac @ da, da) / float(da @ da)
+                for i in range(n):
+                    jac[i, i] = -float(np.clip(-jac[i, i], smin, smax))
+        for i in free:
+            if abs(err[i]) <= comp_tol_db and (first or use_walk):
+                actions[i] = "within tolerance"
+        if first:
+            for i in free:
+                if err[i] > comp_tol_db:
+                    mv[i], actions[i] = -coarse_step_db, "coarse"
+                elif err[i] < -comp_tol_db:
+                    mv[i], actions[i] = _fine_step(err[i], fine_step_db, coarse_step_db), "fine"
+        elif use_walk or jac is None:
+            for i in free:
+                if abs(err[i]) > comp_tol_db:
+                    step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
+                    mv[i] = -step_db if err[i] > 0 else step_db
+                    actions[i] = "walk (fallback)" if method == "slopes" else "walk"
+        else:
+            fx = [i for i in range(n) if fixed[i]]
+            rhs = err[free] - (jac[np.ix_(free, fx)] @ mv[fx] if fx else 0.0)
+            try:
+                mv[free] = np.linalg.solve(jac[np.ix_(free, free)], rhs)
+                for i in free:
+                    actions[i] = "slopes"
+            except np.linalg.LinAlgError:
+                for i in free:
+                    if abs(err[i]) > comp_tol_db:
+                        step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
+                        mv[i] = -step_db if err[i] > 0 else step_db
+                        actions[i] = "walk (singular slopes)"
+        first = False
+        if grew:
+            jac = None  # start again from the own slopes after this step
+        mv = np.clip(mv, -coarse_step_db, coarse_step_db)
+        for i in (
+            free
+        ):  # a band still outside tolerance moves at least one attenuator step toward its target
+            if abs(err[i]) > comp_tol_db and abs(mv[i]) < 0.05 and actions[i] == "slopes":
+                mv[i] = -0.05 if err[i] > 0 else 0.05
+        new_a = np.array(
+            [_quantize_atten(min(max(a[i] + mv[i], floor[i]), atten_max_db)) for i in range(n)]
+        )
+        moved = new_a - a
+        rows = []
+        for i, r in enumerate(readings):
+            row = r["row"]
+            row["move_db"] = float(moved[i])
+            row["action"] = actions[i]
+            row["slopes"] = "" if jac is None else json.dumps(np.round(jac, 4).tolist())
+            rows.append(row)
+        history.extend(rows)
+        if on_step:
+            on_step(rows)
+        if np.all(np.abs(moved) < 1e-9):
+            return finish(False, "no band can move further (limits)", readings, err)
+        prev = (a.copy(), c.copy()) if trusted else None
+        prev_err = err.copy()
+        # The ORx gain follows the output peak, which moves by the drive change minus the
+        # compression change:
+        # predicted from the slopes when known, else from a typical own slope of 0.5 dB per dB.
+        dc = jac @ moved if jac is not None else -0.5 * moved
+        for i in range(n):
+            g[i] = clamp_gain(g[i] + round((moved[i] + dc[i]) / db_per_index))
+        a = new_a
+
+    if best is not None:
+        a, g = best["a"], best["g"]
+        return finish(
+            False,
+            "max steps; left at the step closest to the targets",
+            best["readings"],
+            best["err"],
+        )
+    return finish(False, "max steps", last["readings"], last["err"])
+
+
+# -- hardware ---------------------------------------------------------------------------------
+
+
+def play_bands(radio, bands: Sequence[BandSpec], *, tx_bits: int) -> list[np.ndarray]:
+    """Play every band's signal on its TX in one ``PerformTx`` (they start together).
+
+    Returns each band's reference in TX codes (what ``prepare_tx`` plays). The signals must have
+    equal length.
+    """
+    refs = []
+    for b in bands:
+        i_tx, q_tx = prepare_tx(np.asarray(b.signal, dtype=np.complex128), tx_bits)
+        refs.append(i_tx.astype(np.float64) + 1j * q_tx.astype(np.float64))
+    if len({len(r) for r in refs}) != 1:
+        raise ValueError(
+            f"every band's signal must have the same length, got {[len(r) for r in refs]}"
+        )
+    transmit_bands(radio, {b.tx: r for b, r in zip(bands, refs)}, tx_bits, do_normalize=False)
+    return refs
+
+
+def measure_band(
+    radio,
+    orx: RxChannel,
+    ref,
+    *,
+    rx_bits: int,
+    fs: float,
+    oversample: int = 2,
+    window_s: float = 1e-4,
+):
+    """One capture of ``orx`` (``oversample`` periods).
+
+    Returns ``(peak_dbfs, railed, gain_compression_db, extra)``.
+
+    ``extra`` holds ``papr_compression_db``, ``top_slope``, the raw capture (``raw``, complex
+    codes) and the
+    aligned period (``y_aligned``) with its ``delay_samples``.
+    """
+    ref = np.asarray(ref)
+    ms = oversample * len(ref) / float(fs) * 1e3
+    out = capture(radio, int(orx), ms, bits=rx_bits).channels[orx]
+    rep = clip_report(out.i, out.q, rx_bits)
+    x_al, y_al, delay = estimate_and_align(ref, out.iq, fs)
+    papr, _pin, _pout = window_compression_db(x_al, y_al, fs, window_s)
+    gain_comp, slope = gain_compression_db(x_al, y_al)
+    extra = {
+        "papr_compression_db": papr,
+        "top_slope": slope,
+        "raw": out.iq,
+        "y_aligned": y_al,
+        "delay_samples": float(delay),
+    }
+    return rep.peak_dbfs, rep.railed_samples, gain_comp, extra
+
+
+def _agc(radio, orx, ref, *, rx_bits, fs, oversample, target_dbfs, tol_up_db, tol_down_db) -> int:
+    agc = autolevel_capture(
+        radio,
+        orx,
+        bits=rx_bits,
+        orx_rate_hz=fs,
+        target_dbfs=target_dbfs,
+        tol_up_db=tol_up_db,
+        tol_down_db=tol_down_db,
+        verify_capture_ms=oversample * len(ref) / float(fs) * 1e3,
+    )
+    return int(agc.final_gain_index)
+
+
+def lock_bands(
+    radio,
+    bands: Sequence[BandSpec],
+    *,
+    tx_bits: int,
+    rx_bits: int,
+    fs: float,
+    retune: bool = True,
+    method: str = "slopes",
+    oversample: int = 2,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    on_step=None,
+    **search_kw: Any,
+) -> tuple[MultibandSearch, list[np.ndarray]]:
+    """Retune, play every band, ORx AGC per band at the start attenuations, then the search.
+
+    Returns the search and each band's reference (TX codes). TX keeps playing (the caller
+    captures next).
+    """
+    radio.disable_tx()
+    for b in bands:
+        radio.set_tx_atten(b.tx, _quantize_atten(b.atten_start_db))
+    if retune:
+        for lo in dict.fromkeys(b.lo for b in bands):
+            radio.retune_lo(lo, int(next(b.freq_hz for b in bands if b.lo == lo)))
+    refs = play_bands(radio, bands, tx_bits=tx_bits)
+    gains = [
+        _agc(
+            radio,
+            b.orx,
+            r,
+            rx_bits=rx_bits,
+            fs=fs,
+            oversample=oversample,
+            target_dbfs=target_dbfs,
+            tol_up_db=tol_up_db,
+            tol_down_db=tol_down_db,
+        )
+        for b, r in zip(bands, refs)
+    ]
+    search = search_multiband_compression(
+        lambda i, db: radio.set_tx_atten(bands[i].tx, db),
+        lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
+        lambda i: measure_band(
+            radio, bands[i].orx, refs[i], rx_bits=rx_bits, fs=fs, oversample=oversample
+        ),
+        targets_db=[b.target_db for b in bands],
+        start_attens_db=[b.atten_start_db for b in bands],
+        atten_mins_db=[b.atten_min_db for b in bands],
+        orx_gains=gains,
+        names=[b.name for b in bands],
+        method=method,
+        target_dbfs=target_dbfs,
+        tol_up_db=tol_up_db,
+        tol_down_db=tol_down_db,
+        on_step=on_step,
+        **search_kw,
+    )
+    return search, refs
+
+
+@dataclass
+class BandCapture:
+    """One band at one state: the raw capture (complex codes), the aligned period, metrics."""
+
+    name: str
+    atten_db: float
+    orx_gain: int
+    raw: np.ndarray
+    y_aligned: np.ndarray
+    peak_dbfs: float
+    railed: int
+    metrics: dict[str, float]
+    tries: int = 1
+    check: dict = field(default_factory=dict)
+
+
+def capture_case(
+    radio,
+    bands: Sequence[BandSpec],
+    refs: Sequence[np.ndarray],
+    attens_db: Sequence[float],
+    *,
+    rx_bits: int,
+    fs: float,
+    oversample: int = 2,
+    agc: bool = True,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    check: Callable[[list[BandCapture]], dict[str, dict]] | None = None,
+    retakes: int = 3,
+    min_top_slope: float = PA_CLIP_SLOPE,
+) -> list[BandCapture]:
+    """Every band at ``attens_db`` (TX playing): ORx AGC, one capture per band, then ``check``.
+
+    ``check(captures)`` -> ``{band name: {"ok": bool, ...}}`` sees every band of the state at once
+    (pairing needs both). A failing band is captured again (re-leveled first when it railed), up to
+    ``retakes`` times;
+    its last check result stays in :attr:`BandCapture.check`.
+    """
+    for b, db in zip(bands, attens_db):
+        radio.set_tx_atten(b.tx, _quantize_atten(db))
+    gains = {}
+    out: list[BandCapture | None] = [None] * len(bands)
+
+    def take(i: int, tries: int, relevel: bool) -> BandCapture:
+        b, ref = bands[i], refs[i]
+        if relevel or b.name not in gains:
+            if agc:
+                gains[b.name] = _agc(
+                    radio,
+                    b.orx,
+                    ref,
+                    rx_bits=rx_bits,
+                    fs=fs,
+                    oversample=oversample,
+                    target_dbfs=target_dbfs,
+                    tol_up_db=tol_up_db,
+                    tol_down_db=tol_down_db,
+                )
+            else:
+                gains[b.name] = int(radio.get_rx_gain(b.orx))
+        peak, railed, _comp, extra = measure_band(
+            radio, b.orx, ref, rx_bits=rx_bits, fs=fs, oversample=oversample
+        )
+        metrics = period_metrics(
+            ref,
+            extra["y_aligned"],
+            fs=fs,
+            bw_hz=float(b.bw_mhz) * 1e6,
+            rx_bits=rx_bits,
+            delay_samples=extra["delay_samples"],
+            min_top_slope=min_top_slope,
+        )
+        return BandCapture(
+            b.name,
+            float(_quantize_atten(attens_db[i])),
+            int(gains[b.name]),
+            extra["raw"],
+            extra["y_aligned"],
+            float(peak),
+            int(railed),
+            metrics,
+            tries,
+        )
+
+    for i in range(len(bands)):
+        out[i] = take(i, 1, relevel=True)
+    if check is None:
+        return out  # type: ignore[return-value]
+    for attempt in range(retakes + 1):
+        results = check(out) or {}
+        failing = []
+        for i, c in enumerate(out):
+            res = dict(results.get(c.name, {"ok": True}))
+            c.check = res
+            if not res.get("ok", True):
+                failing.append(i)
+        if not failing or attempt == retakes:
+            break
+        for i in failing:
+            out[i] = take(i, out[i].tries + 1, relevel=out[i].railed > 0)
+    return out  # type: ignore[return-value]
+
+
+@dataclass
+class CaseResult:
+    """A case: the lock, and per backoff the captures of every band."""
+
+    search: MultibandSearch
+    refs: list[np.ndarray]
+    captures: dict[int, list[BandCapture]]
+    case_dir: Path | None = None
+
+
+def find_multiband_operating_point(
+    radio,
+    bands: Sequence[BandSpec],
+    *,
+    tx_bits: int,
+    rx_bits: int,
+    fs: float,
+    backoffs: Sequence[int] = (0, 1, 2, 3, 4),
+    method: str = "slopes",
+    check: Callable[[list[BandCapture]], dict[str, dict]] | None = None,
+    retakes: int = 3,
+    writer: CaseWriter | None = None,
+    retune: bool = True,
+    oversample: int = 2,
+    on_step=None,
+    **search_kw: Any,
+) -> CaseResult:
+    """Lock every band together, then capture every backoff (every band ``+k`` dB together).
+
+    With ``writer`` (a :class:`CaseWriter`), the inputs, every aligned output, ``conditions.csv``
+    and
+    ``lock.csv`` are written. TX is disabled when the call ends or fails.
+    """
+    try:
+        search, refs = lock_bands(
+            radio,
+            bands,
+            tx_bits=tx_bits,
+            rx_bits=rx_bits,
+            fs=fs,
+            retune=retune,
+            method=method,
+            oversample=oversample,
+            on_step=on_step,
+            **search_kw,
+        )
+        locked = [bl.atten_db for bl in search.bands]
+        captures: dict[int, list[BandCapture]] = {}
+        for k in backoffs:
+            attens = [min(a + int(k), MAX_TX_ATTEN_DB) for a in locked]
+            captures[int(k)] = capture_case(
+                radio,
+                bands,
+                refs,
+                attens,
+                rx_bits=rx_bits,
+                fs=fs,
+                oversample=oversample,
+                check=check,
+                retakes=retakes,
+            )
+    finally:
+        try:
+            radio.disable_tx()
+        except Exception:  # noqa: BLE001 - leave the bench safe on any path
+            pass
+    result = CaseResult(search, refs, captures)
+    if writer is not None:
+        writer.write_inputs(refs)
+        for k, caps in captures.items():
+            for c in caps:
+                writer.write_output(k, c.name, c.y_aligned)
+        writer.write_conditions(search, captures)
+        writer.write_lock(search)
+        result.case_dir = writer.dir
+    return result
+
+
+# -- saving -----------------------------------------------------------------------------------
+
+
+def _token(value: float) -> str:
+    """``1440.0`` -> ``1440``; ``758.5`` -> ``758p5`` (file-name safe)."""
+    v = float(value)
+    return f"{v:g}".replace(".", "p") if not v.is_integer() else str(int(v))
+
+
+def case_name(bands: Sequence[BandSpec]) -> str:
+    """``TX1-TX4_1440-1860MHz_80-80BW_4-4GC``: paths, carriers, bandwidths, compression targets."""
+    return (
+        "-".join(b.name for b in bands)
+        + "_"
+        + "-".join(_token(b.freq_hz / 1e6) for b in bands)
+        + "MHz"
+        + "_"
+        + "-".join(_token(b.bw_mhz) for b in bands)
+        + "BW"
+        + "_"
+        + "-".join(_token(b.target_db) for b in bands)
+        + "GC"
+    )
+
+
+class CaseWriter:
+    """One case folder ``<run_dir>/<case_name>/``, write-once (an existing file is an error).
+
+    ``meta`` (plan row, filters, pads, profile, programming id, ...) goes into ``case.json`` and,
+    flattened,
+    into every ``conditions.csv`` row it names in ``row_meta``.
+    """
+
+    def __init__(
+        self,
+        run_dir: str | Path,
+        bands: Sequence[BandSpec],
+        *,
+        tx_bits: int,
+        rx_bits: int,
+        fs: float,
+        meta: dict | None = None,
+        row_meta: Sequence[str] = ("case", "version", "profile", "program_id"),
+    ):
+        self.bands = list(bands)
+        self.name = case_name(bands)
+        self.dir = Path(run_dir) / self.name
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.tx_bits, self.rx_bits, self.fs = tx_bits, rx_bits, fs
+        self.meta = dict(meta or {})
+        self.row_meta = list(row_meta)
+
+    def path(self, suffix: str) -> Path:
+        return self.dir / f"{self.name}_{suffix}"
+
+    def _new(self, path: Path) -> Path:
+        if path.exists():
+            raise FileExistsError(
+                f"{path} exists: files are written once (move the case folder aside to redo)"
+            )
+        return path
+
+    def write_inputs(self, refs: Sequence[np.ndarray]) -> list[Path]:
+        out = []
+        for b, ref in zip(self.bands, refs):
+            p = self._new(self.path(f"{b.name}_in.txt"))
+            save_aligned_iq(ref, p, self.tx_bits)
+            out.append(p)
+        return out
+
+    def write_output(self, backoff_db: int, band: str, y_aligned: np.ndarray) -> Path:
+        p = self._new(self.path(f"{int(backoff_db)}dB_{band}_out.txt"))
+        save_aligned_iq(y_aligned, p, self.rx_bits)
+        return p
+
+    def condition_rows(
+        self, search: MultibandSearch, captures: dict[int, list[BandCapture]]
+    ) -> list[dict]:
+        locks = {bl.name: bl for bl in search.bands}
+        freqs = "/".join(_token(b.freq_hz / 1e6) for b in self.bands)
+        rows = []
+        for k, caps in captures.items():
+            for b, c in zip(self.bands, caps):
+                bl = locks[b.name]
+                rows.append(
+                    {
+                        **{key: self.meta.get(key, "") for key in self.row_meta},
+                        "band": b.name,
+                        "tx": b.name,
+                        "orx": b.orx.name if hasattr(b.orx, "name") else str(b.orx),
+                        "lo": b.lo,
+                        "freq_hz": int(b.freq_hz),
+                        "bw_mhz": b.bw_mhz,
+                        "signal": b.signal_name,
+                        "freqs_mhz": freqs,
+                        "target_db": b.target_db,
+                        "backoff_db": int(k),
+                        "locked_atten_db": bl.atten_db,
+                        "tx_atten_db": c.atten_db,
+                        "orx_gain": c.orx_gain,
+                        "lock_status": bl.status,
+                        "lock_converged": search.converged,
+                        "lock_reason": search.reason,
+                        "search_method": search.method,
+                        "search_steps": search.steps,
+                        "search_captures": search.captures,
+                        "peak_dbfs": c.peak_dbfs,
+                        "railed": c.railed,
+                        **c.metrics,
+                        "fs_hz": self.fs,
+                        "tries": c.tries,
+                        "check_ok": bool(c.check.get("ok", True)) if c.check else "",
+                        "check": json.dumps(c.check, default=str) if c.check else "",
+                        "out_file": self.path(f"{int(k)}dB_{b.name}_out.txt").name,
+                        "in_file": self.path(f"{b.name}_in.txt").name,
+                    }
+                )
+        return rows
+
+    def _write_csv(self, name: str, rows: list[dict]) -> Path:
+        p = self._new(self.dir / name)
+        cols: list[str] = []
+        for r in rows:
+            cols += [k for k in r if k not in cols]
+        with open(p, "x", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows)
+        return p
+
+    def write_conditions(
+        self, search: MultibandSearch, captures: dict[int, list[BandCapture]]
+    ) -> Path:
+        return self._write_csv("conditions.csv", self.condition_rows(search, captures))
+
+    def write_lock(self, search: MultibandSearch) -> Path:
+        return self._write_csv("lock.csv", [dict(h) for h in search.history])
+
+    def write_case_json(self, extra: dict | None = None) -> Path:
+        p = self._new(self.dir / "case.json")
+        doc = {
+            "case_name": self.name,
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "bands": [
+                {
+                    "name": b.name,
+                    "tx": b.name,
+                    "orx": getattr(b.orx, "name", str(b.orx)),
+                    "lo": b.lo,
+                    "freq_hz": int(b.freq_hz),
+                    "bw_mhz": b.bw_mhz,
+                    "signal": b.signal_name,
+                    "target_db": b.target_db,
+                    "atten_start_db": b.atten_start_db,
+                    "atten_min_db": b.atten_min_db,
+                }
+                for b in self.bands
+            ],
+            "fs_hz": self.fs,
+            **self.meta,
+            **(extra or {}),
+        }
+        p.write_text(json.dumps(doc, indent=1, default=str) + "\n", encoding="utf-8")
+        return p
+
+    def write_text(self, name: str, text: str) -> Path:
+        """Any other file of the case (e.g. ``report_0dB.md``), write-once."""
+        p = self._new(self.dir / name)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+
+def lock_summary(search: MultibandSearch) -> list[dict]:
+    """The lock per band as plain dicts (for ``case.json``)."""
+    return [
+        {
+            "band": bl.name,
+            "atten_db": bl.atten_db,
+            "orx_gain": bl.orx_gain,
+            "gain_compression_db": bl.compression_db,
+            "top_slope": bl.top_slope,
+            "status": bl.status,
+        }
+        for bl in search.bands
+    ]

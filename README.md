@@ -144,6 +144,24 @@ from the captured signals to the next waveform) and
 [docs/linearize_notebook.md](docs/linearize_notebook.md) (the whole notebook).
 `adrvtrx` imports no external model library; the GMP is the reference DPD.
 
+Several bands at once (dual band: TX1 and TX4 into one PA). Every band is locked to its own
+compression target together, then backed off together; `method="slopes"` learns how each band's
+attenuation moves every band's compression, `method="walk"` steps each band by the single-band rule:
+
+```python
+from adrvtrx.multiband import BandSpec, CaseWriter, find_multiband_operating_point
+
+bands = [
+    BandSpec(TxChannel.TX1, RxChannel.ORX1, "LO1", 1_440_000_000, 80, sig1, target_db=4.0,
+             atten_start_db=20, atten_min_db=10),
+    BandSpec(TxChannel.TX4, RxChannel.ORX4, "LO2", 1_860_000_000, 80, sig2, target_db=4.0,
+             atten_start_db=20, atten_min_db=10),
+]
+writer = CaseWriter("captures", bands, tx_bits=12, rx_bits=12, fs=368.64e6)  # write-once case folder
+res = find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=368.64e6,
+                                     backoffs=(0, 1, 2, 3, 4), check=my_checks, writer=writer)
+```
+
 ## Hardware server (one process owns the board)
 
 Scripts and notebooks should not each load the DLL and connect: they race for
