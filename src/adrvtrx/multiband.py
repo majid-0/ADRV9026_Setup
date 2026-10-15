@@ -626,7 +626,10 @@ def lock_bands(
 
 @dataclass
 class BandCapture:
-    """One band at one state: the raw capture (complex codes), the aligned period, metrics."""
+    """One band at one state: the raw capture (complex codes), the aligned period, metrics.
+
+    ``ref`` is the band's transmitted reference (TX codes), so a check needs nothing else.
+    """
 
     name: str
     atten_db: float
@@ -638,6 +641,7 @@ class BandCapture:
     metrics: dict[str, float]
     tries: int = 1
     check: dict = field(default_factory=dict)
+    ref: np.ndarray | None = None
 
 
 def capture_case(
@@ -708,6 +712,7 @@ def capture_case(
             int(railed),
             metrics,
             tries,
+            ref=ref,
         )
 
     for i in range(len(bands)):

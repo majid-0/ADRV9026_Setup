@@ -248,6 +248,7 @@ def test_a_whole_case_on_the_shared_pa(tmp_path):
         for c in caps:
             assert c.atten_db == pytest.approx(locked[c.name] + k)
             assert c.tries == (2 if c.name == "TX4" else 1) and c.check["ok"]
+            assert c.ref is res.refs[[b.name for b in bands].index(c.name)]
     gc = {
         k: {c.name: c.metrics["gain_compression_db"] for c in caps}
         for k, caps in res.captures.items()
