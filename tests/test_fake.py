@@ -40,6 +40,42 @@ def test_program_and_status_run_the_real_radio_code():
     assert radio.rx_tx_enable_get()[1] == 0
 
 
+def test_retune_waits_for_every_pll_and_raises_if_one_stays_unlocked(monkeypatch):
+    radio = _radio()
+    radio.connect()
+    radio.program()
+    assert radio.retune_lo("LO2", 1_860_000_000) == 0xF
+    assert radio.get_lo("LO2") == 1_860_000_000
+
+    reads = iter([0x0, 0x9, 0xF])  # unlocked, partly locked (the old check passed here), locked
+    monkeypatch.setattr(radio, "pll_lock_status", lambda: next(reads))
+    assert radio.retune_lo("LO1", 1_440_000_000, poll_interval_s=0) == 0xF
+
+    monkeypatch.setattr(radio, "pll_lock_status", lambda: 0xB)  # one PLL never locks
+    with pytest.raises(RuntimeError, match="not all locked"):
+        radio.retune_lo("LO1", 1_440_000_000, settle_poll=5, poll_interval_s=0)
+
+
+def test_run_bands_captures_with_the_immediate_trigger_by_default(tmp_path):
+    from adrvtrx._enums import RxTrigSource
+    from adrvtrx.bands import make_bands, run_bands
+
+    radio = _radio()
+    radio.connect()
+    radio.program()
+    radio.set_tx_atten(TxChannel.TX1, 15.0)
+    x = 0.5 * np.exp(2j * np.pi * 0.01 * np.arange(4096))
+    run = run_bands(
+        radio,
+        make_bands([("b1", TxChannel.TX1, x, RxChannel.ORX1, 0.05)]),
+        tx_bits=12,
+        rx_bits=12,
+        out_dir=tmp_path,
+    )
+    assert run.captures.trig == RxTrigSource.IMMEDIATE
+    assert [p.name for p in run.files] == ["b1.txt"]
+
+
 def test_tx_atten_is_rejected_before_programming():
     radio = _radio()
     radio.connect()

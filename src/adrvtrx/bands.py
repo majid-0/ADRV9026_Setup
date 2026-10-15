@@ -36,7 +36,8 @@ class BandRun:
 
 
 def _sof_trigger(bands: Sequence[Band]) -> RxTrigSource:
-    """Align the snapshot to the start-of-frame of the lowest-numbered TX in use."""
+    """The start-of-frame trigger of the lowest-numbered TX in use (opt-in: on this bench the
+    TXn_SOF trigger times out, so :func:`run_bands` defaults to IMMEDIATE)."""
     from ._enums import TX_SINGLE, TX_SOF_FOR
 
     for tx in TX_SINGLE:
@@ -59,7 +60,12 @@ def run_bands(
     orx_tol_down_db: float = 0.6,
     orx_coarse_ms: float = 0.1,
 ) -> BandRun:
-    """Transmit all bands, (optionally) auto-level ORx, capture one snapshot, save per band."""
+    """Transmit all bands, (optionally) auto-level ORx, capture each band, save per band.
+
+    ``trig`` defaults to IMMEDIATE (TX runs continuously, so the signal is always
+    there; the TXn_SOF trigger times out on this bench). Pass ``_sof_trigger(bands)``
+    to try the start-of-frame trigger.
+    """
     # 1. Multi-band transmit (all TX channels start together).
     channel_to_iq = {b.tx_channel: b.waveform for b in bands}
     transmit_bands(radio, channel_to_iq, tx_bits, continuous=True)
@@ -90,7 +96,7 @@ def run_bands(
     #    capture is required for correct multiband data. The trade-off is that the
     #    bands are no longer mutually sample-aligned -- fine for per-band level/delay/
     #    save, which is what this returns.
-    trig = trig if trig is not None else _sof_trigger(bands)
+    trig = trig if trig is not None else RxTrigSource.IMMEDIATE
     longest = max(b.capture_time_ms for b in bands)
     result = CaptureResult(capture_time_ms=longest, trig=trig)
     for b in bands:

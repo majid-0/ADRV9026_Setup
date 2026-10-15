@@ -15,6 +15,7 @@ from __future__ import annotations
 import atexit
 import os
 import signal
+import time
 from types import FrameType
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
     from ._clr import ClrBridge
 
 MAX_TX_ATTEN_DB = 41.95  # ADRV902x TxAtten table max (~42 dB)
+
+#: ``PllStatusGet`` with every PLL locked (as read after programming). The per-PLL bits are not
+#: documented in this repo, so a retune waits for all of them rather than one bit.
+ALL_PLLS_LOCKED = 0xF
 
 #: When set (the test suite sets it), :class:`Radio` refuses to load the real DLL.
 FORBID_HARDWARE_ENV = "ADRVTRX_FORBID_HARDWARE"
@@ -421,19 +426,29 @@ class Radio:
         print(f"  >> TX OFF      : {st['tx_off']}")
         return st
 
-    def retune_lo(self, pll: str, freq_hz: int, *, settle_poll: int = 50) -> int:
-        """Set an LO and poll lock status until stable. Returns the lock bitmask.
+    def retune_lo(
+        self, pll: str, freq_hz: int, *, settle_poll: int = 50, poll_interval_s: float = 0.005
+    ) -> int:
+        """Set an LO and poll until every PLL reports locked. Returns the lock bitmask.
+
+        Raises ``RuntimeError`` if they are not all locked (``ALL_PLLS_LOCKED``) after
+        ``settle_poll`` polls; a partly locked status no longer counts as settled.
 
         Deterministic in the settled-state sense (concern #2): commanded value
         applied + relock confirmed; not a phase-continuous hop.
         """
         self.set_lo(pll, freq_hz)
         status = 0
-        for _ in range(settle_poll):
+        for i in range(settle_poll):
             status = self.pll_lock_status()
-            if status:
-                break
-        return status
+            if status & ALL_PLLS_LOCKED == ALL_PLLS_LOCKED:
+                return status
+            if poll_interval_s and i + 1 < settle_poll:
+                time.sleep(poll_interval_s)
+        raise RuntimeError(
+            f"{pll} at {int(freq_hz)} Hz: PLLs not all locked after {settle_poll} polls "
+            f"(status 0x{status:X}, expected 0x{ALL_PLLS_LOCKED:X})"
+        )
 
     # -- capture / transmit (PerformRx / PerformTx) ----------------------------
 

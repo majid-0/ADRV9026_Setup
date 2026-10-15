@@ -57,7 +57,7 @@ def test_identical_reload_only_reenables_tx(cfg):
             radio.set_rx_gain(ORX1, 212)
             transmit_bands(radio, {TX1: x}, 12)
             radio.disable_tx()
-            radio.retune_lo("LO2", 2_400_000_000)  # TX1 uses LO2 in the default clocks
+            radio.retune_lo("LO1", 2_400_000_000)  # TX1 uses LO1 in the default clocks
             radio.set_tx_atten(TX1, 18.0)
             transmit_bands(radio, {TX1: x}, 12)
             assert loads(srv) == 1

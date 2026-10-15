@@ -14,9 +14,9 @@ parameterized from config.
   quantizes to the profile's `jesd204Np` bit depth.
 - **Transmits** one waveform per TX path (single → dual → "quad" = 4 paths / 2 LOs)
   with looping `PerformTx`; all paths start together.
-- **Captures** one sample-aligned snapshot (`PerformRx`) over any Rx **or** ORx
-  channels, aligned to TX start-of-frame (`TXn_SOF` trigger). Saves normalized
-  float `I⟶Q`.
+- **Captures** snapshots (`PerformRx`) of any Rx **or** ORx channel, on the
+  IMMEDIATE trigger (the `TXn_SOF` start-of-frame trigger times out on this bench;
+  alignment is done in software), one ORx per snapshot. Saves normalized float `I⟶Q`.
 - **Levels ORx** in software — an **ORx AGC** (`autolevel_capture`) on the captured-IQ
   peak with a railed-sample clip veto, targeting an asymmetric dBFS band. ORx has no
   hardware AGC and its overload flags / gain readback are unusable, so the gain index
