@@ -600,6 +600,9 @@ class FakeBoard:
         n = int(round(float(capture_time_ms) * 1e-3 * self.rate_hz))
         order = returned_channel_order(self.config.channels.rx_init_mask)
         data = [self._noise(n) for _ in order]
+        self._snapshot_start = (
+            None  # one snapshot: every channel starts at the same point of the loop
+        )
         for orx in (RxChannel.ORX1, RxChannel.ORX2, RxChannel.ORX3, RxChannel.ORX4):
             if not self.state["rx_mask"] & int(orx):
                 continue
@@ -662,7 +665,9 @@ class FakeBoard:
             return np.zeros(n, dtype=np.complex128)
         scale = self.pa.orx_level * _full_scale(self.rx_bits)
         scale *= 10 ** ((self.state["rx_gain"][orx.name] - 210) * 0.5 / 20.0)
-        start = int(self.rng.integers(len(pa)))
+        if getattr(self, "_snapshot_start", None) is None:  # PerformTx loads equal-length buffers
+            self._snapshot_start = int(self.rng.integers(len(pa)))
+        start = self._snapshot_start
         idx = (start + np.arange(n)) % len(pa)
         y = pa[idx]
         if self.pa.other_in_window:

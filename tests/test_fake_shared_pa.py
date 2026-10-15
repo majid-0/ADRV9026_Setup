@@ -150,6 +150,25 @@ def test_skew_delays_one_tx_before_the_pa():
     )
 
 
+def test_one_snapshot_starts_every_channel_together_so_skew_shows():
+    from adrvtrx.align import estimate_and_align
+
+    for skew in (0, 3):
+        radio = _radio({**SHARED, "coupling": 0.0, "tx_skew_samples": {"TX4": skew}})
+        _play(radio, 25.0, 25.0)
+        radio.set_rx_gain(ORX1, 215)
+        radio.set_rx_gain(ORX4, 215)
+        joint = capture(
+            radio, int(ORX1) | int(ORX4), 2 * N / 10e3, bits=12
+        )  # two periods at 10 Msps
+        board = radio.board_model
+        delays = [
+            estimate_and_align(board.waves[tx], joint.channels[orx].iq, 10e6)[2]
+            for tx, orx in (("TX1", ORX1), ("TX4", ORX4))
+        ]
+        assert delays[1] - delays[0] == pytest.approx(skew, abs=0.05)
+
+
 def test_tx_iq_image():
     x = _signal(1)
     radio = _radio({"noise_codes": 0.0, "tx_image_db": -20.0})
