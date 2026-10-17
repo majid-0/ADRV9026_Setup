@@ -57,7 +57,7 @@ import numpy as np
 from ._enums import RxChannel, TxChannel
 from .align import align_with_fraction, estimate_and_align
 from .capture import autolevel_capture, capture
-from .compression import _quantize_atten
+from .compression import _quantize_atten, fine_step, relevel_index
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
@@ -149,11 +149,6 @@ class MultibandSearch:
     captures: int
     fatal: bool = False
     history: list[dict] = field(default_factory=list)
-
-
-def _fine_step(error_db: float, fine: float, coarse: float) -> float:
-    steps = max(1, math.floor((abs(error_db) + 1e-6) / fine))
-    return min(coarse, steps * fine)
 
 
 def own_slopes(
@@ -274,16 +269,6 @@ class _Classes:
     worst: float  # largest |err|
 
 
-def _relevel_index(peak: float, railed: int, rules: _Rules) -> int:
-    """ORx gain index change toward the AGC band: one index down on a railed capture whose peak
-    reads in band (the peak compresses near full scale), else the peak's distance in indices."""
-    if railed > 0 or peak > rules.band_hi:
-        if railed > 0 and not peak > rules.band_hi:
-            return -1
-        return -max(1, round((peak - rules.target_dbfs) / rules.db_per_index))
-    return max(1, round((rules.target_dbfs - peak) / rules.db_per_index))
-
-
 def _read_band(i: int, step: int, rules: _Rules, state: _State, measure, set_gain) -> _Reading:
     """Band ``i``'s reading: captured again (ORx gain moved, attenuation not) until it counts.
 
@@ -328,7 +313,13 @@ def _read_band(i: int, step: int, rules: _Rules, state: _State, measure, set_gai
         if in_band or at_max:  # level fine, compression not finite: measure again
             row["action"] = "measure again (compression not finite)"
         else:
-            k = _relevel_index(peak, railed, rules)
+            k = relevel_index(
+                peak,
+                railed,
+                target_dbfs=rules.target_dbfs,
+                band_hi=rules.band_hi,
+                db_per_index=rules.db_per_index,
+            )  # the single-band search's re-level rule
             state.g[i] = rules.clamp_gain(state.g[i] + k)
             row["action"] = f"ORx gain {k:+d}"
         if attempt == rules.max_relevel:  # this reading drives nothing: the band holds
@@ -410,7 +401,7 @@ def _fixed_moves(readings: list[_Reading], cls: _Classes, rules: _Rules, state: 
     for i in range(n):
         if cls.clipped[i]:
             over = -cls.err[i]
-            up = _fine_step(over, fine, coarse) if over > 0 else fine
+            up = fine_step(over, fine, coarse) if over > 0 else fine
             new = _quantize_atten(min(rules.atten_max_db, state.a[i] + up))
             state.floor[i] = max(state.floor[i], new)
             state.clip_floor[i] = True
@@ -424,7 +415,7 @@ def _fixed_moves(readings: list[_Reading], cls: _Classes, rules: _Rules, state: 
             if cls.err[i] > tol:
                 mv[i], actions[i] = -coarse, "coarse"
             elif cls.err[i] < -tol:
-                mv[i], actions[i] = _fine_step(cls.err[i], fine, coarse), "fine"
+                mv[i], actions[i] = fine_step(cls.err[i], fine, coarse), "fine"
             else:
                 actions[i] = "within tolerance"
             fixed[i] = True
@@ -453,7 +444,7 @@ def _learn_slopes(cls: _Classes, rules: _Rules, state: _State, grew: bool) -> No
 
 
 def _walk_move(err: float, rules: _Rules) -> float:
-    step_db = _fine_step(err, rules.fine_step_db, rules.coarse_step_db)
+    step_db = fine_step(err, rules.fine_step_db, rules.coarse_step_db)  # the single-band rule
     return -step_db if err > 0 else step_db
 
 

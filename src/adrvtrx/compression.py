@@ -45,6 +45,8 @@ __all__ = [
     "CompressionResult",
     "search_tx_compression",
     "find_compression_point",
+    "fine_step",
+    "relevel_index",
 ]
 
 
@@ -77,6 +79,32 @@ class CompressionResult:
 def _quantize_atten(db: float) -> float:
     """TX attenuator step is 0.05 dB."""
     return round(float(db) * 20.0) / 20.0
+
+
+def fine_step(error_db: float, fine_db: float, coarse_db: float) -> float:
+    """TX attenuation step for a compression error of ``error_db``: the largest multiple of
+    ``fine_db`` not larger than the error (at least one), capped at ``coarse_db``.
+
+    The fine-step rule of the single-band search and of the multi-band walk.
+    """
+    steps = max(1, math.floor((abs(error_db) + 1e-6) / fine_db))
+    return min(coarse_db, steps * fine_db)
+
+
+def relevel_index(
+    peak_dbfs: float, railed: int, *, target_dbfs: float, band_hi: float, db_per_index: float
+) -> int:
+    """ORx gain index change for a capture that is not leveled (railed, hot or cold).
+
+    One index down when it railed with its peak still in band (the peak dBFS compresses near
+    full scale, the railed count does not); otherwise the peak's distance from ``target_dbfs`` in
+    indices, at least one. The re-level rule of the single-band and the multi-band searches.
+    """
+    if railed > 0 or peak_dbfs > band_hi:
+        if railed > 0 and not peak_dbfs > band_hi:
+            return -1
+        return -max(1, int(round((peak_dbfs - target_dbfs) / db_per_index)))
+    return max(1, int(round((target_dbfs - peak_dbfs) / db_per_index)))
 
 
 def search_tx_compression(
@@ -136,9 +164,8 @@ def search_tx_compression(
     def in_band(peak: float, railed: int) -> bool:
         return railed == 0 and band_lo <= peak <= band_hi
 
-    def fine_step(error_db: float) -> float:
-        steps = max(1, math.floor((abs(error_db) + 1e-6) / fine_step_db))
-        return min(coarse_step_db, steps * fine_step_db)
+    def step_for(error_db: float) -> float:
+        return fine_step(error_db, fine_step_db, coarse_step_db)
 
     atten = _quantize_atten(max(atten_min_db, min(start_atten_db, atten_max_db)))
     gain = clamp_gain(orx_gain)
@@ -215,7 +242,7 @@ def search_tx_compression(
 
         if clipped:
             over = comp - target_compression_db
-            up = fine_step(over) if over > 0 else fine_step_db
+            up = step_for(over) if over > 0 else fine_step_db
             new = _quantize_atten(min(atten_max_db, atten + up))
             if new <= atten + 1e-9:
                 record(rec, "PA clip guard at attenuation ceiling")
@@ -261,7 +288,7 @@ def search_tx_compression(
 
             error = target_compression_db - comp  # > 0: need more compression
             if error > 0:
-                step = coarse_step_db if coarse_pending else fine_step(error)
+                step = coarse_step_db if coarse_pending else step_for(error)
                 coarse_pending = False
                 new = _quantize_atten(atten - step)
                 if new < floor:
@@ -294,7 +321,7 @@ def search_tx_compression(
                 gain = clamp_gain(gain - int(round(delta / db_per_index)))
                 action = f"TX atten -{delta:.2f} dB"
             else:
-                new = _quantize_atten(min(atten_max_db, atten + fine_step(error)))
+                new = _quantize_atten(min(atten_max_db, atten + step_for(error)))
                 if new <= atten + 1e-9:
                     record(rec, "atten ceiling")
                     return finish(
@@ -322,17 +349,12 @@ def search_tx_compression(
                 railed=railed,
                 extra=extra,
             )
-        elif railed > 0 or peak > band_hi:
-            if railed > 0 and not peak > band_hi:
-                step_idx = 1
-            else:
-                step_idx = max(1, int(round((peak - target_dbfs) / db_per_index)))
-            gain = clamp_gain(gain - step_idx)
-            action = f"ORx gain -{step_idx}"
         else:
-            step_idx = max(1, int(round((target_dbfs - peak) / db_per_index)))
-            gain = clamp_gain(gain + step_idx)
-            action = f"ORx gain +{step_idx}"
+            k = relevel_index(
+                peak, railed, target_dbfs=target_dbfs, band_hi=band_hi, db_per_index=db_per_index
+            )
+            gain = clamp_gain(gain + k)
+            action = f"ORx gain {k:+d}"
 
         record(rec, action)
 
