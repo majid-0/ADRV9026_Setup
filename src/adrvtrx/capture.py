@@ -510,21 +510,15 @@ def capture_arrays(raw, keep=None) -> list[np.ndarray]:
     return [np.fromiter(a, dtype=np.int32) if k in kept else empty for k, a in enumerate(items)]
 
 
-_TAKES_KEEP: dict[type, bool] = {}
-
-
 def _takes_keep(radio) -> bool:
-    """Whether ``radio.perform_rx`` accepts ``keep`` (Radio, RemoteRadio; not every stand-in)."""
-    kind = type(radio)
-    if kind not in _TAKES_KEEP:
-        try:
-            params = inspect.signature(radio.perform_rx).parameters
-            _TAKES_KEEP[kind] = "keep" in params or any(
-                p.kind is p.VAR_KEYWORD for p in params.values()
-            )
-        except (TypeError, ValueError):
-            _TAKES_KEEP[kind] = False
-    return _TAKES_KEEP[kind]
+    """Whether this radio's ``perform_rx`` accepts ``keep`` (Radio, RemoteRadio; not every
+    stand-in). Asked of the method itself at every capture (a few microseconds), so a
+    ``perform_rx`` replaced on one instance is judged by its own signature."""
+    try:
+        params = inspect.signature(radio.perform_rx).parameters
+    except (TypeError, ValueError):
+        return False
+    return "keep" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
 
 
 def _result_len(raw) -> int | None:
