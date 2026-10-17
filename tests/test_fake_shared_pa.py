@@ -12,6 +12,7 @@ from adrvtrx.capture import capture
 from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio, PaModel
 from adrvtrx.metrics import gain_compression_db
+from adrvtrx.radio import MAX_TX_ATTEN_DB
 from adrvtrx.transmit import transmit_bands
 
 TX1, TX4 = TxChannel.TX1, TxChannel.TX4
@@ -78,6 +79,18 @@ def test_a_band_alone_in_a_shared_pa_behaves_like_its_own_pa():
     np.testing.assert_allclose(
         shared.board_model.pa_output(TX1), own.board_model.pa_output(TX1), rtol=1e-12
     )
+
+
+def test_a_band_beside_a_member_at_full_attenuation_compresses_like_its_own_pa():
+    """The other member plays (so the shared model runs) but at 41.95 dB its power is nil: a band's
+    own power must not use up its own headroom."""
+    shared, own = _radio(SHARED), _radio({"noise_codes": 0.0, "coupling": 4.0})
+    _play(shared, 12.0, MAX_TX_ATTEN_DB)
+    own.set_tx_atten(TX1, 12.0)
+    transmit_bands(own, {TX1: _signal(1)}, 12)
+    assert shared.board_model.state["tx_mask"] == int(TX1) | int(TX4)
+    assert _compression(shared, TX1) == pytest.approx(_compression(own, TX1), abs=0.01)
+    assert _compression(own, TX1) > 1.0  # compressed: a lost headroom would show
 
 
 def test_coupling_zero_decouples_the_bands():

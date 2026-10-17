@@ -37,7 +37,8 @@ class TwoBandPa:
     attenuation below 20 dB. ORx peak follows attenuation and gain index (0.5 dB per index).
     ``orx_peak`` pins a band's ORx peak reading (``{0: 0.5}``: band 1 always reads +0.5 dBFS,
     railed): an ORx that never levels. ``comp_nan`` makes every n-th reading of a band NaN
-    (``{1: 3}``: every third of band 2's; ``{1: 1}``: all of them), as a failed alignment does."""
+    (``{1: 3}``: every third of band 2's; ``{1: 1}``: all of them), as a failed alignment does.
+    ``railed_first`` rails a band's first readings with the peak still in band (``{0: 1}``)."""
 
     def __init__(
         self,
@@ -49,12 +50,14 @@ class TwoBandPa:
         clip_below=None,
         orx_peak=None,
         comp_nan=None,
+        railed_first=None,
     ):
         self.locks, self.cross, self.p, self.noise = locks, cross, p, noise
         self.rng = np.random.default_rng(seed)
         self.clip_below = clip_below or {}
         self.orx_peak = orx_peak or {}
         self.comp_nan = comp_nan or {}
+        self.railed_first = railed_first or {}
         self.band_reads = [0, 0]
         self.a = [20.0, 20.0]
         self.g = [210, 210]
@@ -79,6 +82,8 @@ class TwoBandPa:
         railed = 5 if peak > 0 else 0
         slope = 0.05 if self.a[i] < self.clip_below.get(i, -1.0) else 0.4
         comp = self.comp(i) + float(self.rng.normal(0, self.noise))
+        if self.band_reads[i] < self.railed_first.get(i, 0):
+            railed = 4  # a few samples at the rail; the peak reads in band
         self.band_reads[i] += 1
         if i in self.comp_nan and self.band_reads[i] % self.comp_nan[i] == 0:
             comp = float("nan")
@@ -276,6 +281,87 @@ def test_a_band_first_leveled_late_still_takes_its_coarse_step():
     res = pa.search(method="walk", orx_gains=[240, 210], max_relevel=1)  # band 1: 2 steps hot
     tx1 = [h for h in res.history if h["band"] == "TX1" and not h["action"].startswith("ORx")]
     assert tx1[0]["action"] == "coarse" and tx1[0]["move_db"] == -2.5
+    assert res.converged
+
+
+class LinearPa:
+    """Two bands whose compression is linear in the attenuations, noise-free:
+    ``c = 4 + S @ (locks - a)`` (``S[i][j]``: dB of band ``i``'s compression per dB less
+    attenuation on band ``j``). The ORx peak follows the drive minus the compression exactly,
+    -1 dBFS at the start, ``db_per_index`` dB per gain index from index 500."""
+
+    def __init__(self, slopes, locks=(15.0, 16.0), start=20.0, db_per_index=0.05):
+        self.S, self.locks = np.asarray(slopes, dtype=float), np.asarray(locks, dtype=float)
+        self.start, self.dbpi = start, db_per_index
+        self.a, self.g = np.array([start, start]), [500, 500]
+
+    def comp(self, a=None) -> np.ndarray:
+        return 4.0 + self.S @ (self.locks - (self.a if a is None else a))
+
+    def measure(self, i: int):
+        c, c0 = self.comp(), self.comp(np.full(2, self.start))
+        peak = -1.0 + (self.start - self.a[i]) - (c[i] - c0[i]) + self.dbpi * (self.g[i] - 500)
+        railed = 5 if peak > 0 else 0
+        return min(peak, 0.0), railed, float(c[i]), {"top_slope": 0.5}
+
+    def search(self, **kw):
+        args = {
+            "targets_db": [4.0, 4.0],
+            "start_attens_db": [self.start, self.start],
+            "atten_mins_db": [5.0, 5.0],
+            "orx_gains": [500, 500],
+            "names": ["TX1", "TX4"],
+            "db_per_index": self.dbpi,
+            "gain_min": 0,
+            "gain_max": 1000,
+        }
+        args.update(kw)
+        return search_multiband_compression(
+            lambda i, db: self.a.__setitem__(i, db),
+            lambda i, g: self.g.__setitem__(i, g),
+            self.measure,
+            **args,
+        )
+
+
+def test_the_slope_update_is_what_locks_strongly_coupled_bands_in_few_steps(monkeypatch):
+    """0.6 dB/dB from the other band next to 1 dB/dB of its own: the own slopes of a step where
+    both bands moved read 1.6, and only the update learns the cross terms."""
+    coupled = [[1.0, 0.6], [0.6, 1.0]]
+    grid = [(l1, l2) for l1 in np.arange(13.0, 17.6, 0.75) for l2 in np.arange(13.0, 17.6, 0.75)]
+
+    def locked() -> int:
+        return sum(
+            LinearPa(coupled, locks=locks).search(method="slopes", max_steps=6).converged
+            for locks in grid
+        )
+
+    with_update = locked()
+    monkeypatch.setattr(multiband, "update_slopes", lambda jac, da, dc, **_k: jac)
+    diagonal_only = locked()
+    assert with_update >= 0.9 * len(grid), with_update  # 45 of 49
+    assert diagonal_only <= 0.75 * len(grid), diagonal_only  # 31 of 49
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+@pytest.mark.parametrize("locks", [(15.0, 16.0), (13.0, 17.5), (16.5, 14.0)])
+def test_the_orx_gain_follows_the_output_peak_so_no_band_relevels(method, locks):
+    pa = LinearPa([[0.5, 0.0], [0.0, 0.5]], locks=locks)  # the typical own slope, exact
+    res = pa.search(method=method)
+    assert res.converged, res.reason
+    assert [h for h in res.history if h["action"].startswith("ORx gain")] == []
+    assert all(-1.6 <= h["peak_dbfs"] <= -0.7 for h in res.history)
+
+
+def test_a_railed_capture_does_not_count_even_with_the_peak_in_band():
+    pa = TwoBandPa(railed_first={0: 1})
+    res = pa.search()
+    tx1 = [h for h in res.history if h["band"] == "TX1"]
+    assert -1.6 <= tx1[0]["peak_dbfs"] <= -0.7 and tx1[0]["railed"] == 4
+    assert not tx1[0]["leveled"] and tx1[0]["action"] == "ORx gain -1"
+    assert tx1[0]["move_db"] == 0.0
+    assert tx1[1]["step"] == 0 and tx1[1]["leveled"] and tx1[1]["action"] == "coarse"
+    assert tx1[1]["orx_gain"] == tx1[0]["orx_gain"] - 1
     assert res.converged
 
 
