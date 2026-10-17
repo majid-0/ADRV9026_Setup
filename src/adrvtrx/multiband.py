@@ -581,6 +581,21 @@ def search_multiband_compression(
     holding ``papr_compression_db`` and ``top_slope``. ``on_step(rows)`` gets each step's rows
     (one per band).
     The radio is left at the returned attenuations and gains.
+
+    The defaults differ from the single-band :func:`~adrvtrx.compression.search_tx_compression`
+    (coarse 10 dB, fine 0.25 dB, tolerance 0.3 dB, clip guard off), and stay so: changing either
+    set would change locks already taken with it.
+
+    * ``coarse_step_db=2.5``: a band's move also moves every other band's compression (shared
+      PA), so the first jump is kept small enough for the bands to stay where their slopes can be
+      learnt; one band alone can take 10 dB from a safe start.
+    * ``comp_tol_db=0.1``, ``fine_step_db=0.2``: the search steers on gain compression (all the
+      samples of the top 2.5 % of the peaks; the single-band default steers on the PAPR of one
+      window around the peak, hence its 0.3 dB). The tolerance window is then 0.2 dB wide, and
+      near the lock a dB of attenuation moves about 0.5 to 1 dB of compression, so a 0.25 dB fine
+      step could step over it; 0.2 dB (four attenuator steps) does not.
+    * ``min_top_slope=PA_CLIP_SLOPE``: one band's drive can push another band's peaks into
+      clipping, so the clip guard is on; single band keeps it opt-in, as it was introduced.
     """
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}, got {method!r}")

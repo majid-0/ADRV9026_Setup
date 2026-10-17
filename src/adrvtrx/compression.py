@@ -148,6 +148,10 @@ def search_tx_compression(
     below it is PA clipping: the attenuation goes up (by the remaining error, at
     least one fine step), and that attenuation becomes the new floor. A target the
     PA cannot reach without clipping ends at that floor with ``clip_limited=True``.
+
+    The multi-band search (:func:`adrvtrx.multiband.search_multiband_compression`) uses the
+    same rules with other defaults (coarse 2.5 dB, fine 0.2 dB, tolerance 0.1 dB, clip guard on);
+    its docstring says why.
     """
     if atten_min_db > start_atten_db:
         raise ValueError(
