@@ -163,7 +163,10 @@ def autolevel_orx(
 
     ``start_gain`` (a gain already known to be close, e.g. predicted from an earlier
     level) skips Stage A: Stage B trims from there, and a clip at ``gain_min`` is FATAL
-    at once (Stage A's floor check). ``None`` (the default) runs Stage A as always.
+    at once (Stage A's floor check). Stage A's other FATAL check does NOT run: a signal
+    already in (or above) the band at ``gain_min`` ("TX too strong for target") is not an
+    error from a start gain; a reading in band at ``gain_min`` is accepted, with no
+    headroom left below it. ``None`` (the default) runs Stage A as always.
     """
     band_lo = target_dbfs - tol_down_db
     band_hi = target_dbfs + tol_up_db

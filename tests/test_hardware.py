@@ -31,7 +31,6 @@ import numpy as np
 import pytest
 
 from adrvtrx import RxChannel, TxChannel
-from adrvtrx._hwlink import HOST
 from adrvtrx.capture import capture
 from adrvtrx.config import load_config
 from adrvtrx.experiment import session
@@ -61,14 +60,19 @@ def hardware_refusal(cfg, environ=os.environ) -> str | None:
 
     Checked in this order, so a refusal opens no connection it does not need: the
     opt-in variable, then a hardware server on ``[server] port`` (it owns the board, and
-    these tests would connect and program beside it), then the board itself.
+    these tests would connect and program beside it), then the board itself. The server is
+    asked with its own ping, the probe ``adrvtrx-server safe --direct`` uses (an
+    authenticated request, not a bare connection to its port).
     """
+    from adrvtrx.server import _answers_ping
+
     if environ.get(ALLOW_ENV) != "1":
         return f"set {ALLOW_ENV}=1 to run the hardware tests (they program the real board)"
-    if _reachable(HOST, cfg.server.port, timeout=1.0):
+    pong = _answers_ping(cfg.server)
+    if pong is not None:
         return (
-            f"a hardware server answers on {HOST}:{cfg.server.port} and owns the board: "
-            "stop it (adrvtrx-server stop) before running the hardware tests"
+            f"adrvtrx-server pid {pong.get('pid')} answers on port {cfg.server.port} and owns "
+            "the board: stop it (adrvtrx-server stop) before running the hardware tests"
         )
     if not _reachable(cfg.board.ip, cfg.board.port):
         return f"ADS9 not reachable at {cfg.board.ip}:{cfg.board.port}"

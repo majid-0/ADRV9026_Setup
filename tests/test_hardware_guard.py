@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from adrvtrx.config import load_config
-from hw_helpers import free_port, subprocess_env, toml_path
+from hw_helpers import free_port, running_server, subprocess_env, toml_path
 from test_hardware import ALLOW_ENV, hardware_refusal
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,12 +85,20 @@ def test_without_the_opt_in_the_guard_refuses_before_any_connection(tmp_path, mo
 
 
 def test_with_the_opt_in_a_running_hardware_server_is_refused(tmp_path):
-    with socket.socket() as listener:  # stands in for adrvtrx-server on its port
+    cfg = load_config(_safe_config(tmp_path))  # a fake-board server on a free port, its own key
+    with running_server(cfg) as server:
+        reason = hardware_refusal(cfg, {ALLOW_ENV: "1"})
+        assert reason is not None and "answers on port" in reason
+        assert f"pid {server.status(live=False)['server']['pid']}" in reason
+
+
+def test_a_port_that_answers_without_the_server_ping_is_not_the_server(tmp_path):
+    with socket.socket() as listener:  # something else listens there: no key, no ping
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         cfg = load_config(_safe_config(tmp_path, server_port=listener.getsockname()[1]))
         reason = hardware_refusal(cfg, {ALLOW_ENV: "1"})
-    assert reason is not None and "hardware server answers" in reason
+    assert reason is not None and "not reachable" in reason  # the board check came next
 
 
 def test_with_the_opt_in_and_no_board_the_tests_skip(tmp_path):
