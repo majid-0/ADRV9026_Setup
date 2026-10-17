@@ -9,7 +9,9 @@ backs them off together and saves one case folder.
 every band's attenuation and ORx gain and takes one reading per band; a band whose ORx is not
 leveled moves only its ORx gain and is measured again before its reading counts (up to
 ``max_relevel`` times; still not leveled, it keeps its attenuation that step and its reading
-drives nothing). Every capture is one ``history`` row. Moves (``method``):
+drives nothing). A compression reading that is not finite (a failed alignment) does not count
+either: the band is measured again at the same gain. Every capture is one ``history`` row.
+Moves (``method``):
 
 * ``"walk"``: every band by the single-band rule (one coarse step toward the target, then fine
   steps sized to its error, 1 dB of compression assumed per dB).
@@ -275,8 +277,10 @@ def search_multiband_compression(
                 captures += 1
                 extra = dict(rest[0]) if rest and rest[0] is not None else {}
                 peak, railed, comp = float(peak), int(railed), float(comp)
-                leveled = railed == 0 and band_lo <= peak <= band_hi
-                cold = (not leveled) and railed == 0 and peak < band_lo and g[i] >= gain_max
+                in_band = railed == 0 and band_lo <= peak <= band_hi
+                at_max = railed == 0 and peak < band_lo and g[i] >= gain_max
+                leveled = in_band and math.isfinite(comp)  # NaN: a failed alignment
+                cold = at_max and math.isfinite(comp)
                 row = {
                     "step": step,
                     "band": names[i],
@@ -330,7 +334,9 @@ def search_multiband_compression(
                         err,
                         fatal=True,
                     )
-                if railed > 0 or peak > band_hi:
+                if in_band or at_max:  # level fine, compression not finite: measure again
+                    row["action"] = "measure again (compression not finite)"
+                elif railed > 0 or peak > band_hi:
                     k = (
                         1
                         if (railed > 0 and not peak > band_hi)
@@ -434,11 +440,14 @@ def search_multiband_compression(
             da, dc = a - prev[0], c - prev[1]
             if jac is None or grew:
                 own = np.array([(-dc[i] / da[i]) if abs(da[i]) > 1e-9 else 0.5 for i in range(n)])
+                own = np.where(np.isfinite(own), own, 0.5)
                 jac = np.diag(-np.clip(own, smin, smax))
             elif float(da @ da) > 1e-12:
-                jac = jac + np.outer(dc - jac @ da, da) / float(da @ da)
+                new_jac = jac + np.outer(dc - jac @ da, da) / float(da @ da)
                 for i in range(n):
-                    jac[i, i] = -float(np.clip(-jac[i, i], smin, smax))
+                    new_jac[i, i] = -float(np.clip(-new_jac[i, i], smin, smax))
+                if np.all(np.isfinite(new_jac)):  # never learn from a non-finite step
+                    jac = new_jac
         for i in free:
             if abs(err[i]) <= comp_tol_db and use_walk:
                 actions[i] = "within tolerance"
@@ -454,7 +463,10 @@ def search_multiband_compression(
             fx = [i for i in range(n) if fixed[i]]
             rhs = err[free] - (jac[np.ix_(free, fx)] @ mv[fx] if fx else 0.0)
             try:
-                mv[free] = np.linalg.solve(jac[np.ix_(free, free)], rhs)
+                sol = np.linalg.solve(jac[np.ix_(free, free)], rhs)
+                if not np.all(np.isfinite(sol)):
+                    raise np.linalg.LinAlgError("non-finite move")
+                mv[free] = sol
                 for i in free:
                     actions[i] = "slopes"
             except np.linalg.LinAlgError:

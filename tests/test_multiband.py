@@ -28,7 +28,8 @@ class TwoBandPa:
     band's
     attenuation below 20 dB. ORx peak follows attenuation and gain index (0.5 dB per index).
     ``orx_peak`` pins a band's ORx peak reading (``{0: 0.5}``: band 1 always reads +0.5 dBFS,
-    railed): an ORx that never levels."""
+    railed): an ORx that never levels. ``comp_nan`` makes every n-th reading of a band NaN
+    (``{1: 3}``: every third of band 2's; ``{1: 1}``: all of them), as a failed alignment does."""
 
     def __init__(
         self,
@@ -39,11 +40,14 @@ class TwoBandPa:
         seed=0,
         clip_below=None,
         orx_peak=None,
+        comp_nan=None,
     ):
         self.locks, self.cross, self.p, self.noise = locks, cross, p, noise
         self.rng = np.random.default_rng(seed)
         self.clip_below = clip_below or {}
         self.orx_peak = orx_peak or {}
+        self.comp_nan = comp_nan or {}
+        self.band_reads = [0, 0]
         self.a = [20.0, 20.0]
         self.g = [210, 210]
         self.reads = 0
@@ -67,6 +71,9 @@ class TwoBandPa:
         railed = 5 if peak > 0 else 0
         slope = 0.05 if self.a[i] < self.clip_below.get(i, -1.0) else 0.4
         comp = self.comp(i) + float(self.rng.normal(0, self.noise))
+        self.band_reads[i] += 1
+        if i in self.comp_nan and self.band_reads[i] % self.comp_nan[i] == 0:
+            comp = float("nan")
         return min(peak, 0.0), railed, comp, {"papr_compression_db": comp - 1.0, "top_slope": slope}
 
     def search(self, **kw):
@@ -170,6 +177,32 @@ def test_every_capture_is_one_history_row_with_its_own_action(method, orx):
         assert h["action"]
         if h["action"].startswith("ORx gain"):
             assert h["move_db"] == 0.0 and h["slopes"] == ""
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+def test_a_nan_compression_is_measured_again_and_never_counts(method):
+    pa = TwoBandPa(comp_nan={1: 3})  # every third reading of band 2 fails to align
+    res = pa.search(method=method)
+    assert res.converged, res.reason
+    nan_rows = [h for h in res.history if not np.isfinite(h["gain_compression_db"])]
+    assert nan_rows and all(h["band"] == "TX4" for h in nan_rows)
+    for h in nan_rows:  # measured again at the same gain and attenuation: no move
+        assert h["action"] == "measure again (compression not finite)" and h["move_db"] == 0.0
+        assert not h["leveled"]
+    assert all(np.isfinite(bl.compression_db) for bl in res.bands)
+    assert all("nan" not in h["slopes"].lower() for h in res.history)
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+def test_a_band_that_never_aligns_holds_and_the_search_does_not_crash(method):
+    pa = TwoBandPa(comp_nan={1: 1})
+    res = pa.search(method=method, max_steps=5)
+    assert not res.converged
+    tx4 = [h for h in res.history if h["band"] == "TX4"]
+    assert {h["atten_db"] for h in tx4} == {20.0} and {h["orx_gain"] for h in tx4} == {210}
+    assert all(h["action"].startswith("measure again") for h in tx4)
+    assert res.bands[1].status == "not converged" and pa.a[1] == 20.0
+    assert "closest" not in res.reason  # no step counted, so none was kept as the best
 
 
 def test_a_band_first_leveled_late_still_takes_its_coarse_step():
