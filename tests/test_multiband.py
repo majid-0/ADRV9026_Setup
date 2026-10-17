@@ -26,14 +26,24 @@ from adrvtrx.multiband import (
 class TwoBandPa:
     """Gain compression of each band: its own Rapp-like curve plus ``cross`` dB per dB of the other
     band's
-    attenuation below 20 dB. ORx peak follows attenuation and gain index (0.5 dB per index)."""
+    attenuation below 20 dB. ORx peak follows attenuation and gain index (0.5 dB per index).
+    ``orx_peak`` pins a band's ORx peak reading (``{0: 0.5}``: band 1 always reads +0.5 dBFS,
+    railed): an ORx that never levels."""
 
     def __init__(
-        self, locks=(14.0, 15.0), cross=(0.3, 0.3), p=1.4, noise=0.02, seed=0, clip_below=None
+        self,
+        locks=(14.0, 15.0),
+        cross=(0.3, 0.3),
+        p=1.4,
+        noise=0.02,
+        seed=0,
+        clip_below=None,
+        orx_peak=None,
     ):
         self.locks, self.cross, self.p, self.noise = locks, cross, p, noise
         self.rng = np.random.default_rng(seed)
         self.clip_below = clip_below or {}
+        self.orx_peak = orx_peak or {}
         self.a = [20.0, 20.0]
         self.g = [210, 210]
         self.reads = 0
@@ -53,6 +63,7 @@ class TwoBandPa:
         c_start = self.comp(i)
         self.a[i] = a_now
         peak = -1.0 + (20.0 - a_now) - (self.comp(i) - c_start) + 0.5 * (self.g[i] - 210)
+        peak = self.orx_peak.get(i, peak)
         railed = 5 if peak > 0 else 0
         slope = 0.05 if self.a[i] < self.clip_below.get(i, -1.0) else 0.4
         comp = self.comp(i) + float(self.rng.normal(0, self.noise))
@@ -131,6 +142,42 @@ def test_an_unleveled_orx_moves_its_gain_not_the_attenuation():
     assert {h["band"] for h in relevels} == {"TX1", "TX4"}
     assert all(h["move_db"] == 0.0 for h in relevels)
     assert res.captures > 2 * res.steps
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+def test_a_band_whose_orx_never_levels_keeps_its_attenuation(method):
+    pa = TwoBandPa(orx_peak={0: 0.5})  # band 1's ORx always reads +0.5 dBFS (railed)
+    res = pa.search(method=method, max_steps=4, gain_min=100)  # never at the ORx gain floor
+    tx1 = [h for h in res.history if h["band"] == "TX1"]
+    assert len(tx1) == 4 * 7  # max_relevel + 1 captures per step, every one re-leveling
+    assert {h["atten_db"] for h in tx1} == {20.0} and all(h["move_db"] == 0.0 for h in tx1)
+    assert all(h["action"].startswith("ORx gain -") for h in tx1)
+    assert sum("atten held" in h["action"] for h in tx1) == 4
+    assert pa.a[0] == 20.0 and res.bands[0].status == "not converged"
+    tx4 = [h for h in res.history if h["band"] == "TX4"]
+    assert tx4[0]["action"] == "coarse" and tx4[-1]["atten_db"] < 20.0  # the other band goes on
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+@pytest.mark.parametrize("orx", [{"orx_gains": [240, 180]}, {"orx_peak": {1: 0.5}}])
+def test_every_capture_is_one_history_row_with_its_own_action(method, orx):
+    pa = TwoBandPa(**{k: v for k, v in orx.items() if k == "orx_peak"})
+    res = pa.search(method=method, max_steps=6, **{k: v for k, v in orx.items() if k != "orx_peak"})
+    assert res.fatal == ("orx_peak" in orx)  # a band that rails at the ORx gain floor stops it
+    assert res.captures == len(res.history) == pa.reads
+    assert len({id(h) for h in res.history}) == len(res.history)  # no row recorded twice
+    for h in res.history:
+        assert h["action"]
+        if h["action"].startswith("ORx gain"):
+            assert h["move_db"] == 0.0 and h["slopes"] == ""
+
+
+def test_a_band_first_leveled_late_still_takes_its_coarse_step():
+    pa = TwoBandPa(cross=(0.0, 0.0), noise=0.0)
+    res = pa.search(method="walk", orx_gains=[240, 210], max_relevel=1)  # band 1: 2 steps hot
+    tx1 = [h for h in res.history if h["band"] == "TX1" and not h["action"].startswith("ORx")]
+    assert tx1[0]["action"] == "coarse" and tx1[0]["move_db"] == -2.5
+    assert res.converged
 
 
 def test_one_band_ends_where_the_single_band_walk_ends():

@@ -7,19 +7,21 @@ backs them off together and saves one case folder.
 :func:`search_multiband_compression` is hardware-free (``set_atten``, ``set_gain`` and
 ``measure`` per band, like :func:`adrvtrx.compression.search_tx_compression`). One step sets
 every band's attenuation and ORx gain and takes one reading per band; a band whose ORx is not
-leveled moves only its ORx gain and is measured again before its reading counts. Moves
-(``method``):
+leveled moves only its ORx gain and is measured again before its reading counts (up to
+``max_relevel`` times; still not leveled, it keeps its attenuation that step and its reading
+drives nothing). Every capture is one ``history`` row. Moves (``method``):
 
 * ``"walk"``: every band by the single-band rule (one coarse step toward the target, then fine
   steps sized to its error, 1 dB of compression assumed per dB).
-* ``"slopes"``: one coarse step, then a slope matrix ``J`` (how much each band's compression
-  moves per dB of each band's attenuation) learnt from the steps taken: it starts from each
-  band's own slope (its last two readings, no cross terms) and every step corrects it with what
-  happened (Broyden), so a cross-band effect is learnt when it exists. The move solves
+* ``"slopes"``: one coarse step per band, then a slope matrix ``J`` (how much each band's
+  compression moves per dB of each band's attenuation) learnt from the steps taken: it starts
+  from each band's own slope (its last two readings, no cross terms) and every step corrects it
+  with what happened (Broyden), so a cross-band effect is learnt when it exists. The move solves
   ``J @ da = target - c``. When a step made a band's error grow, the next step falls back to the
   walk and ``J`` starts again from the own slopes.
 
-Both: moves capped at ``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
+Both: a band's coarse step is taken at its first reading that counts; moves capped at
+``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
 gain follows the predicted output peak (the drive change minus the compression change); a band
 never goes below its ``atten_min_db`` (a band that needs more drive than that stops there, the
 others go on); clip guard per band (``min_top_slope``); at most ``max_steps`` steps, then the
@@ -212,7 +214,7 @@ def search_multiband_compression(
     jac: np.ndarray | None = None
     prev: tuple[np.ndarray, np.ndarray] | None = None
     prev_err: np.ndarray | None = None
-    first = True
+    coarse_pending = [True] * n  # until the band's first reading that counts
     best: dict | None = None
     last: dict | None = None
 
@@ -224,11 +226,12 @@ def search_multiband_compression(
     def band_locks(readings, err) -> list[BandLock]:
         out = []
         for i, r in enumerate(readings):
+            below = r["leveled"] and err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9
             if r["leveled"] and abs(err[i]) <= comp_tol_db:
                 status = "converged"
-            elif clip_floor[i] and err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9:
+            elif clip_floor[i] and below:
                 status = "clip-limited"
-            elif err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9:
+            elif below:
                 status = "at limit"
             else:
                 status = "not converged"
@@ -267,7 +270,7 @@ def search_multiband_compression(
         apply()
         readings = []
         for i in range(n):
-            for _ in range(max_relevel + 1):
+            for attempt in range(max_relevel + 1):
                 peak, railed, comp, *rest = measure(i)
                 captures += 1
                 extra = dict(rest[0]) if rest and rest[0] is not None else {}
@@ -293,6 +296,10 @@ def search_multiband_compression(
                 if leveled or cold:
                     break
                 if (railed > 0 or peak > band_hi) and g[i] <= gain_min:
+                    for r in readings:  # the bands read before this one this step
+                        if r["leveled"]:
+                            r["row"]["action"] = "stopped"
+                            history.append(r["row"])
                     row["action"] = "ORx clips at minimum gain: TX atten up one fine step, stop"
                     history.append(row)
                     a[i] = _quantize_atten(min(atten_max_db, a[i] + fine_step_db))
@@ -335,6 +342,8 @@ def search_multiband_compression(
                     k = max(1, round((target_dbfs - peak) / db_per_index))
                     g[i] = clamp_gain(g[i] + k)
                     row["action"] = f"ORx gain +{k}"
+                if attempt == max_relevel:  # this reading drives nothing: the band holds
+                    row["action"] += f"; not leveled after {attempt + 1} captures, atten held"
                 history.append(row)
                 set_gain(i, int(g[i]))
             readings.append(
@@ -350,7 +359,8 @@ def search_multiband_compression(
             )
         c = np.array([r["comp"] for r in readings])
         err = targets - c
-        trusted = all(r["leveled"] for r in readings)
+        ok = [r["leveled"] for r in readings]  # a reading that counts (leveled or cold)
+        trusted = all(ok)
         clipped = [
             min_top_slope is not None
             and r["leveled"]
@@ -369,8 +379,8 @@ def search_multiband_compression(
             }
         last = {"readings": readings, "err": err}
 
-        within = [r["leveled"] and abs(e) <= comp_tol_db for r, e in zip(readings, err)]
-        stuck = [e > comp_tol_db and a[i] <= floor[i] + 1e-9 for i, e in enumerate(err)]
+        within = [ok[i] and abs(e) <= comp_tol_db for i, e in enumerate(err)]
+        stuck = [ok[i] and e > comp_tol_db and a[i] <= floor[i] + 1e-9 for i, e in enumerate(err)]
         if not any(clipped) and all(w or s for w, s in zip(within, stuck)):
             rows = [r["row"] for r in readings]
             for row in rows:
@@ -403,16 +413,24 @@ def search_multiband_compression(
                 actions[i] = f"clip guard (top slope {readings[i]['slope']:.3f})"
             elif stuck[i]:
                 fixed[i], actions[i] = True, "at limit"
+            elif not ok[i]:
+                fixed[i] = True  # not leveled: its row is in the history already, atten held
+            elif coarse_pending[i]:  # the band's first reading that counts: the single-band rule
+                if err[i] > comp_tol_db:
+                    mv[i], actions[i] = -coarse_step_db, "coarse"
+                elif err[i] < -comp_tol_db:
+                    mv[i], actions[i] = _fine_step(err[i], fine_step_db, coarse_step_db), "fine"
+                else:
+                    actions[i] = "within tolerance"
+                fixed[i] = True
+            if ok[i]:
+                coarse_pending[i] = False
         free = [i for i in range(n) if not fixed[i]]
-        grew = (
-            prev_err is not None
-            and not first
-            and any(
-                abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > comp_tol_db for i in free
-            )
+        grew = prev_err is not None and any(
+            abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > comp_tol_db for i in free
         )
         use_walk = method == "walk" or grew or not trusted
-        if method == "slopes" and trusted and prev is not None and not first:
+        if method == "slopes" and trusted and prev is not None:
             da, dc = a - prev[0], c - prev[1]
             if jac is None or grew:
                 own = np.array([(-dc[i] / da[i]) if abs(da[i]) > 1e-9 else 0.5 for i in range(n)])
@@ -422,14 +440,10 @@ def search_multiband_compression(
                 for i in range(n):
                     jac[i, i] = -float(np.clip(-jac[i, i], smin, smax))
         for i in free:
-            if abs(err[i]) <= comp_tol_db and (first or use_walk):
+            if abs(err[i]) <= comp_tol_db and use_walk:
                 actions[i] = "within tolerance"
-        if first:
-            for i in free:
-                if err[i] > comp_tol_db:
-                    mv[i], actions[i] = -coarse_step_db, "coarse"
-                elif err[i] < -comp_tol_db:
-                    mv[i], actions[i] = _fine_step(err[i], fine_step_db, coarse_step_db), "fine"
+        if not free:
+            pass
         elif use_walk or jac is None:
             for i in free:
                 if abs(err[i]) > comp_tol_db:
@@ -449,13 +463,11 @@ def search_multiband_compression(
                         step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
                         mv[i] = -step_db if err[i] > 0 else step_db
                         actions[i] = "walk (singular slopes)"
-        first = False
         if grew:
             jac = None  # start again from the own slopes after this step
         mv = np.clip(mv, -coarse_step_db, coarse_step_db)
-        for i in (
-            free
-        ):  # a band still outside tolerance moves at least one attenuator step toward its target
+        # a band still outside tolerance moves at least one attenuator step toward its target
+        for i in free:
             if abs(err[i]) > comp_tol_db and abs(mv[i]) < 0.05 and actions[i] == "slopes":
                 mv[i] = -0.05 if err[i] > 0 else 0.05
         new_a = np.array(
@@ -465,17 +477,18 @@ def search_multiband_compression(
         rows = []
         for i, r in enumerate(readings):
             row = r["row"]
-            row["move_db"] = float(moved[i])
-            row["action"] = actions[i]
-            row["slopes"] = "" if jac is None else json.dumps(np.round(jac, 4).tolist())
+            if ok[i]:  # a band not leveled has its row already (its own action, no move)
+                row["move_db"] = float(moved[i])
+                row["action"] = actions[i]
+                row["slopes"] = "" if jac is None else json.dumps(np.round(jac, 4).tolist())
+                history.append(row)
             rows.append(row)
-        history.extend(rows)
         if on_step:
             on_step(rows)
-        if np.all(np.abs(moved) < 1e-9):
+        if np.all(np.abs(moved) < 1e-9) and trusted:
             return finish(False, "no band can move further (limits)", readings, err)
         prev = (a.copy(), c.copy()) if trusted else None
-        prev_err = err.copy()
+        prev_err = np.where(ok, err, np.nan)  # an error that did not count cannot have grown
         # The ORx gain follows the output peak, which moves by the drive change minus the
         # compression change:
         # predicted from the slopes when known, else from a typical own slope of 0.5 dB per dB.
