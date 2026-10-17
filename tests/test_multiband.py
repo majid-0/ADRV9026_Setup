@@ -205,6 +205,64 @@ def test_a_band_that_never_aligns_holds_and_the_search_does_not_crash(method):
     assert "closest" not in res.reason  # no step counted, so none was kept as the best
 
 
+def _counted_steps(res, names=("TX1", "TX4")) -> dict[int, dict[str, dict]]:
+    """Per step, each band's reading that counted (the last row of the band in that step)."""
+    rows: dict[int, dict[str, dict]] = {}
+    for h in res.history:
+        if h["leveled"]:
+            rows.setdefault(h["step"], {})[h["band"]] = h
+    return {s: r for s, r in rows.items() if set(r) == set(names)}
+
+
+@pytest.mark.parametrize(
+    "pa_kw, search_kw",
+    [
+        ({"orx_peak": {1: 0.5}}, {"max_steps": 3, "gain_min": 100}),  # never a counted step
+        ({"cross": (0.3, 0.3)}, {"max_steps": 3}),
+        ({"cross": (0.6, 0.6)}, {"max_steps": 12}),
+        ({"cross": (0.6, 0.6)}, {"max_steps": 12, "method": "walk"}),
+    ],
+)
+def test_at_max_steps_the_radio_is_left_where_it_was_measured(pa_kw, search_kw):
+    pa = TwoBandPa(**pa_kw)
+    res = pa.search(**search_kw)
+    assert not res.converged and res.steps == search_kw["max_steps"]
+    assert pa.a == [bl.atten_db for bl in res.bands] and pa.g == [bl.orx_gain for bl in res.bands]
+    for bl in res.bands:  # every band's lock is one of its captures: atten, gain and reading
+        assert any(
+            (h["atten_db"], h["orx_gain"], h["gain_compression_db"])
+            == (bl.atten_db, bl.orx_gain, bl.compression_db)
+            for h in res.history
+            if h["band"] == bl.name
+        ), bl
+    last = [h for h in res.history if h["step"] == res.steps - 1]
+    assert all(h["move_db"] == 0.0 for h in last)  # no move after the last step
+
+
+def test_at_max_steps_the_step_closest_to_the_targets_is_restored():
+    pa = TwoBandPa(cross=(0.6, 0.6))
+    res = pa.search(max_steps=12)
+    steps = _counted_steps(res)
+    worst = {s: max(abs(h["error_db"]) for h in rows.values()) for s, rows in steps.items()}
+    best = min(worst, key=worst.get)
+    assert best != max(steps)  # the last step is not the best one here
+    assert "closest" in res.reason
+    assert pa.a == [steps[best][name]["atten_db"] for name in ("TX1", "TX4")]
+    assert [bl.compression_db for bl in res.bands] == [
+        steps[best][name]["gain_compression_db"] for name in ("TX1", "TX4")
+    ]
+
+
+def test_without_a_counted_step_the_last_measured_step_is_kept():
+    pa = TwoBandPa(orx_peak={1: 0.5})
+    res = pa.search(max_steps=3, gain_min=100)
+    tx1 = [h for h in res.history if h["band"] == "TX1" and h["leveled"]]
+    assert [h["atten_db"] for h in tx1][:2] == [20.0, 17.5] and len(tx1) == 3
+    assert pa.a[0] == tx1[-1]["atten_db"] < 17.5 and pa.g[0] == tx1[-1]["orx_gain"]
+    assert res.bands[0].compression_db == tx1[-1]["gain_compression_db"]
+    assert "last step measured" in res.reason
+
+
 def test_a_band_first_leveled_late_still_takes_its_coarse_step():
     pa = TwoBandPa(cross=(0.0, 0.0), noise=0.0)
     res = pa.search(method="walk", orx_gains=[240, 210], max_relevel=1)  # band 1: 2 steps hot

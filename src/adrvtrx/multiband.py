@@ -26,8 +26,10 @@ Both: a band's coarse step is taken at its first reading that counts; moves capp
 ``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
 gain follows the predicted output peak (the drive change minus the compression change); a band
 never goes below its ``atten_min_db`` (a band that needs more drive than that stops there, the
-others go on); clip guard per band (``min_top_slope``); at most ``max_steps`` steps, then the
-step with the smallest worst-band error is kept.
+others go on); clip guard per band (``min_top_slope``); at most ``max_steps`` steps (no move
+after the last one), then the step with the smallest worst-band error among the steps where
+every reading counted is kept, or else the last step's attenuations and gains: the radio is
+always left where it was measured.
 
 :func:`find_multiband_operating_point` runs it on hardware (a :class:`~adrvtrx.radio.Radio` or
 the hardware server's ``RemoteRadio``): retune, play every TX in one ``PerformTx``, ORx AGC per
@@ -383,7 +385,12 @@ def search_multiband_compression(
                 "readings": readings,
                 "err": err.copy(),
             }
-        last = {"readings": readings, "err": err}
+        last = {
+            "readings": readings,
+            "err": err,
+            "a": a.copy(),
+            "g": [int(r["row"]["orx_gain"]) for r in readings],  # as captured
+        }
 
         within = [ok[i] and abs(e) <= comp_tol_db for i, e in enumerate(err)]
         stuck = [ok[i] and e > comp_tol_db and a[i] <= floor[i] + 1e-9 for i, e in enumerate(err)]
@@ -403,6 +410,15 @@ def search_multiband_compression(
                 readings,
                 err,
             )
+        if step == max_steps - 1:  # no move after the last step: nothing would measure it
+            rows = [r["row"] for r in readings]
+            for i, row in enumerate(rows):
+                if ok[i]:
+                    row["action"] = "max steps"
+                    history.append(row)
+            if on_step:
+                on_step(rows)
+            break
 
         # -- moves ----------------------------------------------------------------------
         mv = np.zeros(n)
@@ -517,7 +533,8 @@ def search_multiband_compression(
             best["readings"],
             best["err"],
         )
-    return finish(False, "max steps", last["readings"], last["err"])
+    a, g = last["a"], list(last["g"])
+    return finish(False, "max steps; left at the last step measured", last["readings"], last["err"])
 
 
 # -- hardware ---------------------------------------------------------------------------------
