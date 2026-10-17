@@ -58,6 +58,7 @@ from .align import estimate_and_align
 from .capture import autolevel_capture, capture
 from .compression import _quantize_atten
 from .conditions import save_aligned_iq
+from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
 from .metrics import PA_CLIP_SLOPE, gain_compression_db, period_metrics, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
@@ -650,6 +651,20 @@ def _agc(radio, orx, ref, *, rx_bits, fs, oversample, target_dbfs, tol_up_db, to
     return int(agc.final_gain_index)
 
 
+def _check_los(bands: Sequence[BandSpec], clocks) -> None:
+    """Each band's ``lo`` must be the LO ``[clocks]`` routes its TX to, and one LO one frequency."""
+    freqs: dict[str, int] = {}
+    for b in bands:
+        if isinstance(clocks, ClocksConfig) and b.lo != lo_for_tx(clocks, b.tx):
+            raise ValueError(
+                f"{b.name}: lo is {b.lo!r}, but [clocks] routes {b.name} to "
+                f"{lo_for_tx(clocks, b.tx)!r}"
+            )
+        hz = freqs.setdefault(b.lo, int(b.freq_hz))
+        if hz != int(b.freq_hz):
+            raise ValueError(f"{b.lo} is shared by bands at {hz} Hz and {int(b.freq_hz)} Hz")
+
+
 def lock_bands(
     radio,
     bands: Sequence[BandSpec],
@@ -669,14 +684,17 @@ def lock_bands(
     """Retune, play every band, ORx AGC per band at the start attenuations, then the search.
 
     Returns the search and each band's reference (TX codes). TX keeps playing (the caller
-    captures next).
+    captures next). Before the radio is touched, each band's ``lo`` is checked against the LO
+    the radio's ``[clocks]`` routes its TX to, and bands that share an LO must share its
+    frequency (``ValueError``).
     """
+    _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     radio.disable_tx()
     for b in bands:
         radio.set_tx_atten(b.tx, _quantize_atten(b.atten_start_db))
     if retune:
-        for lo in dict.fromkeys(b.lo for b in bands):
-            radio.retune_lo(lo, int(next(b.freq_hz for b in bands if b.lo == lo)))
+        for lo, hz in {b.lo: int(b.freq_hz) for b in bands}.items():
+            radio.retune_lo(lo, hz)
     refs = play_bands(radio, bands, tx_bits=tx_bits)
     gains = [
         _agc(
@@ -876,6 +894,7 @@ def find_multiband_operating_point(
     """
     if any(k < 0 for k in backoffs):
         raise ValueError(f"backoffs must be >= 0, got {list(backoffs)}")
+    _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     if writer is not None:
         writer.require_empty()
     captures: dict[int, list[BandCapture]] = {}

@@ -23,6 +23,7 @@ from adrvtrx.multiband import (
     capture_case,
     case_name,
     find_multiband_operating_point,
+    lock_bands,
     own_slopes,
     play_bands,
     search_multiband_compression,
@@ -631,3 +632,31 @@ def test_capture_case_relevels_a_railed_band_and_records_the_new_gain(monkeypatc
     assert [o for o, _g in levels] == [RxChannel.ORX1, RxChannel.ORX4, RxChannel.ORX1]
     assert caps[0].tries == 2 and caps[0].railed == 0 and caps[0].orx_gain == levels[-1][1]
     assert caps[1].tries == 1 and caps[1].orx_gain == levels[1][1]
+
+
+@pytest.mark.parametrize(
+    "second, match",
+    [
+        ({"tx": TxChannel.TX2, "lo": "LO1", "freq_hz": 1_860_000_000}, "shared by bands"),
+        ({"lo": "LO1", "freq_hz": 1_440_000_000}, "routes TX4 to 'LO2'"),
+        ({"tx": TxChannel.TX2, "lo": "LO2"}, "routes TX2 to 'LO1'"),
+    ],
+)
+@pytest.mark.parametrize("call", ["find", "lock"])
+def test_bands_must_use_the_lo_their_tx_is_routed_to_at_one_frequency(second, match, call):
+    radio = MagicMock(name="radio")
+    radio.config = Config(dll=DllConfig(install_dir=Path("C:/nonexistent")))  # TX4 on LO2
+    bands = [_case_bands()[0], replace(_case_bands()[1], **second)]
+    run = find_multiband_operating_point if call == "find" else lock_bands
+    with pytest.raises(ValueError, match=match):
+        run(radio, bands, tx_bits=12, rx_bits=12, fs=10e6)
+    assert radio.mock_calls == []
+
+
+def test_two_bands_on_one_lo_at_one_frequency_are_fine():
+    radio = _case_radio()
+    tx2 = BandSpec(TxChannel.TX2, RxChannel.ORX2, "LO1", 1_440_000_000, 2.0, _signal(3))
+    bands = [_case_bands()[0], tx2]
+    multiband._check_los(bands, radio.config.clocks)  # TX1 and TX2 share LO1
+    play_bands(radio, bands, tx_bits=12)
+    assert radio.board_model.state["tx_mask"] == int(TxChannel.TX1) | int(TxChannel.TX2)
