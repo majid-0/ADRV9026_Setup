@@ -192,3 +192,20 @@ def test_tx_iq_image():
     xq = board.waves["TX1"]
     coef = np.linalg.lstsq(np.c_[xq, np.conj(xq)], y, rcond=None)[0]
     assert 20 * np.log10(abs(coef[1] / coef[0])) == pytest.approx(-20.0, abs=0.5)
+
+
+def test_one_snapshot_computes_each_shared_pa_once(monkeypatch):
+    radio = _radio(SHARED)
+    assert radio.board_model._snapshot_start is None  # set up before any capture
+    _play(radio, 14.0, 15.0)
+    radio.set_rx_gain(ORX1, 205)
+    radio.set_rx_gain(ORX4, 205)
+    pa = radio.board_model.pa
+    calls = []
+    real = pa.shared_outputs
+    monkeypatch.setattr(pa, "shared_outputs", lambda *a, **k: calls.append(1) or real(*a, **k))
+    joint = capture(radio, int(ORX1) | int(ORX4), 2 * N / 10e3, bits=12)
+    assert len(calls) == 1  # both ORx of the snapshot see one computation of the PA
+    assert all(np.abs(joint.channels[o].iq).max() > 100 for o in (ORX1, ORX4))
+    capture(radio, int(ORX1) | int(ORX4), 2 * N / 10e3, bits=12)
+    assert len(calls) == 2  # the next snapshot computes it again (attenuation may have moved)

@@ -400,6 +400,10 @@ class FakeBoard:
         self.post_init: Any = None
         self.profile_loaded: str | None = None  # the last ConfigFileLoad(path)
         self.calls: deque[str] = deque(maxlen=10_000)  # recent DLL ops, newest last
+        # One PerformRx is one snapshot: every channel starts at the same point of the loop,
+        # and each PA (a shared group) is computed once for all the ORx that see it.
+        self._snapshot_start: int | None = None
+        self._snapshot_pa: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
         self.state: dict[str, Any] = {
             "programmed": False,
             "rx_mask": 0,
@@ -605,9 +609,7 @@ class FakeBoard:
         n = int(round(float(capture_time_ms) * 1e-3 * self.rate_hz))
         order = returned_channel_order(self.config.channels.rx_init_mask)
         data = [self._noise(n) for _ in order]
-        self._snapshot_start = (
-            None  # one snapshot: every channel starts at the same point of the loop
-        )
+        self._snapshot_start, self._snapshot_pa = None, {}  # a new snapshot
         for orx in (RxChannel.ORX1, RxChannel.ORX2, RxChannel.ORX3, RxChannel.ORX4):
             if not self.state["rx_mask"] & int(orx):
                 continue
@@ -664,13 +666,16 @@ class FakeBoard:
         return self.pa_outputs(tx).get(tx.name)
 
     def _loopback(self, tx: TxChannel, orx: RxChannel, n: int) -> np.ndarray:
-        outs = self.pa_outputs(tx)
+        group = tuple(self.pa.group_of(tx.name))
+        outs = self._snapshot_pa.get(group)
+        if outs is None or tx.name not in outs:  # once per snapshot for the PA of the group
+            outs = self._snapshot_pa[group] = self.pa_outputs(tx)
         pa = outs.get(tx.name)
         if pa is None:
             return np.zeros(n, dtype=np.complex128)
         scale = self.pa.orx_level * _full_scale(self.rx_bits)
         scale *= 10 ** ((self.state["rx_gain"][orx.name] - 210) * 0.5 / 20.0)
-        if getattr(self, "_snapshot_start", None) is None:  # PerformTx loads equal-length buffers
+        if self._snapshot_start is None:  # PerformTx loads equal-length buffers
             self._snapshot_start = int(self.rng.integers(len(pa)))
         start = self._snapshot_start
         idx = (start + np.arange(n)) % len(pa)
