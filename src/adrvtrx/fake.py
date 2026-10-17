@@ -40,6 +40,21 @@ The PA model (:class:`PaModel`, on one period of the looping waveform, circular)
   the number in ``drift_file`` (read at every capture: drift on demand).
 * ``noise_codes`` (ORx noise per I and Q) and ``seed`` make it deterministic.
 
+Several TX into one PA (dual band): ``shared = [["TX1", "TX4"]]``. Each TX of a group
+gets its own ``w`` (its own attenuation, LO, drive and filters), and the other
+members' average power uses up its headroom: band b compresses against
+``sat_b / sqrt(1 + coupling * sum mean(|w_other|**2) / sat_b**2)``, so lowering one
+band's attenuation compresses the other band at its peaks while its small-signal
+gain stays (the gain-compression lock sees it). ``coupling`` sets the strength (with
+a 4 dB lock, about 0.1 dB of compression per dB of the other band at 1, 0.3 at 4,
+0.45 at 8). Only TX that are enabled feed the PA. Each ORx sees its own band; with
+``other_in_window`` it also sees the other members' outputs, shifted by their LO
+offset, when that offset is inside the ORx window (closely spaced bands). ``tx_skew_samples``
+delays a TX before the PA (``{"TX4": 2}``), and ``tx_image_db`` adds the TX IQ
+image ``10**(tx_image_db/20) * conj(x)`` before the drive. ``bands`` holds
+per-TX overrides of any other parameter (``{"TX4": {"smoothness": 1.2}}``), as a
+fitted preset needs.
+
 The default ``PaModel()`` is the simple memoryless Rapp (``drive = 6``, ``p = 2``,
 no memory, no frequency dependence, no drift). ``PaModel.rich()`` is a PA with
 memory whose gain-compression lock moves with frequency. Select it with
@@ -63,7 +78,7 @@ import sys
 import time
 import zlib
 from collections import deque
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -181,6 +196,31 @@ class PaModel:
     drift_step_after_s: float = 0.0
     drift_file: str = ""
     drift_sat_fraction: float = 0.5
+    shared: list[list[str]] = field(default_factory=list)  # TX groups that drive one PA
+    coupling: float = 1.0  # how much the other members' mean power cuts a band's headroom
+    other_in_window: bool = False  # ORx also sees the other members when inside its window
+    tx_skew_samples: dict[str, int] = field(default_factory=dict)  # TX name -> delay before the PA
+    tx_image_db: float = -300.0  # TX IQ image (conj(x)) relative to x; -300 = none
+    bands: dict[str, dict[str, Any]] = field(default_factory=dict)  # TX name -> overrides
+
+    def __post_init__(self) -> None:
+        known = {f.name for f in fields(self)} - {"bands", "shared"}
+        for tx, overrides in self.bands.items():
+            unknown = sorted(set(overrides) - known)
+            if unknown:
+                raise ValueError(f"unknown fake PA parameter(s) {unknown} for {tx}")
+        for group in self.shared:
+            if len(group) != len(set(group)) or any(tx not in _TX_NAMES for tx in group):
+                raise ValueError(f"shared PA group {group}: distinct names among {_TX_NAMES}")
+
+    def for_tx(self, tx: str) -> PaModel:
+        """This model with ``bands[tx]``'s overrides (itself when there are none)."""
+        overrides = self.bands.get(tx)
+        return replace(self, bands={}, **overrides) if overrides else self
+
+    def group_of(self, tx: str) -> list[str]:
+        """The TX names sharing ``tx``'s PA (just ``[tx]`` when it has its own)."""
+        return next((list(g) for g in self.shared if tx in g), [tx])
 
     @classmethod
     def rich(cls, **overrides: Any) -> PaModel:
@@ -191,7 +231,10 @@ class PaModel:
 
     @classmethod
     def from_spec(cls, spec) -> PaModel:
-        """``None`` / ``""`` / ``"simple"``, ``"rich"``, a dict, or a ``.json`` / ``.toml`` file."""
+        """``None`` / ``""`` / ``"simple"``, ``"rich"``, a dict, or a ``.json`` / ``.toml`` file.
+
+        Keys starting with ``_`` are comments (JSON has none), e.g. ``"_about"``.
+        """
         if isinstance(spec, PaModel):
             return spec
         if spec is None or str(spec).strip() in ("", "simple"):
@@ -210,6 +253,7 @@ class PaModel:
                 params = tomllib.loads(path.read_text())
             else:
                 params = json.loads(path.read_text())
+        params = {k: v for k, v in params.items() if not str(k).startswith("_")}
         preset = params.pop("preset", "simple")
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(params) - known)
@@ -229,10 +273,10 @@ class PaModel:
                 pass
         return drift
 
-    def output(
-        self, x_norm: np.ndarray, atten_db: float, lo_hz: float, drift_db: float = 0.0
-    ) -> np.ndarray:
-        """PA output for one period of ``x_norm`` (TX codes / full scale), delayed."""
+    def _front(
+        self, x_norm: np.ndarray, atten_db: float, lo_hz: float, drift_db: float, tx: str = ""
+    ) -> tuple[np.ndarray, float, float]:
+        """PA input ``w`` (drive, IQ image, skew, pre-filter), saturation and memory scale."""
         df = (float(lo_hz) - self.f0_hz) / 1e9 if lo_hz else 0.0
         gain_db = (
             self.gain_db
@@ -241,23 +285,59 @@ class PaModel:
             + drift_db
         )
         sat_db = self.sat_db + self.sat_slope_db_per_ghz * df + self.drift_sat_fraction * drift_db
-        sat = 10 ** (sat_db / 20.0)
         mem = 1.0 + self.memory_slope_per_ghz * df
-
-        def scaled(taps):
-            return [taps[0]] + [t * mem for t in taps[1:]] if taps else [1.0]
-
+        x = np.asarray(x_norm, dtype=np.complex128)
+        if self.tx_image_db > -300.0:
+            x = x + 10 ** (self.tx_image_db / 20.0) * np.conj(x)
+        skew = int(self.tx_skew_samples.get(tx, 0))
+        if skew:
+            x = np.roll(x, skew)
         gain = self.drive * 10 ** ((gain_db - atten_db) / 20.0)
-        w = _circular_fir(np.asarray(x_norm, dtype=np.complex128) * gain, scaled(self.pre_taps))
+        w = _circular_fir(x * gain, self._scaled(self.pre_taps, mem))
+        return w, 10 ** (sat_db / 20.0), mem
+
+    @staticmethod
+    def _scaled(taps, mem: float) -> list[float]:
+        return [taps[0]] + [t * mem for t in taps[1:]] if taps else [1.0]
+
+    def _back(self, w: np.ndarray, drive_power: np.ndarray, sat: float, mem: float) -> np.ndarray:
+        """Compression on ``drive_power`` (Rapp), AM/PM, memory, post-filter and delay."""
         p = self.smoothness
-        g = w / (1.0 + (np.abs(w) / sat) ** (2 * p)) ** (1.0 / (2 * p))
+        g = w / (1.0 + (drive_power / sat**2) ** p) ** (1.0 / (2 * p))
         if self.am_pm_deg:
             g = g * np.exp(1j * np.deg2rad(self.am_pm_deg) * np.abs(g / sat) ** 2)
         if self.nl_memory:
             env = np.abs(g / sat) ** 2
             g = g + g * sum(b * mem * np.roll(env, m) for m, b in enumerate(self.nl_memory, 1))
-        y = _circular_fir(g, scaled(self.post_taps))
+        y = _circular_fir(g, self._scaled(self.post_taps, mem))
         return np.roll(y, int(self.delay_samples))
+
+    def output(
+        self, x_norm: np.ndarray, atten_db: float, lo_hz: float, drift_db: float = 0.0, tx: str = ""
+    ) -> np.ndarray:
+        """PA output for one period of ``x_norm`` (TX codes / full scale), delayed."""
+        model = self.for_tx(tx) if tx else self
+        w, sat, mem = model._front(x_norm, atten_db, lo_hz, drift_db, tx)
+        return model._back(w, np.abs(w) ** 2, sat, mem)
+
+    def shared_outputs(
+        self, inputs: dict[str, tuple[np.ndarray, float, float]], drift_db: float = 0.0
+    ) -> dict[str, np.ndarray]:
+        """Outputs of TX that drive one PA: ``{tx: (x_norm, atten_db, lo_hz)}`` -> ``{tx: y}``.
+
+        The waveforms must have the same length (one ``PerformTx`` loads them all).
+        """
+        fronts = {}
+        for tx, (x_norm, atten_db, lo_hz) in inputs.items():
+            model = self.for_tx(tx)
+            fronts[tx] = (model, *model._front(x_norm, atten_db, lo_hz, drift_db, tx))
+        mean_power = {tx: float(np.mean(np.abs(w) ** 2)) for tx, (_m, w, _s, _k) in fronts.items()}
+        out = {}
+        for tx, (model, w, sat, mem) in fronts.items():
+            others = sum(pw for o, pw in mean_power.items() if o != tx)
+            headroom = sat / np.sqrt(1.0 + model.coupling * others / sat**2)
+            out[tx] = model._back(w, np.abs(w) ** 2, headroom, mem)
+        return out
 
 
 #: Parameters of :meth:`PaModel.rich`.
@@ -284,12 +364,12 @@ def _env_delays() -> dict[str, float]:
     return {str(k): float(v) for k, v in json.loads(raw).items()} if raw else {}
 
 
-def _profile_numbers(config: Config) -> tuple[float, int, int]:
-    """ORx rate and TX / Rx bits from the config's profile, or the fake defaults."""
+def _profile_numbers(config: Config, path: str | None = None) -> tuple[float, int, int]:
+    """ORx rate and TX / Rx bits from ``path`` (default: the config's profile), or defaults."""
     try:
         from .profile import read_profile
 
-        info = read_profile(config.profile_path)
+        info = read_profile(config.profile_path if path is None else path)
         return float(info.orx_rate_hz), int(info.tx_bits), int(info.rx_bits)
     except Exception:  # noqa: BLE001 - no profile on this machine: use defaults
         return DEFAULT_RATE_HZ, DEFAULT_BITS, DEFAULT_BITS
@@ -318,7 +398,12 @@ class FakeBoard:
         self.connected = False  # this process's socket, never persisted
         self.waves: dict[str, np.ndarray] = {}  # TX name -> complex codes (playback RAM)
         self.post_init: Any = None
+        self.profile_loaded: str | None = None  # the last ConfigFileLoad(path)
         self.calls: deque[str] = deque(maxlen=10_000)  # recent DLL ops, newest last
+        # One PerformRx is one snapshot: every channel starts at the same point of the loop,
+        # and each PA (a shared group) is computed once for all the ORx that see it.
+        self._snapshot_start: int | None = None
+        self._snapshot_pa: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
         self.state: dict[str, Any] = {
             "programmed": False,
             "rx_mask": 0,
@@ -402,6 +487,8 @@ class FakeBoard:
 
     def config_file_load(self, path: str | None = None) -> None:
         self._require_connected()
+        if path is not None:
+            self.profile_loaded = path  # what Program will run (its rates and bits)
         self._event("ConfigFileLoad", path=path)
 
     def init_struct_get(self) -> _Struct:
@@ -416,6 +503,10 @@ class FakeBoard:
     def program(self) -> None:
         self._require_connected()
         self._delay("Program")
+        # program(profile=...) may load another profile: rates and bits follow the loaded one
+        self.rate_hz, self.tx_bits, self.rx_bits = _profile_numbers(
+            self.config, self.profile_loaded
+        )
         rc = getattr(self.post_init, "radioCtrlInit", None)
         for name, attr in (("LO1", "lo1PllFreq_Hz"), ("LO2", "lo2PllFreq_Hz")):
             value = getattr(rc, attr, None) if rc is not None else None
@@ -518,6 +609,7 @@ class FakeBoard:
         n = int(round(float(capture_time_ms) * 1e-3 * self.rate_hz))
         order = returned_channel_order(self.config.channels.rx_init_mask)
         data = [self._noise(n) for _ in order]
+        self._snapshot_start, self._snapshot_pa = None, {}  # a new snapshot
         for orx in (RxChannel.ORX1, RxChannel.ORX2, RxChannel.ORX3, RxChannel.ORX4):
             if not self.state["rx_mask"] & int(orx):
                 continue
@@ -542,25 +634,59 @@ class FakeBoard:
         """The LO frequency ``tx`` uses (``[clocks]`` tx12_lo / tx34_lo)."""
         return int(self.state["lo_hz"].get(lo_for_tx(self.config.clocks, tx), 0))
 
-    def pa_output(self, tx: TxChannel) -> np.ndarray | None:
-        """Noise-free PA output for one period of ``tx``'s waveform (saturation = 1)."""
+    def _pa_input(self, name: str):
+        """``(x_norm, atten_db, lo_hz)`` of an enabled TX with a waveform, else None."""
+        wave = self.waves.get(name)
+        tx = TxChannel[name]
+        if wave is None or len(wave) == 0 or not self.state["tx_mask"] & int(tx):
+            return None
+        atten_db = self.state["tx_atten_mdb"][name] / 1000.0
+        return wave / _full_scale(self.tx_bits), atten_db, self.tx_lo_hz(tx)
+
+    def pa_outputs(self, tx: TxChannel) -> dict[str, np.ndarray]:
+        """Noise-free PA output (saturation = 1) of ``tx`` and of the enabled TX sharing its PA.
+
+        ``tx`` itself is included whether or not it is enabled (its waveform must be loaded).
+        """
+        drift = self.pa.drift_db(self.clock() - self.created)
+        group = self.pa.group_of(tx.name)
+        inputs = {n: inp for n in group if n != tx.name and (inp := self._pa_input(n)) is not None}
         wave = self.waves.get(tx.name)
         if wave is None or len(wave) == 0:
-            return None
+            return {}
+        own = wave / _full_scale(self.tx_bits)
         atten_db = self.state["tx_atten_mdb"][tx.name] / 1000.0
-        drift = self.pa.drift_db(self.clock() - self.created)
-        x_norm = wave / _full_scale(self.tx_bits)
-        return self.pa.output(x_norm, atten_db, self.tx_lo_hz(tx), drift)
+        if not inputs:
+            return {tx.name: self.pa.output(own, atten_db, self.tx_lo_hz(tx), drift, tx.name)}
+        inputs[tx.name] = (own, atten_db, self.tx_lo_hz(tx))
+        return self.pa.shared_outputs(inputs, drift)
+
+    def pa_output(self, tx: TxChannel) -> np.ndarray | None:
+        """Noise-free PA output for one period of ``tx``'s waveform (saturation = 1)."""
+        return self.pa_outputs(tx).get(tx.name)
 
     def _loopback(self, tx: TxChannel, orx: RxChannel, n: int) -> np.ndarray:
-        pa = self.pa_output(tx)
+        group = tuple(self.pa.group_of(tx.name))
+        outs = self._snapshot_pa.get(group)
+        if outs is None or tx.name not in outs:  # once per snapshot for the PA of the group
+            outs = self._snapshot_pa[group] = self.pa_outputs(tx)
+        pa = outs.get(tx.name)
         if pa is None:
             return np.zeros(n, dtype=np.complex128)
-        gain_db = (self.state["rx_gain"][orx.name] - 210) * 0.5
-        y = pa * self.pa.orx_level * _full_scale(self.rx_bits)
-        y = y * 10 ** (gain_db / 20.0)
-        start = int(self.rng.integers(len(y)))
-        return y[(start + np.arange(n)) % len(y)]
+        scale = self.pa.orx_level * _full_scale(self.rx_bits)
+        scale *= 10 ** ((self.state["rx_gain"][orx.name] - 210) * 0.5 / 20.0)
+        if self._snapshot_start is None:  # PerformTx loads equal-length buffers
+            self._snapshot_start = int(self.rng.integers(len(pa)))
+        start = self._snapshot_start
+        idx = (start + np.arange(n)) % len(pa)
+        y = pa[idx]
+        if self.pa.other_in_window:
+            t = (start + np.arange(n)) / self.rate_hz
+            for name, other in outs.items():
+                offset = self.tx_lo_hz(TxChannel[name]) - self.tx_lo_hz(tx)
+                if name != tx.name and abs(offset) < self.rate_hz / 2:
+                    y = y + other[idx] * np.exp(2j * np.pi * offset * t)
+        return y * scale
 
 
 class FakeBridge:

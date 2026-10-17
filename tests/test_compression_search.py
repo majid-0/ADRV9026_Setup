@@ -304,3 +304,14 @@ def test_find_compression_point_rejects_unknown_lock():
             atten_min_db=5.0,
             lock_on="rms",
         )
+
+
+def test_the_fine_step_and_relevel_rules_shared_with_the_multi_band_search():
+    from adrvtrx.compression import fine_step, relevel_index
+
+    assert fine_step(0.65, 0.2, 2.5) == pytest.approx(0.6)  # largest multiple not above
+    assert fine_step(0.05, 0.2, 2.5) == 0.2 and fine_step(-9.0, 0.2, 2.5) == 2.5
+    kw = {"target_dbfs": -1.0, "band_hi": -0.7, "db_per_index": 0.5}
+    assert relevel_index(-0.9, 3, **kw) == -1  # railed, peak still in band
+    assert relevel_index(0.0, 3, **kw) == -2  # railed and hot: its distance
+    assert relevel_index(-0.4, 0, **kw) == -1 and relevel_index(-4.0, 0, **kw) == 6

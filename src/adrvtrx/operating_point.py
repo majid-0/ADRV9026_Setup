@@ -26,9 +26,9 @@ from pathlib import Path
 
 import numpy as np
 
-from ._enums import RxChannel, TxChannel
-from .capture import AgcResult, autolevel_capture
-from .compression import CompressionResult, _quantize_atten, find_compression_point
+from ._enums import RxChannel, TxChannel, channel_name
+from .capture import AgcResult, autolevel_for
+from .compression import CompressionResult, find_compression_point, quantize_atten
 from .conditions import (
     ConditionLog,
     OperatingCondition,
@@ -117,14 +117,14 @@ def find_operating_point(
     if backoff_db < 0:
         raise ValueError(f"backoff_db must be >= 0, got {backoff_db}")
     name = condition_name(tx, backoff_db, freq_hz, bw_mhz)
-    tx_name = tx.name if hasattr(tx, "name") else str(tx)
+    tx_name = channel_name(tx)
     in_name = f"{Path(signal_name).stem}_in.txt"
     out_name = f"{name}_out.txt"
 
     agc = None
     try:
         radio.disable_tx()
-        radio.set_tx_atten(tx, _quantize_atten(start_atten_db))
+        radio.set_tx_atten(tx, quantize_atten(start_atten_db))
         radio.retune_lo(lo, int(freq_hz))
         transmit_bands(radio, {tx: signal}, tx_bits)
         search = find_compression_point(
@@ -154,17 +154,18 @@ def find_operating_point(
         atten = locked
         gain = search.final_orx_gain
         if backoff_db > 0:
-            atten = _quantize_atten(min(locked + backoff_db, MAX_TX_ATTEN_DB))
+            atten = quantize_atten(min(locked + backoff_db, MAX_TX_ATTEN_DB))
             radio.set_tx_atten(tx, atten)
-            agc = autolevel_capture(
+            agc = autolevel_for(
                 radio,
                 orx,
+                ref,
                 bits=rx_bits,
-                orx_rate_hz=fs,
+                fs=fs,
+                oversample=oversample,
                 target_dbfs=target_dbfs,
                 tol_up_db=tol_up_db,
                 tol_down_db=tol_down_db,
-                verify_capture_ms=oversample * len(ref) / float(fs) * 1e3,
             )
             gain = agc.final_gain_index
         point = capture_point(

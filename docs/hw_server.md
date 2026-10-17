@@ -65,7 +65,14 @@ one experiment.
   arrays to `perform_tx`; `Radio.perform_tx` converts them to .NET arrays
   itself. `perform_rx` results come back as a list of `int32` numpy arrays
   `[ch0_I, ch0_Q, ...]`, the same layout `capture.extract_channels` already
-  reads.
+  reads. `perform_rx(..., keep=[positions])` (what `capture.capture` sends)
+  ships only those arrays; the others come back empty in their places, so the
+  layout and indexing do not change. One ORx of a 1 ms capture at 491.52 MSPS
+  is 3.9 MB instead of the 39 MB of all 20 arrays, and the server converts 2
+  .NET arrays instead of 20. `keep` travels beside the call, not as an argument
+  of it: a server older than this ignores it and ships every array (the
+  client still reads the right ones), and an older client sends none and gets
+  every array. Restart the server to get the smaller captures.
 
 ## 3. Client API
 
@@ -102,6 +109,9 @@ with hardware("TX1 sweep") as radio:          # waits in the queue for the board
   `_is_connected()`, so `experiment.verify_status` works on both.
 - `programming` and `session_info()`: the board's programming identity
   (§4.2). Record it with every measurement.
+- `program(profile=...)` reprograms the board with another profile (another
+  sample rate, §4.2); afterwards `config` (so `read_profile(radio.config.profile_path)`)
+  and `programming` describe the new profile.
 - `loaded_signals()`: what each TX channel's playback RAM holds (§4.1).
 - `release()` (same as leaving the `with` block) ends the job. For a notebook
   that keeps the board across cells: `radio = hardware("nb")` … `radio.release()`.
@@ -110,8 +120,8 @@ with hardware("TX1 sweep") as radio:          # waits in the queue for the board
   `connect()` is a no-op while the server is connected.
 
 `transmit`, `capture`, `compression`, `replay`, `operating_point`,
-`linearize`, `sweep`, `sweep_plan` and `bands` take a `RemoteRadio` wherever
-they take a `Radio`. The one change they needed: `capture.capture` used
+`linearize`, `sweep`, `sweep_plan`, `bands` and `multiband` take a `RemoteRadio`
+wherever they take a `Radio`. The one change they needed: `capture.capture` used
 `radio._en_tx` to keep TX enabled while it set the Rx enables; it now calls the
 new `Radio.set_rx_enable(mask)`, which sets the Rx mask and keeps TX.
 
@@ -188,6 +198,19 @@ a start with `--no-program` keeps the last record. It is in `status`, in
 `RemoteRadio.programming` (at acquire) and `RemoteRadio.session_info()`
 (live). A job records it with its measurements; a different `program_id`
 between two jobs means the calibrations ran again.
+
+**Profile.** `program(profile=...)` (a file name under the install's profiles
+directory, or an absolute path) makes that profile the server's: the
+programming identity records it, `status` shows it, and the next lease's
+`config` carries it. Programming clears TX RAM (§4.1). A watchdog restart
+programs with the config file's profile again; the new `program_id` and
+`profile` show it, so a client that needs another profile programs it again.
+The profile becomes the server's only once programming succeeded: a missing
+file is refused before the board is touched, and a failed load or `Program()`
+keeps the previous profile name and programming identity (the client's
+`config` and `programming` are re-read from the server before the error
+raises). After a failed `Program()` the board's state is unknown: program it
+again.
 
 ## 5. Limits
 
@@ -470,7 +493,7 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | Test | What it checks |
 |---|---|
 | forwarding | `RemoteRadio` has exactly the public `Radio` methods; each one returns what an in-process `FakeRadio` returns |
-| numpy boundary | `perform_tx` numpy → .NET conversion inside `Radio`; `perform_rx` comes back as `int32` arrays |
+| numpy boundary | `perform_tx` numpy → .NET conversion inside `Radio`; `perform_rx` comes back as `int32` arrays; with `keep` only those arrays carry data; an older server or client still works |
 | queue | FIFO order, `wait=False`, queue timeout, waiting client disconnects |
 | client killed | a client process killed with TX on → `safe_state`, next job proceeds |
 | heartbeat | silent client with TX on → revoked after the timeout |
@@ -482,5 +505,5 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | programming identity | `program_count` / `program_id` change on a client re-program, a new server and a watchdog restart |
 | TX RAM | per-channel record, survives release and safe_state; identical reload skipped (only re-enables TX), other signal / mode / channel reloads; cleared by program and restart (in-process and watchdog); switch off; fake load time grows with length |
 | fake PA | default = simple Rapp; rich model: gain lock converges at two LOs with different attenuations, GMP fit beats no DPD and needs memory, drift (file, rate, step), seed, parameter files |
-| existing modules | transmit, capture, compression, replay, operating point, linearize and sweep give the same results on a `RemoteRadio` as in-process |
+| existing modules | transmit, capture, compression, replay, operating point, linearize, sweep and a multi-band case give the same results on a `RemoteRadio` as in-process |
 | replay CLI | end to end on the fake: summary, per-label CSVs, missing files reported before the board is taken |

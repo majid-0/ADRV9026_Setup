@@ -125,6 +125,34 @@ class _DotNetLike:
         raise TypeError("no len")
 
 
+def test_capture_arrays_converts_only_the_kept_positions():
+    raw = _DotNetLike([[1, 2], [3, 4], [5, 6], [7, 8]])
+    arrays = capture_arrays(raw, keep=[2, 3])
+    assert [len(a) for a in arrays] == [0, 0, 2, 2] and all(a.dtype == np.int32 for a in arrays)
+    np.testing.assert_array_equal(arrays[3], [7, 8])
+
+
+def test_extract_channels_takes_numpy_arrays_as_they_are():
+    order = returned_channel_order(0x3FF)
+    raw = [np.full(4, k, dtype=np.int32) for k in range(20)]
+    out = extract_channels(raw, order, [RxChannel.ORX1], 12)[RxChannel.ORX1]
+    assert out.i is raw[8] and out.q is raw[9]  # no element-by-element copy
+    listed = extract_channels([list(a) for a in raw], order, [RxChannel.ORX1], 12)
+    np.testing.assert_array_equal(listed[RxChannel.ORX1].i, raw[8])  # a .NET-like sequence
+
+
+def test_build_tx_data_hands_a_numpy_bridge_the_arrays_and_others_lists(fake_bridge):
+    from adrvtrx.client import NumpyBridge
+
+    iq = prepare_channel_iq(0.5 * np.exp(2j * np.pi * 0.01 * np.arange(64)), 12)
+    data, mask = build_tx_data(NumpyBridge(), {TxChannel.TX2: iq})
+    assert mask == int(TxChannel.TX2) and len(data) == 8
+    assert all(isinstance(a, np.ndarray) and a.dtype == np.int32 for a in data)
+    np.testing.assert_array_equal(data[2], iq[0])
+    listed, _mask = build_tx_data(fake_bridge, {TxChannel.TX2: iq})
+    assert all(type(v) is int for v in listed[2]) and listed[2] == iq[0].tolist()
+
+
 def test_capture_arrays_gives_int32_numpy_in_the_same_layout():
     raw = _DotNetLike([[1, 2, 3], [4, 5, 6], [-7, 8, 9], [0, 0, 1]])
     arrays = capture_arrays(raw)
@@ -134,3 +162,36 @@ def test_capture_arrays_gives_int32_numpy_in_the_same_layout():
     order = [RxChannel.RX1, RxChannel.ORX1]
     out = extract_channels(arrays, order, [RxChannel.ORX1], 12)
     np.testing.assert_array_equal(out[RxChannel.ORX1].i, [-7, 8, 9])
+
+
+def test_a_perform_rx_replaced_on_one_radio_is_called_as_it_is_written():
+    """``keep`` goes only to a ``perform_rx`` that takes it, judged on the instance (a monkeypatched
+    method included), not on the radio's class."""
+    from pathlib import Path
+
+    from adrvtrx.capture import capture
+    from adrvtrx.config import Config, DllConfig
+    from adrvtrx.fake import FakeRadio
+    from sim_bench import SimRadio
+
+    radio = FakeRadio(Config(dll=DllConfig(install_dir=Path("C:/nonexistent"))), seed=1)
+    radio._safe_hooks_installed = True
+    radio.connect()
+    radio.program()
+    real = radio.perform_rx
+    seen = []
+
+    def plain(channel_mask, capture_time_ms, *, trig=None, timeout_ms=1000):  # no keep
+        seen.append("plain")
+        return real(channel_mask, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
+
+    capture(radio, int(RxChannel.ORX1), 0.01, bits=12)  # the class's own: keep accepted
+    radio.perform_rx = plain
+    out = capture(radio, int(RxChannel.ORX1), 0.01, bits=12).channels[RxChannel.ORX1]
+    assert seen == ["plain"] and len(out.i) == 100
+
+    sim = SimRadio()
+    sim_real = sim.perform_rx
+    sim.perform_rx = lambda *a, **k: (seen.append(sorted(k)), sim_real(*a, **k))[1]
+    capture(sim, int(RxChannel.ORX1), 0.01, bits=12)  # a wrapper passes keep on to the stand-in
+    assert seen[-1] == ["keep", "timeout_ms", "trig"]

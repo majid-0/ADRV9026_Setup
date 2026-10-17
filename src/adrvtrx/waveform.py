@@ -7,7 +7,8 @@ Conventions (decided with the user):
 
 Quantization targets the JESD transport word width ``Np`` read from the loaded
 profile (``jesd204Np``), i.e. full-scale magnitude = ``2**(Np-1) - 1``. For
-StdUseCase102, Np = 16 -> +/-32767. All functions here are pure numpy.
+StdUseCase98 (the default profile), Np = 12 -> +/-2047; for StdUseCase102,
+Np = 16 -> +/-32767. All functions here are pure numpy.
 """
 
 from __future__ import annotations

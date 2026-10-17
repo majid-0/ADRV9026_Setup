@@ -1,7 +1,10 @@
 """Snapshot capture: trigger PerformRx, shape per-channel IQ, report clipping, save.
 
 A capture is one FPGA snapshot taken in a single ``PerformRx`` call, so all channels
-are mutually sample-aligned. Use a ``TXn_SOF`` trigger to align to TX start-of-frame.
+are mutually sample-aligned. The trigger is IMMEDIATE: ``TXn_SOF`` times out on this bench
+(the TX datapath emits no start-of-frame), so a capture is aligned to its reference in
+software (:mod:`adrvtrx.align`, :func:`aligned_capture`). Through the hardware server only
+the arrays of the wanted channels travel (``perform_rx(..., keep=...)``).
 
 Confirmed on hardware (docs/api_notes.md): ``PerformRx`` ignores its mask argument
 and returns the full ``rxInitChannelMask`` set as a flat indexable of already-scaled
@@ -11,12 +14,14 @@ therefore index a wanted channel by its absolute position in that set.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from ._enums import RX_SINGLE, TX_SOF_FOR, RxChannel, RxTrigSource, TxChannel, is_orx
+from .align import align_with_fraction, estimate_and_align
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
 from .waveform import samples_for_duration, save_tab_iq_float
 
@@ -145,17 +150,14 @@ def auto_sof_trigger(channel_mask, tx_to_orx, default=RxTrigSource.IMMEDIATE) ->
     return TX_SOF_FOR[txs[0]] if txs else default
 
 
-def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
-    """Extract ``wanted`` channels from a PerformRx result by absolute position.
+def channel_slots(order, wanted) -> dict:
+    """Readback slot of each ``wanted`` channel: ``{channel: slot}`` (arrays ``2*slot``, ``+1``).
 
-    ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
-    the result holds 2 arrays (I, Q) per entry in ``order``. Main Rx channels sit
-    at their own bit position. ORx is different: the 4 ORx inputs mux into just 2
-    ADCs, so an ORx request resolves to one of the two physical ORx ADC slots
-    (ORx1/ORx2 -> slot 0, ORx3/ORx4 -> slot 1) -- confirmed on the bench and
-    against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
+    Main Rx channels sit at their own bit position; an ORx input resolves to its physical ORx
+    ADC slot (see :func:`extract_channels`). Raises ``ValueError`` for a channel the active
+    ``rxInitChannelMask`` does not return.
     """
-    out: dict[RxChannel, ChannelCapture] = {}
+    slots: dict[RxChannel, int] = {}
     for ch in wanted:
         if is_orx(ch):
             idx = orx_slot_for(ch, order)
@@ -173,8 +175,31 @@ def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
                 f"(returned channels: {[c.name for c in order if c]}). "
                 f"Enable it in config [channels].rx_init_mask."
             )
-        i = np.fromiter(perform_rx_result[2 * idx], dtype=np.int32)
-        q = np.fromiter(perform_rx_result[2 * idx + 1], dtype=np.int32)
+        slots[ch] = idx
+    return slots
+
+
+def _int32(values) -> np.ndarray:
+    """A numpy array (the hardware server's result) as is; a .NET array element by element."""
+    if isinstance(values, np.ndarray):
+        return np.asarray(values, dtype=np.int32)
+    return np.fromiter(values, dtype=np.int32)
+
+
+def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
+    """Extract ``wanted`` channels from a PerformRx result by absolute position.
+
+    ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
+    the result holds 2 arrays (I, Q) per entry in ``order``. Main Rx channels sit
+    at their own bit position. ORx is different: the 4 ORx inputs mux into just 2
+    ADCs, so an ORx request resolves to one of the two physical ORx ADC slots
+    (ORx1/ORx2 -> slot 0, ORx3/ORx4 -> slot 1) -- confirmed on the bench and
+    against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
+    """
+    out: dict[RxChannel, ChannelCapture] = {}
+    for ch, idx in channel_slots(order, wanted).items():
+        i = _int32(perform_rx_result[2 * idx])
+        q = _int32(perform_rx_result[2 * idx + 1])
         out[ch] = ChannelCapture(ch, i, q, bits)
     return out
 
@@ -211,7 +236,16 @@ def capture(
     # Absolute set (preserving TX) so a prior capture's ORx enable can't leak in.
     orx_bits = sum(int(ch) for ch in wanted if is_orx(ch))
     radio.set_rx_enable((rx_init & 0x0F) | orx_bits)
-    raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
+    # Through the hardware server only the wanted arrays travel (``keep``).
+    keep = sorted(
+        p for slot in channel_slots(order, wanted).values() for p in (2 * slot, 2 * slot + 1)
+    )
+    if _takes_keep(radio):
+        raw = radio.perform_rx(
+            rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms, keep=keep
+        )
+    else:  # a radio stand-in without ``keep``
+        raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
 
     # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
     # per channel in rxInitChannelMask. If a profile returns a different set, the
@@ -294,6 +328,7 @@ def autolevel_capture(
     coarse_ms: float = 0.1,
     verify_capture_ms: float | None = None,
     max_iterations: int = 16,
+    start_gain: int | None = None,
 ) -> AgcResult:
     """End-to-end software ORx AGC against live hardware (TX must already be running).
 
@@ -311,6 +346,8 @@ def autolevel_capture(
 
     ``orx_rate_hz`` is the ORx datapath rate (``ProfileInfo.orx_rate_hz``); the caller
     typically derives ``verify_capture_ms`` from it and the waveform length.
+
+    ``start_gain`` skips Stage A and trims from that gain (see :func:`autolevel_orx`).
     """
 
     def set_gain(g: int) -> None:
@@ -328,6 +365,7 @@ def autolevel_capture(
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
         max_iterations=max_iterations,
+        start_gain=start_gain,
     )
     if lr.fatal:
         radio.safe_state()
@@ -376,15 +414,111 @@ def autolevel_capture(
     return result
 
 
-def capture_arrays(raw) -> list[np.ndarray]:
+def reference_capture_ms(ref, fs: float, oversample: int = 2) -> float:
+    """Capture length (ms) for ``oversample`` periods of the reference ``ref`` at ``fs``."""
+    return oversample * len(ref) / float(fs) * 1e3
+
+
+@dataclass
+class AlignedCapture:
+    """One capture of ``oversample`` reference periods, one period aligned to the reference.
+
+    ``raw`` is the capture (``raw.iq`` complex codes is ``iq``), ``clip`` its clip report;
+    ``x_aligned`` / ``y_aligned`` are the reference period and the captured period aligned to it,
+    ``delay_samples`` the delay found.
+    """
+
+    raw: ChannelCapture
+    iq: np.ndarray
+    clip: ClipReport
+    x_aligned: np.ndarray
+    y_aligned: np.ndarray
+    delay_samples: float
+
+
+def aligned_capture(
+    radio,
+    channel: RxChannel,
+    ref,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    fraction: float | None = None,
+) -> AlignedCapture:
+    """Capture ``oversample`` periods of ``ref`` on ``channel``, report clipping, align a period.
+
+    TX must already be playing ``ref`` (TX codes). The alignment is
+    :func:`~adrvtrx.align.estimate_and_align`, or :func:`~adrvtrx.align.align_with_fraction`
+    with ``fraction`` (the path's ``delay % 1``, known from an earlier full alignment). The
+    capture-and-align step of the compression searches and of ``conditions.capture_point``.
+    """
+    ref = np.asarray(ref)
+    out = capture(radio, int(channel), reference_capture_ms(ref, fs, oversample), bits=bits)
+    raw = out.channels[channel]
+    rep = clip_report(raw.i, raw.q, bits)
+    iq = raw.iq
+    if fraction is None:
+        x_al, y_al, delay = estimate_and_align(ref, iq, fs)
+    else:
+        x_al, y_al, delay = align_with_fraction(ref, iq, fraction)
+    return AlignedCapture(raw, iq, rep, x_al, y_al, float(delay))
+
+
+def autolevel_for(
+    radio,
+    channel: RxChannel,
+    ref,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    start_gain: int | None = None,
+) -> AgcResult:
+    """:func:`autolevel_capture` for a capture of ``oversample`` periods of ``ref``: Stage C
+    verifies the gain on exactly the capture the measurement takes. ``fs`` is the ORx rate."""
+    return autolevel_capture(
+        radio,
+        channel,
+        bits=bits,
+        orx_rate_hz=fs,
+        target_dbfs=target_dbfs,
+        tol_up_db=tol_up_db,
+        tol_down_db=tol_down_db,
+        verify_capture_ms=reference_capture_ms(ref, fs, oversample),
+        start_gain=start_gain,
+    )
+
+
+def capture_arrays(raw, keep=None) -> list[np.ndarray]:
     """A PerformRx result as plain ``int32`` numpy arrays ``[ch0_I, ch0_Q, ...]``.
 
     Same layout and indexing as the DLL result, so :func:`extract_channels`
     reads either. Used where the .NET object cannot travel (the hardware server).
+    With ``keep`` (array positions), only those are converted; the others are
+    empty arrays in their places.
     """
     n = _result_len(raw)
     items = raw if n is None else (raw[k] for k in range(n))
-    return [np.fromiter(a, dtype=np.int32) for a in items]
+    if keep is None:
+        return [np.fromiter(a, dtype=np.int32) for a in items]
+    kept = {int(k) for k in keep}
+    empty = np.zeros(0, dtype=np.int32)
+    return [np.fromiter(a, dtype=np.int32) if k in kept else empty for k, a in enumerate(items)]
+
+
+def _takes_keep(radio) -> bool:
+    """Whether this radio's ``perform_rx`` accepts ``keep`` (Radio, RemoteRadio; not every
+    stand-in). Asked of the method itself at every capture (a few microseconds), so a
+    ``perform_rx`` replaced on one instance is judged by its own signature."""
+    try:
+        params = inspect.signature(radio.perform_rx).parameters
+    except (TypeError, ValueError):
+        return False
+    return "keep" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
 
 
 def _result_len(raw) -> int | None:

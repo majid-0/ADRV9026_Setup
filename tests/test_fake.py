@@ -26,6 +26,52 @@ def _radio(**kw) -> FakeRadio:
     return radio
 
 
+DATA = Path(__file__).parent / "data"
+
+
+def test_program_with_a_profile_changes_the_sample_rate_and_clears_tx_ram():
+    radio = _radio()
+    radio.connect()
+    radio.program(profile=str(DATA / "stub_uc98.profile"))
+    board = radio.board_model
+    assert (board.rate_hz, board.tx_bits, board.rx_bits) == (491.52e6, 12, 12)
+    radio.set_tx_atten(TxChannel.TX1, 15.0)
+    transmit_bands(radio, {TxChannel.TX1: 0.5 * np.ones(1024, complex)}, 12)
+    assert "TX1" in board.waves
+
+    radio.program(profile=str(DATA / "stub_uc61.profile"))
+    assert radio.config.profile_path == DATA / "stub_uc61.profile"
+    assert (board.rate_hz, board.tx_bits, board.rx_bits) == (368.64e6, 12, 12)
+    assert not board.waves  # programming clears TX RAM
+    cap = capture(radio, int(RxChannel.ORX1), 1.0, bits=12).channels[RxChannel.ORX1]
+    assert len(cap.i) == 368_640  # 1 ms at the new rate
+
+    radio.program()  # no profile: keeps the current one
+    assert radio.config.profile_path == DATA / "stub_uc61.profile"
+
+
+def test_a_profile_that_fails_to_program_does_not_become_the_configs():
+    radio = _radio()
+    radio.connect()
+    radio.program(profile=str(DATA / "stub_uc98.profile"))
+    board = radio.board_model
+    loads = board.calls.count("ConfigFileLoad")
+
+    with pytest.raises(FileNotFoundError, match="not found"):  # checked before the board
+        radio.program(profile=str(DATA / "no_such.profile"))
+    assert board.calls.count("ConfigFileLoad") == loads
+    assert radio.config.profile_path == DATA / "stub_uc98.profile"
+
+    def program_fails():
+        raise RuntimeError("Program failed")
+
+    radio.board.Program = program_fails  # the load succeeds, programming fails
+    with pytest.raises(RuntimeError, match="Program failed"):
+        radio.program(profile=str(DATA / "stub_uc61.profile"))
+    assert radio.config.profile_path == DATA / "stub_uc98.profile"
+    assert board.rate_hz == 491.52e6
+
+
 def test_program_and_status_run_the_real_radio_code():
     radio = _radio()
     radio.connect()
@@ -38,6 +84,42 @@ def test_program_and_status_run_the_real_radio_code():
     radio.safe_state()
     assert radio.get_tx_atten(TxChannel.TX3) == MAX_TX_ATTEN_DB
     assert radio.rx_tx_enable_get()[1] == 0
+
+
+def test_retune_waits_for_every_pll_and_raises_if_one_stays_unlocked(monkeypatch):
+    radio = _radio()
+    radio.connect()
+    radio.program()
+    assert radio.retune_lo("LO2", 1_860_000_000) == 0xF
+    assert radio.get_lo("LO2") == 1_860_000_000
+
+    reads = iter([0x0, 0x9, 0xF])  # unlocked, partly locked (the old check passed here), locked
+    monkeypatch.setattr(radio, "pll_lock_status", lambda: next(reads))
+    assert radio.retune_lo("LO1", 1_440_000_000, poll_interval_s=0) == 0xF
+
+    monkeypatch.setattr(radio, "pll_lock_status", lambda: 0xB)  # one PLL never locks
+    with pytest.raises(RuntimeError, match="not all locked"):
+        radio.retune_lo("LO1", 1_440_000_000, settle_poll=5, poll_interval_s=0)
+
+
+def test_run_bands_captures_with_the_immediate_trigger_by_default(tmp_path):
+    from adrvtrx._enums import RxTrigSource
+    from adrvtrx.bands import make_bands, run_bands
+
+    radio = _radio()
+    radio.connect()
+    radio.program()
+    radio.set_tx_atten(TxChannel.TX1, 15.0)
+    x = 0.5 * np.exp(2j * np.pi * 0.01 * np.arange(4096))
+    run = run_bands(
+        radio,
+        make_bands([("b1", TxChannel.TX1, x, RxChannel.ORX1, 0.05)]),
+        tx_bits=12,
+        rx_bits=12,
+        out_dir=tmp_path,
+    )
+    assert run.captures.trig == RxTrigSource.IMMEDIATE
+    assert [p.name for p in run.files] == ["b1.txt"]
 
 
 def test_tx_atten_is_rejected_before_programming():

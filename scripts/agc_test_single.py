@@ -7,8 +7,9 @@ ORx gain + achieved level per point, and suggests a static gain for the signal.
     conda run -n myenv python scripts/agc_test_single.py
 
 The sweep is the Cartesian product of TX_ATTENS_DB x FREQS_HZ. Leave TX_ATTENS_DB
-a single value to sweep frequency only; LO2 drives both TX and ORx (link-sharing),
-so retuning it moves the whole loopback together.
+a single value to sweep frequency only. The TX's own LO (``lo_for_tx`` under the
+config's clocks: TX1/TX2 on LO1, TX3/TX4 on LO2) drives both TX and ORx
+(link-sharing), so retuning it moves the whole loopback together.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import statistics
 
 from adrvtrx import RxChannel, TxChannel
 from adrvtrx.capture import capture
-from adrvtrx.config import load_config
+from adrvtrx.config import load_config, lo_for_tx
 from adrvtrx.experiment import session
 from adrvtrx.gain import ORX_GAIN_MAX, ORX_GAIN_MIN, autolevel_orx, clip_report
 from adrvtrx.sweep import attenuation_axis, frequency_axis, run_sweep
@@ -33,7 +34,7 @@ SIGNAL_PATH = "C:/Users/ohammi/OneDrive - aus.edu/DualBand/input_100/Signal1.txt
 
 # Test grid -------------------------------------------------------------------
 TX_ATTENS_DB = [15.0]  # TX level(s); dB, 0..41.95
-FREQS_HZ = [0.90e9, 1.00e9, 1.10e9]  # LO2 (TX+ORx) frequencies
+FREQS_HZ = [0.90e9, 1.00e9, 1.10e9]  # the TX's LO (TX+ORx) frequencies
 
 # ORx AGC ---------------------------------------------------------------------
 ORX_TARGET_DBFS = -1.0  # aim point for captured peak
@@ -46,6 +47,7 @@ CAPTURE_MS = 0.1
 def main() -> None:
     cfg = load_config()
     cfg.profile_name = PROFILE
+    lo = lo_for_tx(cfg.clocks, TX_CHANNEL)
     with session(cfg) as (radio, info):
         wave = load_tab_iq(SIGNAL_PATH)
         print(f"Profile {cfg.profile_path.name}")
@@ -55,7 +57,7 @@ def main() -> None:
         )
         print(f"  Signal {SIGNAL_PATH} ({len(wave)} samples)")
         print(
-            f"  {TX_CHANNEL.name}->{ORX_CHANNEL.name} | target "
+            f"  {TX_CHANNEL.name}->{ORX_CHANNEL.name} on {lo} | target "
             f"{ORX_TARGET_DBFS:+.1f} (+{ORX_TOL_UP_DB:.1f}/-{ORX_TOL_DOWN_DB:.1f}) dBFS | "
             f"gain window {ORX_GAIN_MIN}-{ORX_GAIN_MAX}"
         )
@@ -92,7 +94,7 @@ def main() -> None:
 
         axes = [
             attenuation_axis(radio, TX_CHANNEL, TX_ATTENS_DB, name="atten_db"),
-            frequency_axis(radio, "LO2", [int(f) for f in FREQS_HZ], name="lo2_hz"),
+            frequency_axis(radio, lo, [int(f) for f in FREQS_HZ], name="lo_hz"),
         ]
         records = run_sweep(axes, action)
         radio.disable_tx()
@@ -101,13 +103,13 @@ def main() -> None:
 
 def _print_table(records) -> None:
     print(
-        f"\n  {'atten':>6} {'LO2_MHz':>9} {'orx_gain':>9} "
+        f"\n  {'atten':>6} {'LO_MHz':>9} {'orx_gain':>9} "
         f"{'peak_dBFS':>10} {'ok':>5} {'railed':>7}  note"
     )
     for r in records:
         note = "" if r["ok"] else r["note"]
         print(
-            f"  {r['atten_db']:>6.1f} {r['lo2_hz']/1e6:>9.1f} {r['gain']:>9} "
+            f"  {r['atten_db']:>6.1f} {r['lo_hz']/1e6:>9.1f} {r['gain']:>9} "
             f"{r['peak']:>10.1f} {str(r['ok']):>5} {r['railed']:>7}  {note}"
         )
     ok = [r for r in records if r["ok"]]

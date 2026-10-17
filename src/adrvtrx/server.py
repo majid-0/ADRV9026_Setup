@@ -698,6 +698,7 @@ class HardwareServer:
             raise AttributeError(f"{method!r} is not a public Radio method")
         args = tuple(message.get("args", ()))
         kwargs = dict(message.get("kwargs", {}))
+        keep = message.get("keep")  # perform_rx: the arrays the client reads (newer clients)
 
         def check() -> None:
             if lease.ended is not None:
@@ -708,7 +709,9 @@ class HardwareServer:
             lease.last_seen = lease.last_call = time.monotonic()
         try:
             job = self.hw.submit(
-                method, lambda: self._invoke(method, args, kwargs, session.client), check=check
+                method,
+                lambda: self._invoke(method, args, kwargs, session.client, keep),
+                check=check,
             )
             job.wait()
         finally:
@@ -723,6 +726,7 @@ class HardwareServer:
             method=method,
             args=summarize(args),
             kwargs=summarize(kwargs),
+            **({} if keep is None else {"keep": summarize(keep)}),
             dur_s=round(job.duration_s, 4),
             ok=error is None,
             error=None if error is None else repr(error),
@@ -736,9 +740,18 @@ class HardwareServer:
         return job.result
 
     def _invoke(
-        self, method: str, args: tuple, kwargs: dict, client: dict[str, Any] | None = None
+        self,
+        method: str,
+        args: tuple,
+        kwargs: dict,
+        client: dict[str, Any] | None = None,
+        keep: list[int] | None = None,
     ) -> Any:
-        """Run one forwarded call on the hardware thread."""
+        """Run one forwarded call on the hardware thread.
+
+        ``keep`` (``perform_rx``): the array positions to convert and send; the others go
+        back empty, so a capture ships one ORx instead of the whole ``rxInitChannelMask``.
+        """
         radio = self.radio
         if method == "perform_tx":
             result = self._perform_tx(args, kwargs, client or {})
@@ -765,7 +778,7 @@ class HardwareServer:
         if method == "perform_rx":
             from .capture import capture_arrays
 
-            result = capture_arrays(result)
+            result = capture_arrays(result, keep=keep)
         return result
 
     # -- TX playback RAM ----------------------------------------------------------------
@@ -910,6 +923,7 @@ class HardwareServer:
             "server_started": iso(self.started),
             "restarts": self.restarts,
             "programming": self.programming,
+            "profile_name": self.config.profile_name,
         }
 
     def _op_heartbeat(self, session: _Session, _message: dict[str, Any]) -> dict[str, Any]:
