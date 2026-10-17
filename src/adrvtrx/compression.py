@@ -47,6 +47,7 @@ __all__ = [
     "find_compression_point",
     "fine_step",
     "relevel_index",
+    "quantize_atten",
 ]
 
 
@@ -76,9 +77,12 @@ class CompressionResult:
     history: list[dict] = field(default_factory=list)
 
 
-def _quantize_atten(db: float) -> float:
-    """TX attenuator step is 0.05 dB."""
+def quantize_atten(db: float) -> float:
+    """``db`` on the TX attenuator's 0.05 dB step."""
     return round(float(db) * 20.0) / 20.0
+
+
+_quantize_atten = quantize_atten  # the earlier private name
 
 
 def fine_step(error_db: float, fine_db: float, coarse_db: float) -> float:
@@ -167,9 +171,9 @@ def search_tx_compression(
     def step_for(error_db: float) -> float:
         return fine_step(error_db, fine_step_db, coarse_step_db)
 
-    atten = _quantize_atten(max(atten_min_db, min(start_atten_db, atten_max_db)))
+    atten = quantize_atten(max(atten_min_db, min(start_atten_db, atten_max_db)))
     gain = clamp_gain(orx_gain)
-    floor = _quantize_atten(atten_min_db)  # raised by the clip guard
+    floor = quantize_atten(atten_min_db)  # raised by the clip guard
     guard_floor = False
     coarse_pending = True
     history: list[dict] = []
@@ -243,7 +247,7 @@ def search_tx_compression(
         if clipped:
             over = comp - target_compression_db
             up = step_for(over) if over > 0 else fine_step_db
-            new = _quantize_atten(min(atten_max_db, atten + up))
+            new = quantize_atten(min(atten_max_db, atten + up))
             if new <= atten + 1e-9:
                 record(rec, "PA clip guard at attenuation ceiling")
                 return finish(
@@ -290,7 +294,7 @@ def search_tx_compression(
             if error > 0:
                 step = coarse_step_db if coarse_pending else step_for(error)
                 coarse_pending = False
-                new = _quantize_atten(atten - step)
+                new = quantize_atten(atten - step)
                 if new < floor:
                     if atten <= floor + 1e-9:
                         if guard_floor:
@@ -321,7 +325,7 @@ def search_tx_compression(
                 gain = clamp_gain(gain - int(round(delta / db_per_index)))
                 action = f"TX atten -{delta:.2f} dB"
             else:
-                new = _quantize_atten(min(atten_max_db, atten + step_for(error)))
+                new = quantize_atten(min(atten_max_db, atten + step_for(error)))
                 if new <= atten + 1e-9:
                     record(rec, "atten ceiling")
                     return finish(
@@ -337,7 +341,7 @@ def search_tx_compression(
                 gain = clamp_gain(gain + int(round(delta / db_per_index)))
                 action = f"TX atten +{delta:.2f} dB"
         elif (railed > 0 or peak > band_hi) and gain <= gain_min:
-            new = _quantize_atten(min(atten_max_db, atten + fine_step_db))
+            new = quantize_atten(min(atten_max_db, atten + fine_step_db))
             record(rec, f"ORx railed at gain floor; TX atten +{new - atten:.2f} dB, stop")
             atten = new
             return finish(
@@ -414,7 +418,7 @@ def find_compression_point(
     ref = np.asarray(ref)
     capture_ms = oversample * len(ref) / float(fs) * 1e3
 
-    radio.set_tx_atten(tx, _quantize_atten(start_atten_db))
+    radio.set_tx_atten(tx, quantize_atten(start_atten_db))
     agc = autolevel_capture(
         radio,
         orx,

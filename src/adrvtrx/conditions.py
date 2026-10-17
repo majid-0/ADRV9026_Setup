@@ -25,7 +25,7 @@ from typing import Any
 
 import numpy as np
 
-from ._enums import RxChannel
+from ._enums import RxChannel, channel_name
 from .align import estimate_and_align
 from .capture import capture
 from .gain import ClipReport, clip_report
@@ -175,8 +175,7 @@ _CONDITION_KEYS = (*CSV_FIELDS[: CSV_FIELDS.index("converged") + 1], "lock_on")
 
 def condition_name(tx, backoff_db: int, freq_hz: int, bw_mhz: int) -> str:
     """``{TX}_{backoff}dB_{freq_MHz}MHz_{bw}BW``, e.g. ``TX1_0dB_2000MHz_100BW``."""
-    tx_name = tx.name if hasattr(tx, "name") else str(tx)
-    return f"{tx_name}_{int(backoff_db)}dB_{int(freq_hz) // 1_000_000}MHz_{int(bw_mhz)}BW"
+    return f"{channel_name(tx)}_{int(backoff_db)}dB_{int(freq_hz) // 1_000_000}MHz_{int(bw_mhz)}BW"
 
 
 def condition_keys(condition: OperatingCondition) -> dict[str, Any]:

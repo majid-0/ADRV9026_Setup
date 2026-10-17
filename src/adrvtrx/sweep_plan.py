@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._enums import channel_name
+
 _BLOCK_NAMES = frozenset({"freq", "power_db", "signals"})
 _FREQ_KEYS = frozenset({"lo1_hz", "lo2_hz"})
 
@@ -81,7 +83,7 @@ def sweep_defaults_from_config(
     for b in bands:
         nm = str(b["name"])
         tx = b["tx"]
-        tx_key = tx.name.lower() if hasattr(tx, "name") else str(tx).lower()
+        tx_key = channel_name(tx).lower()
         power_db[nm] = cfg.levels.tx_atten_for(tx_key)
         if "signal" in b:
             signals[nm] = str(b["signal"])

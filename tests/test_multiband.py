@@ -862,3 +862,27 @@ def test_capture_case_agc_starts_from_the_given_gains():
     assert set_gains[0] == (RxChannel.ORX1, 219)
     assert (RxChannel.ORX4, 221) in set_gains and (RxChannel.ORX1, 185) not in set_gains
     assert all(c.railed == 0 for c in caps)
+
+
+def test_a_band_describes_itself_for_case_json_and_conditions(tmp_path):
+    from adrvtrx._enums import channel_name
+    from adrvtrx.compression import _quantize_atten, quantize_atten
+
+    band = _case_bands()[1]
+    assert band.describe() == {
+        "name": "TX4",
+        "tx": "TX4",
+        "orx": "ORX4",
+        "lo": "LO2",
+        "freq_hz": 1_860_000_000,
+        "bw_mhz": 2.0,
+        "signal": "Signal2.txt",
+        "target_db": 4.0,
+        "atten_start_db": 20.0,
+        "atten_min_db": 10.0,
+    }
+    writer = CaseWriter(tmp_path, _case_bands(), tx_bits=12, rx_bits=12, fs=10e6)
+    doc = json.loads(writer.write_case_json().read_text())
+    assert doc["bands"] == [b.describe() for b in _case_bands()]
+    assert channel_name(TxChannel.TX4) == "TX4" and channel_name("TXA") == "TXA"
+    assert _quantize_atten is quantize_atten and quantize_atten(12.37) == 12.35

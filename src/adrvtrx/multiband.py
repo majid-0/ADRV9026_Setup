@@ -54,10 +54,10 @@ from typing import Any
 
 import numpy as np
 
-from ._enums import RxChannel, TxChannel
+from ._enums import RxChannel, TxChannel, channel_name
 from .align import align_with_fraction, estimate_and_align
 from .capture import autolevel_capture, capture
-from .compression import _quantize_atten, fine_step, relevel_index
+from .compression import fine_step, quantize_atten, relevel_index
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
@@ -110,7 +110,22 @@ class BandSpec:
 
     @property
     def name(self) -> str:
-        return self.tx.name if hasattr(self.tx, "name") else str(self.tx)
+        return channel_name(self.tx)
+
+    def describe(self) -> dict[str, Any]:
+        """The band as plain values (``case.json``, and the band columns of ``conditions.csv``)."""
+        return {
+            "name": self.name,
+            "tx": self.name,
+            "orx": channel_name(self.orx),
+            "lo": self.lo,
+            "freq_hz": int(self.freq_hz),
+            "bw_mhz": self.bw_mhz,
+            "signal": self.signal_name,
+            "target_db": self.target_db,
+            "atten_start_db": self.atten_start_db,
+            "atten_min_db": self.atten_min_db,
+        }
 
 
 @dataclass
@@ -339,7 +354,7 @@ def _stop_fatal(i: int, reading: _Reading, readings: list[_Reading], rules: _Rul
             state.history.append(r.row)
     reading.row["action"] = "ORx clips at minimum gain: TX atten up one fine step, stop"
     state.history.append(reading.row)
-    state.a[i] = _quantize_atten(min(rules.atten_max_db, state.a[i] + rules.fine_step_db))
+    state.a[i] = quantize_atten(min(rules.atten_max_db, state.a[i] + rules.fine_step_db))
     reading.counts = False
     nan = float("nan")
     unread = _Reading(nan, nan, nan, nan, 0, False)
@@ -402,7 +417,7 @@ def _fixed_moves(readings: list[_Reading], cls: _Classes, rules: _Rules, state: 
         if cls.clipped[i]:
             over = -cls.err[i]
             up = fine_step(over, fine, coarse) if over > 0 else fine
-            new = _quantize_atten(min(rules.atten_max_db, state.a[i] + up))
+            new = quantize_atten(min(rules.atten_max_db, state.a[i] + up))
             state.floor[i] = max(state.floor[i], new)
             state.clip_floor[i] = True
             mv[i], fixed[i] = new - state.a[i], True
@@ -487,7 +502,7 @@ def _new_attens(mv, actions, free, err, rules: _Rules, state: _State) -> np.ndar
             mv[i] = -0.05 if err[i] > 0 else 0.05
     return np.array(
         [
-            _quantize_atten(min(max(state.a[i] + mv[i], state.floor[i]), rules.atten_max_db))
+            quantize_atten(min(max(state.a[i] + mv[i], state.floor[i]), rules.atten_max_db))
             for i in range(len(mv))
         ]
     )
@@ -597,13 +612,13 @@ def search_multiband_compression(
         min_top_slope=min_top_slope,
         slope_bounds=slope_bounds,
     )
-    floor = np.array([_quantize_atten(m) for m in atten_mins_db])
+    floor = np.array([quantize_atten(m) for m in atten_mins_db])
     for i, s in enumerate(start_attens_db):
         if floor[i] > s:
             raise ValueError(f"{rules.names[i]}: limit {floor[i]} dB is above the start {s} dB")
     state = _State(
         a=np.array(
-            [_quantize_atten(min(max(s, f), atten_max_db)) for s, f in zip(start_attens_db, floor)]
+            [quantize_atten(min(max(s, f), atten_max_db)) for s, f in zip(start_attens_db, floor)]
         ),
         g=[rules.clamp_gain(x) for x in orx_gains],
         floor=floor,
@@ -849,7 +864,7 @@ def lock_bands(
     _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     radio.disable_tx()
     for b in bands:
-        radio.set_tx_atten(b.tx, _quantize_atten(b.atten_start_db))
+        radio.set_tx_atten(b.tx, quantize_atten(b.atten_start_db))
     if retune:
         for lo, hz in {b.lo: int(b.freq_hz) for b in bands}.items():
             radio.retune_lo(lo, hz)
@@ -962,7 +977,7 @@ def capture_case(
             "agc=False needs gains= (the ORx gain of each band): the ORx gain cannot be read back"
         )
     for b, db in zip(bands, attens_db):
-        radio.set_tx_atten(b.tx, _quantize_atten(db))
+        radio.set_tx_atten(b.tx, quantize_atten(db))
     used: dict[str, int] = {}  # the ORx gain in effect per band (set here, never read back)
     out: list[BandCapture | None] = [None] * len(bands)
 
@@ -999,7 +1014,7 @@ def capture_case(
         )
         return BandCapture(
             b.name,
-            float(_quantize_atten(attens_db[i])),
+            float(quantize_atten(attens_db[i])),
             int(used[b.name]),
             extra["raw"],
             extra["y_aligned"],
@@ -1232,18 +1247,15 @@ class CaseWriter:
         for k, caps in captures.items():
             for b, c in zip(self.bands, caps):
                 bl = locks[b.name]
+                band = b.describe()
                 rows.append(
                     {
                         **{key: self.meta.get(key, "") for key in self.row_meta},
-                        "band": b.name,
-                        "tx": b.name,
-                        "orx": b.orx.name if hasattr(b.orx, "name") else str(b.orx),
-                        "lo": b.lo,
-                        "freq_hz": int(b.freq_hz),
-                        "bw_mhz": b.bw_mhz,
-                        "signal": b.signal_name,
+                        "band": band["name"],
+                        **{key: band[key] for key in ("tx", "orx", "lo", "freq_hz", "bw_mhz")},
+                        "signal": band["signal"],
                         "freqs_mhz": freqs,
-                        "target_db": b.target_db,
+                        "target_db": band["target_db"],
                         "backoff_db": int(k),
                         "locked_atten_db": bl.atten_db,
                         "tx_atten_db": c.atten_db,
@@ -1299,21 +1311,7 @@ class CaseWriter:
         doc = {
             "case_name": self.name,
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "bands": [
-                {
-                    "name": b.name,
-                    "tx": b.name,
-                    "orx": getattr(b.orx, "name", str(b.orx)),
-                    "lo": b.lo,
-                    "freq_hz": int(b.freq_hz),
-                    "bw_mhz": b.bw_mhz,
-                    "signal": b.signal_name,
-                    "target_db": b.target_db,
-                    "atten_start_db": b.atten_start_db,
-                    "atten_min_db": b.atten_min_db,
-                }
-                for b in self.bands
-            ],
+            "bands": [b.describe() for b in self.bands],
             "fs_hz": self.fs,
             **({"lock": lock_summary(search)} if search is not None else {}),
             **self.meta,
