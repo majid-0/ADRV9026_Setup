@@ -55,7 +55,7 @@ from typing import Any
 import numpy as np
 
 from ._enums import RxChannel, TxChannel
-from .align import estimate_and_align
+from .align import align_with_fraction, estimate_and_align
 from .capture import autolevel_capture, capture
 from .compression import _quantize_atten
 from .conditions import save_aligned_iq
@@ -613,6 +613,7 @@ def measure_band(
     fs: float,
     oversample: int = 2,
     window_s: float = 1e-4,
+    fraction: float | None = None,
 ):
     """One capture of ``orx`` (``oversample`` periods).
 
@@ -621,12 +622,20 @@ def measure_band(
     ``extra`` holds ``papr_compression_db``, ``top_slope``, the raw capture (``raw``, complex
     codes) and the
     aligned period (``y_aligned``) with its ``delay_samples``.
+
+    ``fraction`` (the path's ``delay % 1`` from an earlier full alignment) aligns with
+    :func:`~adrvtrx.align.align_with_fraction` instead of the full
+    :func:`~adrvtrx.align.estimate_and_align` (no upsampled refinement): the search's readings
+    use it; a case capture aligns in full.
     """
     ref = np.asarray(ref)
     ms = oversample * len(ref) / float(fs) * 1e3
     out = capture(radio, int(orx), ms, bits=rx_bits).channels[orx]
     rep = clip_report(out.i, out.q, rx_bits)
-    x_al, y_al, delay = estimate_and_align(ref, out.iq, fs)
+    if fraction is None:
+        x_al, y_al, delay = estimate_and_align(ref, out.iq, fs)
+    else:
+        x_al, y_al, delay = align_with_fraction(ref, out.iq, fraction)
     papr, _pin, _pout = window_compression_db(x_al, y_al, fs, window_s)
     gain_comp, slope = gain_compression_db(x_al, y_al)
     extra = {
@@ -686,9 +695,11 @@ def lock_bands(
     """Retune, play every band, ORx AGC per band at the start attenuations, then the search.
 
     Returns the search and each band's reference (TX codes). TX keeps playing (the caller
-    captures next). Before the radio is touched, each band's ``lo`` is checked against the LO
-    the radio's ``[clocks]`` routes its TX to, and bands that share an LO must share its
-    frequency (``ValueError``).
+    captures next). A band's first reading leveled in the AGC band is aligned in full; its
+    fractional delay is kept and the band's later readings only search the integer lag
+    (:func:`measure_band` ``fraction``). Before the radio is touched, each band's ``lo`` is
+    checked against the LO the radio's ``[clocks]`` routes its TX to, and bands that share an
+    LO must share its frequency (``ValueError``).
     """
     _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     radio.disable_tx()
@@ -712,12 +723,27 @@ def lock_bands(
         )
         for b, r in zip(bands, refs)
     ]
+    fractions: dict[int, float] = {}  # per band: delay % 1 of its first leveled reading
+
+    def measure(i: int):
+        reading = measure_band(
+            radio,
+            bands[i].orx,
+            refs[i],
+            rx_bits=rx_bits,
+            fs=fs,
+            oversample=oversample,
+            fraction=fractions.get(i),
+        )
+        peak, railed = reading[0], reading[1]
+        if i not in fractions and railed == 0 and -tol_down_db <= peak - target_dbfs <= tol_up_db:
+            fractions[i] = float(reading[3]["delay_samples"]) % 1.0
+        return reading
+
     search = search_multiband_compression(
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
-        lambda i: measure_band(
-            radio, bands[i].orx, refs[i], rx_bits=rx_bits, fs=fs, oversample=oversample
-        ),
+        measure,
         targets_db=[b.target_db for b in bands],
         start_attens_db=[b.atten_start_db for b in bands],
         atten_mins_db=[b.atten_min_db for b in bands],

@@ -29,6 +29,7 @@ from adrvtrx.multiband import (
     search_multiband_compression,
     update_slopes,
 )
+from adrvtrx.transmit import transmit_bands
 
 
 class TwoBandPa:
@@ -760,3 +761,70 @@ def test_case_json_carries_the_lock(tmp_path):
     other = CaseWriter(tmp_path / "b", bands, tx_bits=12, rx_bits=12, fs=10e6)
     assert "lock" not in json.loads(other.write_case_json().read_text())  # no lock written yet
     assert "lock_summary" in multiband.__all__
+
+
+def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeypatch):
+    calls = {"full": 0, "fraction": 0}
+    real_full, real_fraction = multiband.estimate_and_align, multiband.align_with_fraction
+
+    def full(*a, **k):
+        calls["full"] += 1
+        return real_full(*a, **k)
+
+    def fraction(*a, **k):
+        calls["fraction"] += 1
+        return real_fraction(*a, **k)
+
+    monkeypatch.setattr(multiband, "estimate_and_align", full)
+    monkeypatch.setattr(multiband, "align_with_fraction", fraction)
+    radio, bands = _case_radio(), _case_bands()
+    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
+    assert search.converged
+    assert calls["full"] == 2  # each band's first reading came leveled from the AGC
+    assert calls["fraction"] == search.captures - 2
+
+
+@pytest.mark.parametrize("bench, tol_db", [("sim", 0.005), ("rich", 0.03)])
+def test_a_cached_fraction_reads_the_compression_the_full_alignment_reads(bench, tol_db):
+    """Within 0.005 dB on the memoryless sim bench (path delay 0.37 samples); within 0.03 dB on the
+    rich fake PA, whose AM/PM and memory move its apparent delay by 0.03 sample from 0.1 to
+    5.7 dB of compression (a quarter of the search's 0.1 dB tolerance)."""
+    from adrvtrx.align import align_with_fraction, estimate_and_align
+    from adrvtrx.capture import capture
+    from adrvtrx.metrics import gain_compression_db
+
+    if bench == "sim":
+        from sim_bench import FS, SimRadio, make_signal, reference_codes
+
+        radio, fs, x = SimRadio(seed=3), FS, make_signal()
+        ref, orx, attens = reference_codes(x), RxChannel.ORX1, (14, 10, 8, 6, 4)
+        radio.set_rx_gain(orx, 200)
+        transmit_bands(radio, {TxChannel.TX1: x}, 12)
+    else:
+        radio = FakeRadio(
+            Config(dll=DllConfig(install_dir=Path("C:/nonexistent"))), seed=2, pa="rich"
+        )
+        radio._safe_hooks_installed = True
+        radio.connect()
+        radio.program()
+        radio.set_rx_gain(RxChannel.ORX1, 205)
+        band = BandSpec(TxChannel.TX1, RxChannel.ORX1, "LO1", 2_200_000_000, 2.0, _signal(1))
+        radio.retune_lo("LO1", band.freq_hz)
+        radio.set_tx_atten(TxChannel.TX1, 20.0)
+        ref, orx, attens = (
+            play_bands(radio, [band], tx_bits=12)[0],
+            RxChannel.ORX1,
+            (20, 16, 13, 11, 9),
+        )
+        fs = radio.board_model.rate_hz
+    frac, compressions = None, []
+    for atten in attens:  # the fraction of the first, least compressed capture serves them all
+        radio.set_tx_atten(TxChannel.TX1, atten)
+        y = capture(radio, int(orx), 2 * len(ref) / fs * 1e3, bits=12).channels[orx].iq
+        xa, ya, d = estimate_and_align(ref, y, fs)
+        frac = d % 1.0 if frac is None else frac
+        xb, yb, _d = align_with_fraction(ref, y, frac)
+        full, cheap = gain_compression_db(xa, ya)[0], gain_compression_db(xb, yb)[0]
+        compressions.append(full)
+        assert cheap == pytest.approx(full, abs=tol_db), (atten, full, cheap)
+    assert compressions[-1] > 3.5  # the range covers the lock targets
