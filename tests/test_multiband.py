@@ -20,9 +20,11 @@ from adrvtrx.multiband import (
     BandSpec,
     CaseWriter,
     MultibandSearch,
+    capture_case,
     case_name,
     find_multiband_operating_point,
     own_slopes,
+    play_bands,
     search_multiband_compression,
     update_slopes,
 )
@@ -570,3 +572,62 @@ def test_a_failed_write_keeps_the_captures_in_the_error(tmp_path, monkeypatch):
     assert sorted(kept.captures) == [0, 2] and kept.search.converged
     assert all(len(caps) == 2 for caps in kept.captures.values())
     assert radio.rx_tx_enable_get()[1] == 0
+
+
+def _playing_case():
+    radio, bands = _case_radio(), _case_bands()
+    for b in bands:
+        radio.retune_lo(b.lo, b.freq_hz)
+    refs = play_bands(radio, bands, tx_bits=12)
+    return radio, bands, refs, radio.board_model.rate_hz
+
+
+def test_capture_case_without_agc_records_the_gains_it_set_never_a_readback(monkeypatch):
+    radio, bands, refs, fs = _playing_case()
+    monkeypatch.setattr(radio, "get_rx_gain", lambda _ch: 0)  # what the real chip returns
+    with pytest.raises(ValueError, match="gains"):
+        capture_case(radio, bands, refs, [16.0, 16.0], rx_bits=12, fs=fs, agc=False)
+    caps = capture_case(
+        radio,
+        bands,
+        refs,
+        [16.0, 16.0],
+        rx_bits=12,
+        fs=fs,
+        agc=False,
+        gains=[205, 207],
+        check=lambda cs: {c.name: {"ok": c.tries > 1} for c in cs},  # every band retaken once
+    )
+    assert [c.orx_gain for c in caps] == [205, 207] and [c.tries for c in caps] == [2, 2]
+    state = radio.board_model.state["rx_gain"]
+    assert (state["ORX1"], state["ORX4"]) == (205, 207)
+
+
+def test_capture_case_relevels_a_railed_band_and_records_the_new_gain(monkeypatch):
+    radio, bands, refs, fs = _playing_case()
+    levels = []
+    real_agc, real_measure = multiband._agc, multiband.measure_band
+
+    def agc(radio_, orx, *a, **k):
+        levels.append((orx, real_agc(radio_, orx, *a, **k)))
+        return levels[-1][1]
+
+    def measure(radio_, orx, *a, **k):
+        peak, railed, comp, extra = real_measure(radio_, orx, *a, **k)
+        first_tx1 = orx == RxChannel.ORX1 and sum(o == orx for o, _g in levels) == 1
+        return peak, 3 if first_tx1 else railed, comp, extra  # TX1's first capture railed
+
+    monkeypatch.setattr(multiband, "_agc", agc)
+    monkeypatch.setattr(multiband, "measure_band", measure)
+    caps = capture_case(
+        radio,
+        bands,
+        refs,
+        [16.0, 16.0],
+        rx_bits=12,
+        fs=fs,
+        check=lambda cs: {c.name: {"ok": c.railed == 0} for c in cs},
+    )
+    assert [o for o, _g in levels] == [RxChannel.ORX1, RxChannel.ORX4, RxChannel.ORX1]
+    assert caps[0].tries == 2 and caps[0].railed == 0 and caps[0].orx_gain == levels[-1][1]
+    assert caps[1].tries == 1 and caps[1].orx_gain == levels[1][1]

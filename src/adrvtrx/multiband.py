@@ -749,6 +749,7 @@ def capture_case(
     check: Callable[[list[BandCapture]], dict[str, dict]] | None = None,
     retakes: int = 3,
     min_top_slope: float = PA_CLIP_SLOPE,
+    gains: Sequence[int] | None = None,
 ) -> list[BandCapture]:
     """Every band at ``attens_db`` (TX playing): ORx AGC, one capture per band, then ``check``.
 
@@ -756,17 +757,27 @@ def capture_case(
     (pairing needs both). A failing band is captured again (re-leveled first when it railed), up to
     ``retakes`` times;
     its last check result stays in :attr:`BandCapture.check`.
+
+    ``agc=False`` captures at ``gains`` (one ORx gain index per band, set here) without leveling.
+    The ORx gain cannot be read back (``RxGainGet`` returns 0 on the chip; the gain is tracked in
+    software), so ``agc=False`` needs ``gains``: each :class:`BandCapture` records the gain set.
     """
+    if gains is not None and len(gains) != len(bands):
+        raise ValueError(f"gains needs one ORx gain index per band, got {list(gains)}")
+    if not agc and gains is None:
+        raise ValueError(
+            "agc=False needs gains= (the ORx gain of each band): the ORx gain cannot be read back"
+        )
     for b, db in zip(bands, attens_db):
         radio.set_tx_atten(b.tx, _quantize_atten(db))
-    gains = {}
+    used: dict[str, int] = {}  # the ORx gain in effect per band (set here, never read back)
     out: list[BandCapture | None] = [None] * len(bands)
 
     def take(i: int, tries: int, relevel: bool) -> BandCapture:
         b, ref = bands[i], refs[i]
-        if relevel or b.name not in gains:
+        if relevel or b.name not in used:
             if agc:
-                gains[b.name] = _agc(
+                used[b.name] = _agc(
                     radio,
                     b.orx,
                     ref,
@@ -778,7 +789,8 @@ def capture_case(
                     tol_down_db=tol_down_db,
                 )
             else:
-                gains[b.name] = int(radio.get_rx_gain(b.orx))
+                used[b.name] = int(gains[i])  # type: ignore[index]
+                radio.set_rx_gain(b.orx, used[b.name])
         peak, railed, _comp, extra = measure_band(
             radio, b.orx, ref, rx_bits=rx_bits, fs=fs, oversample=oversample
         )
@@ -794,7 +806,7 @@ def capture_case(
         return BandCapture(
             b.name,
             float(_quantize_atten(attens_db[i])),
-            int(gains[b.name]),
+            int(used[b.name]),
             extra["raw"],
             extra["y_aligned"],
             float(peak),
