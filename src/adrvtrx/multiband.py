@@ -18,9 +18,10 @@ Moves (``method``):
 * ``"slopes"``: one coarse step per band, then a slope matrix ``J`` (how much each band's
   compression moves per dB of each band's attenuation) learnt from the steps taken: it starts
   from each band's own slope (its last two readings, no cross terms) and every step corrects it
-  with what happened (Broyden), so a cross-band effect is learnt when it exists. The move solves
-  ``J @ da = target - c``. When a step made a band's error grow, the next step falls back to the
-  walk and ``J`` starts again from the own slopes.
+  with what happened (Broyden, :func:`update_slopes`; a cross term never exceeds its band's own
+  slope), so a cross-band effect is learnt when it exists. The move solves
+  ``J @ da = target - c``. When a step made a band's error grow, that step walks and ``J`` starts
+  again from the own slopes of the next step.
 
 Both: a band's coarse step is taken at its first reading that counts; moves capped at
 ``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
@@ -71,6 +72,8 @@ __all__ = [
     "BandCapture",
     "CaseResult",
     "search_multiband_compression",
+    "own_slopes",
+    "update_slopes",
     "play_bands",
     "measure_band",
     "lock_bands",
@@ -150,6 +153,53 @@ def _fine_step(error_db: float, fine: float, coarse: float) -> float:
     return min(coarse, steps * fine)
 
 
+def own_slopes(
+    da: np.ndarray, dc: np.ndarray, *, slope_bounds: tuple[float, float] = (0.2, 1.5)
+) -> np.ndarray:
+    """``J`` from one step: each band's own slope ``-dc/da`` (0.5 if it did not move), no cross
+    terms, held in ``slope_bounds`` (dB of compression per dB of attenuation, as a magnitude).
+    """
+    da, dc = np.asarray(da, dtype=float), np.asarray(dc, dtype=float)
+    own = np.array([(-dc[i] / da[i]) if abs(da[i]) > 1e-9 else 0.5 for i in range(len(da))])
+    own = np.where(np.isfinite(own), own, 0.5)
+    return np.diag(-np.clip(own, *slope_bounds))
+
+
+def update_slopes(
+    jac: np.ndarray,
+    da: np.ndarray,
+    dc: np.ndarray,
+    *,
+    slope_bounds: tuple[float, float] = (0.2, 1.5),
+) -> np.ndarray:
+    """One Broyden update of ``J``: attenuations moved by ``da``, compressions by ``dc``.
+
+    ``J + (dc - J da) da^T / (da^T da)`` makes ``J @ da == dc`` for this step and leaves ``J``
+    unchanged across directions it did not explore. Each own slope (diagonal) is then held in
+    ``slope_bounds``, and each cross term to at most its row's own slope,
+    ``|J[i, j]| <= |J[i, i]|``: band ``j`` reaches band ``i``'s compression only through the
+    headroom its average power takes in the shared PA, while band ``i``'s own peaks drive it into
+    compression directly, so a dB of the other band's attenuation moves it less than a dB of its
+    own. Without the bound one noisy step can teach a cross term larger than the own slope, and
+    the solve then moves the wrong band. ``J`` itself is returned when the step is too small or
+    not finite.
+    """
+    jac = np.asarray(jac, dtype=float)
+    da, dc = np.asarray(da, dtype=float), np.asarray(dc, dtype=float)
+    norm = float(da @ da)
+    if not norm > 1e-12:
+        return jac
+    new = jac + np.outer(dc - jac @ da, da) / norm
+    smin, smax = slope_bounds
+    for i in range(len(da)):
+        new[i, i] = -float(np.clip(-new[i, i], smin, smax))
+        own = abs(new[i, i])
+        for j in range(len(da)):
+            if j != i:
+                new[i, j] = float(np.clip(new[i, j], -own, own))
+    return new if np.all(np.isfinite(new)) else jac  # never learn from a non-finite step
+
+
 def search_multiband_compression(
     set_atten: Callable[[int, float], None],
     set_gain: Callable[[int, int], None],
@@ -198,7 +248,6 @@ def search_multiband_compression(
     names = list(names) if names is not None else [f"band{i + 1}" for i in range(n)]
     targets = np.asarray(targets_db, dtype=float)
     band_lo, band_hi = target_dbfs - tol_down_db, target_dbfs + tol_up_db
-    smin, smax = slope_bounds
     nan = float("nan")
 
     def clamp_gain(g: float) -> int:
@@ -452,18 +501,14 @@ def search_multiband_compression(
             abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > comp_tol_db for i in free
         )
         use_walk = method == "walk" or grew or not trusted
-        if method == "slopes" and trusted and prev is not None:
+        if grew:
+            jac = None  # this step walks; J starts again from the own slopes of the next one
+        if method == "slopes" and trusted and prev is not None and not grew:
             da, dc = a - prev[0], c - prev[1]
-            if jac is None or grew:
-                own = np.array([(-dc[i] / da[i]) if abs(da[i]) > 1e-9 else 0.5 for i in range(n)])
-                own = np.where(np.isfinite(own), own, 0.5)
-                jac = np.diag(-np.clip(own, smin, smax))
-            elif float(da @ da) > 1e-12:
-                new_jac = jac + np.outer(dc - jac @ da, da) / float(da @ da)
-                for i in range(n):
-                    new_jac[i, i] = -float(np.clip(-new_jac[i, i], smin, smax))
-                if np.all(np.isfinite(new_jac)):  # never learn from a non-finite step
-                    jac = new_jac
+            if jac is None:
+                jac = own_slopes(da, dc, slope_bounds=slope_bounds)
+            else:
+                jac = update_slopes(jac, da, dc, slope_bounds=slope_bounds)
         for i in free:
             if abs(err[i]) <= comp_tol_db and use_walk:
                 actions[i] = "within tolerance"
@@ -491,8 +536,6 @@ def search_multiband_compression(
                         step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
                         mv[i] = -step_db if err[i] > 0 else step_db
                         actions[i] = "walk (singular slopes)"
-        if grew:
-            jac = None  # start again from the own slopes after this step
         mv = np.clip(mv, -coarse_step_db, coarse_step_db)
         # a band still outside tolerance moves at least one attenuator step toward its target
         for i in free:

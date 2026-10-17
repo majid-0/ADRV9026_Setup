@@ -19,7 +19,9 @@ from adrvtrx.multiband import (
     CaseWriter,
     case_name,
     find_multiband_operating_point,
+    own_slopes,
     search_multiband_compression,
+    update_slopes,
 )
 
 
@@ -322,6 +324,60 @@ def test_a_negative_backoff_is_rejected_before_the_radio_is_touched():
             radio, [band], tx_bits=12, rx_bits=12, fs=1e6, backoffs=(0, -1)
         )
     assert radio.mock_calls == []
+
+
+# -- the slope matrix ----------------------------------------------------------------------
+
+
+def test_own_slopes_are_minus_dc_over_da_held_in_bounds():
+    jac = own_slopes(np.array([-2.5, -1.0, 0.0]), np.array([1.5, 2.0, 0.3]))
+    np.testing.assert_allclose(jac, np.diag([-0.6, -1.5, -0.5]))  # 2.0 clipped; still: 0.5
+    assert own_slopes(np.array([-1.0]), np.array([0.05]))[0, 0] == -0.2
+
+
+def test_the_slope_update_explains_the_step_it_learns_from():
+    jac = np.diag([-0.7, -0.8])
+    da, dc = np.array([-1.0, -0.5]), np.array([1.0, 0.75])  # what the step did
+    new = update_slopes(jac, da, dc)
+    np.testing.assert_allclose(new @ da, dc)  # the secant equation
+    v = np.array([0.5, -1.0])  # orthogonal to da: J is unchanged along it
+    np.testing.assert_allclose(new @ v, jac @ v)
+    assert new[0, 1] < 0 and new[1, 0] < 0  # more drive on one band compresses the other
+
+
+def test_a_cross_slope_is_never_larger_than_the_own_slope():
+    jac = np.diag([-0.5, -0.5])
+    new = update_slopes(jac, np.array([0.0, -1.0]), np.array([2.0, 0.5]))  # a noisy step
+    assert new[0, 1] == pytest.approx(-0.5)  # the step alone says -2.0: bound to |J[0, 0]|
+    assert abs(new[1, 0]) <= abs(new[1, 1])
+    held = update_slopes(np.diag([-1.4, -0.3]), np.array([-1.0, 0.0]), np.array([3.0, 0.0]))
+    assert held[0, 0] == pytest.approx(-1.5)  # own slopes stay in slope_bounds
+
+
+def test_the_slope_update_ignores_a_step_it_cannot_learn_from():
+    jac = np.array([[-0.7, -0.1], [-0.2, -0.8]])
+    np.testing.assert_array_equal(update_slopes(jac, np.zeros(2), np.array([1.0, 1.0])), jac)
+    nan_step = update_slopes(jac, np.array([-1.0, 0.0]), np.array([np.nan, 0.2]))
+    np.testing.assert_array_equal(nan_step, jac)
+
+
+def test_after_an_error_grew_the_search_walks_and_starts_again_from_own_slopes():
+    checked = 0
+    for locks, cross in (((14, 15), (0.3, 0.3)), ((13, 16.5), (0.0, 0.4)), ((14, 15), (0.6, 0.6))):
+        res = TwoBandPa(locks=locks, cross=cross).search(max_steps=12)
+        by_step: dict[int, list[dict]] = {}
+        for h in res.history:
+            if h["leveled"]:
+                by_step.setdefault(h["step"], []).append(h)
+        fallbacks = [s for s, rows in by_step.items() if rows[0]["action"] == "walk (fallback)"]
+        for s in fallbacks:
+            assert all(h["slopes"] == "" for h in by_step[s])  # J dropped on that step
+            after = by_step.get(s + 1, [])
+            if after and after[0]["slopes"]:
+                jac = np.array(json.loads(after[0]["slopes"]))
+                assert np.count_nonzero(jac - np.diag(np.diag(jac))) == 0  # own slopes only
+                checked += 1
+    assert checked >= 2
 
 
 def test_case_names_carry_paths_carriers_bandwidths_and_targets():
