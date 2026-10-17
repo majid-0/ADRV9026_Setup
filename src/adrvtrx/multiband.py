@@ -1168,6 +1168,9 @@ class CaseWriter:
     ``meta`` (plan row, filters, pads, profile, programming id, ...) goes into ``case.json`` and,
     flattened,
     into every ``conditions.csv`` row it names in ``row_meta``.
+
+    Making a writer creates nothing: the case folder appears with the first file written (or
+    :meth:`path`, which names a file about to be written), after :meth:`require_empty` has run.
     """
 
     def __init__(
@@ -1183,14 +1186,15 @@ class CaseWriter:
     ):
         self.bands = list(bands)
         self.name = case_name(bands)
-        self.dir = Path(run_dir) / self.name
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = Path(run_dir) / self.name  # created by the first write, not here
         self.tx_bits, self.rx_bits, self.fs = tx_bits, rx_bits, fs
         self.meta = dict(meta or {})
         self.row_meta = list(row_meta)
         self.search: MultibandSearch | None = None  # the lock, once written (for case.json)
 
     def path(self, suffix: str) -> Path:
+        """``<dir>/<case>_<suffix>``, a case file about to be written: the folder is created."""
+        self.dir.mkdir(parents=True, exist_ok=True)
         return self.dir / f"{self.name}_{suffix}"
 
     def require_empty(self) -> None:
@@ -1208,6 +1212,7 @@ class CaseWriter:
             raise FileExistsError(
                 f"{path} exists: files are written once (move the case folder aside to redo)"
             )
+        path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
     def write_inputs(self, refs: Sequence[np.ndarray]) -> list[Path]:

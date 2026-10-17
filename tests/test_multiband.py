@@ -616,7 +616,7 @@ def test_a_fatal_search_captures_and_writes_nothing(tmp_path, monkeypatch):
         radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, writer=writer
     )
     assert res.search.fatal and res.captures == {} and res.case_dir is None
-    assert captured == [] and list(writer.dir.iterdir()) == []
+    assert captured == [] and not writer.dir.exists()  # not even the folder
     assert radio.rx_tx_enable_get()[1] == 0  # TX off
 
 
@@ -636,6 +636,7 @@ def test_a_lock_at_the_limit_is_still_captured(monkeypatch):
 def test_a_used_case_folder_is_refused_before_the_radio_is_touched(tmp_path):
     bands = _case_bands()
     writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=10e6)
+    writer.dir.mkdir()
     (writer.dir / "conditions.csv").write_text("from an earlier run")
     radio = MagicMock(name="radio")
     with pytest.raises(FileExistsError, match="not empty"):
@@ -889,3 +890,15 @@ def test_a_band_describes_itself_for_case_json_and_conditions(tmp_path):
     assert doc["bands"] == [b.describe() for b in _case_bands()]
     assert channel_name(TxChannel.TX4) == "TX4" and channel_name("TXA") == "TXA"
     assert _quantize_atten is quantize_atten and quantize_atten(12.37) == 12.35
+
+
+def test_a_case_writer_creates_its_folder_with_its_first_file(tmp_path):
+    writer = CaseWriter(tmp_path, _case_bands(), tx_bits=12, rx_bits=12, fs=10e6)
+    writer.require_empty()  # nothing there yet: fine, and still nothing created
+    assert not writer.dir.exists() and list(tmp_path.iterdir()) == []
+    writer.write_text("notes.md", "first")
+    assert [p.name for p in writer.dir.iterdir()] == ["notes.md"]
+    other = CaseWriter(tmp_path / "b", _case_bands(), tx_bits=12, rx_bits=12, fs=10e6)
+    target = other.path("TX1_extra.txt")  # naming a file to write makes room for it
+    target.write_text("x")
+    assert target.parent == other.dir and other.dir.is_dir()
