@@ -24,20 +24,21 @@ Moves (``method``):
   again from the own slopes of the next step.
 
 Both: a band's coarse step is taken at its first reading that counts; moves capped at
-``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx
-gain follows the predicted output peak (the drive change minus the compression change); a band
-never goes below its ``atten_min_db`` (a band that needs more drive than that stops there, the
-others go on); clip guard per band (``min_top_slope``); at most ``max_steps`` steps (no move
-after the last one), then the step with the smallest worst-band error among the steps where
-every reading counted is kept, or else the last step's attenuations and gains: the radio is
-always left where it was measured.
+``coarse_step_db`` and rounded to the 0.05 dB attenuator step; the ORx gain follows the
+predicted output peak (the drive change minus the compression change); a band never goes below
+its ``atten_min_db`` (a band that needs more drive than that stops there, the others go on);
+clip guard per band (``min_top_slope``); at most ``max_steps`` steps and no move after the last
+one, then the step with the smallest worst-band error among the steps where every reading
+counted is kept, or else the last step: the radio is left where it was measured. An ORx that
+still clips at its minimum gain stops the search (``fatal``), that band one fine step up.
 
 :func:`find_multiband_operating_point` runs it on hardware (a :class:`~adrvtrx.radio.Radio` or
 the hardware server's ``RemoteRadio``): retune, play every TX in one ``PerformTx``, ORx AGC per
 band, the search, then per backoff every band ``+k`` dB, ORx AGC per band, one capture per band
-and the caller's ``check`` on them. The steps are separate functions too (:func:`play_bands`,
-:func:`lock_bands`, :func:`capture_case`) for a campaign that runs them as separate jobs.
-:class:`CaseWriter` saves a case folder (write-once).
+and the caller's ``check`` on them (nothing after a fatal search). The steps are separate
+functions too (:func:`play_bands`, :func:`lock_bands`, :func:`capture_case`) for a campaign that
+runs them as separate jobs. :class:`CaseWriter` saves a case folder (write-once, checked empty
+before the run; ``case.json`` carries the lock, :func:`lock_summary`).
 """
 
 from __future__ import annotations
@@ -82,6 +83,7 @@ __all__ = [
     "find_multiband_operating_point",
     "case_name",
     "CaseWriter",
+    "lock_summary",
 ]
 
 METHODS = ("slopes", "walk")
@@ -997,6 +999,7 @@ class CaseWriter:
         self.tx_bits, self.rx_bits, self.fs = tx_bits, rx_bits, fs
         self.meta = dict(meta or {})
         self.row_meta = list(row_meta)
+        self.search: MultibandSearch | None = None  # the lock, once written (for case.json)
 
     def path(self, suffix: str) -> Path:
         return self.dir / f"{self.name}_{suffix}"
@@ -1089,13 +1092,21 @@ class CaseWriter:
     def write_conditions(
         self, search: MultibandSearch, captures: dict[int, list[BandCapture]]
     ) -> Path:
+        self.search = search
         return self._write_csv("conditions.csv", self.condition_rows(search, captures))
 
     def write_lock(self, search: MultibandSearch) -> Path:
+        self.search = search
         return self._write_csv("lock.csv", [dict(h) for h in search.history])
 
-    def write_case_json(self, extra: dict | None = None) -> Path:
+    def write_case_json(
+        self, extra: dict | None = None, *, search: MultibandSearch | None = None
+    ) -> Path:
+        """``case.json``: the bands, ``fs_hz``, the lock (:func:`lock_summary` of ``search``, or of
+        the search this writer wrote), then ``meta`` and ``extra`` (which win on a shared key).
+        """
         p = self._new(self.dir / "case.json")
+        search = search if search is not None else self.search
         doc = {
             "case_name": self.name,
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1115,6 +1126,7 @@ class CaseWriter:
                 for b in self.bands
             ],
             "fs_hz": self.fs,
+            **({"lock": lock_summary(search)} if search is not None else {}),
             **self.meta,
             **(extra or {}),
         }

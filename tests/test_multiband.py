@@ -660,3 +660,17 @@ def test_two_bands_on_one_lo_at_one_frequency_are_fine():
     multiband._check_los(bands, radio.config.clocks)  # TX1 and TX2 share LO1
     play_bands(radio, bands, tx_bits=12)
     assert radio.board_model.state["tx_mask"] == int(TxChannel.TX1) | int(TxChannel.TX2)
+
+
+def test_case_json_carries_the_lock(tmp_path):
+    bands = _case_bands()
+    res = TwoBandPa().search()
+    writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=10e6, meta={"case": "C1"})
+    writer.write_lock(res)
+    doc = json.loads(writer.write_case_json({"note": "after the run"}).read_text())
+    assert doc["lock"] == multiband.lock_summary(res) and doc["case"] == "C1"
+    assert [row["band"] for row in doc["lock"]] == ["TX1", "TX4"]
+    assert doc["lock"][0]["atten_db"] == res.bands[0].atten_db
+    other = CaseWriter(tmp_path / "b", bands, tx_bits=12, rx_bits=12, fs=10e6)
+    assert "lock" not in json.loads(other.write_case_json().read_text())  # no lock written yet
+    assert "lock_summary" in multiband.__all__
