@@ -9,8 +9,11 @@ backs them off together and saves one case folder.
 every band's attenuation and ORx gain and takes one reading per band; a band whose ORx is not
 leveled moves only its ORx gain and is measured again before its reading counts (up to
 ``max_relevel`` times; still not leveled, it keeps its attenuation that step and its reading
-drives nothing). A compression reading that is not finite (a failed alignment) does not count
-either: the band is measured again at the same gain. Every capture is one ``history`` row.
+drives nothing). When no band moved for two steps in a row and every band not within
+tolerance was at its limit or held at an unchanged ORx gain, the search stops (it would only
+capture the same again). A
+compression reading that is not finite (a failed alignment) does not count either: the band
+is measured again at the same gain. Every capture is one ``history`` row.
 Moves (``method``):
 
 * ``"walk"``: every band by the single-band rule (one coarse step toward the target, then fine
@@ -253,6 +256,7 @@ class _State:
     last: dict | None = None  # the last step, as measured
     history: list[dict] = field(default_factory=list)
     captures: int = 0
+    idle_steps: int = 0  # steps in a row where nothing moved and no band could (see _idle)
 
 
 @dataclass
@@ -507,6 +511,34 @@ def _new_attens(mv, actions, free, err, rules: _Rules, state: _State) -> np.ndar
     )
 
 
+#: Steps in a row with nothing to do before the search stops (held bands re-level meanwhile).
+IDLE_STEPS = 2
+
+
+def _idle(moved: np.ndarray, cls: _Classes, gains_before: list[int], gains: list[int]) -> bool:
+    """No band moved, and every band not within tolerance is stuck at its limit or held with
+    its ORx gain where the step found it (re-leveling got nowhere, e.g. compression readings that
+    are not finite): the next step can only capture the same thing again. A held band whose gain
+    moved is still leveling."""
+    return bool(np.all(np.abs(moved) < 1e-9)) and all(
+        w or s or (not ok and g0 == g1)
+        for w, s, ok, g0, g1 in zip(cls.within, cls.stuck, cls.ok, gains_before, gains)
+    )
+
+
+def _idle_reason(cls: _Classes, rules: _Rules) -> str:
+    parts = []
+    for label, flags in (
+        ("not leveled at an unchanged ORx gain", [not ok for ok in cls.ok]),
+        ("at the attenuation limit", cls.stuck),
+        ("within tolerance", cls.within),
+    ):
+        names = [rules.names[i] for i, f in enumerate(flags) if f]
+        if names:
+            parts.append(f"{', '.join(names)} {label}")
+    return f"no band could move for {IDLE_STEPS} steps ({'; '.join(parts)})"
+
+
 def _predict_gains(g: list[int], moved: np.ndarray, jac, rules: _Rules) -> list[int]:
     """The ORx gain follows the output peak, which moves by the drive change minus the
     compression change: predicted from the slopes when known, else from a typical own slope of
@@ -662,8 +694,10 @@ def search_multiband_compression(
         if on_step:
             on_step(rows)
 
+    stop = "max steps"
     for step in range(max_steps):
         apply()
+        gains_before = list(state.g)
         readings: list[_Reading] = []
         for i in range(n):
             reading = _read_band(i, step, rules, state, measure, set_gain)
@@ -722,6 +756,11 @@ def search_multiband_compression(
         report(rows)
         if np.all(np.abs(moved) < 1e-9) and cls.trusted:
             return finish(False, "no band can move further (limits)", readings, cls.err)
+        idle = _idle(moved, cls, gains_before, state.g)
+        state.idle_steps = state.idle_steps + 1 if idle else 0
+        if state.idle_steps >= IDLE_STEPS:  # a band that never levels: stop capturing it
+            stop = _idle_reason(cls, rules)
+            break
         state.prev = (state.a.copy(), cls.c.copy()) if cls.trusted else None
         state.prev_err = np.where(cls.ok, cls.err, np.nan)  # what did not count cannot grow
         state.g = _predict_gains(state.g, moved, state.jac, rules)
@@ -731,14 +770,14 @@ def search_multiband_compression(
         state.a, state.g = state.best["a"], state.best["g"]
         return finish(
             False,
-            "max steps; left at the step closest to the targets",
+            f"{stop}; left at the step closest to the targets",
             state.best["readings"],
             state.best["err"],
         )
     state.a, state.g = state.last["a"], list(state.last["g"])
     return finish(
         False,
-        "max steps; left at the last step measured",
+        f"{stop}; left at the last step measured",
         state.last["readings"],
         state.last["err"],
     )

@@ -902,3 +902,15 @@ def test_a_case_writer_creates_its_folder_with_its_first_file(tmp_path):
     target = other.path("TX1_extra.txt")  # naming a file to write makes room for it
     target.write_text("x")
     assert target.parent == other.dir and other.dir.is_dir()
+
+
+@pytest.mark.parametrize("method", ["slopes", "walk"])
+def test_a_band_that_can_never_level_stops_the_search_when_nothing_can_change(method):
+    pa = TwoBandPa(noise=0.0, comp_nan={1: 1})  # TX4 never aligns: measured again, same gain
+    res = pa.search(method=method)  # max_steps 20 would take 161 captures
+    assert not res.converged and res.steps < 10 and res.captures < 70
+    assert res.reason.startswith("no band could move for 2 steps (TX4 not leveled")
+    assert "TX1 within tolerance" in res.reason and res.bands[0].status == "converged"
+    last_two = [h for h in res.history if h["step"] >= res.steps - 2]
+    assert all(h["move_db"] == 0.0 for h in last_two)
+    assert pa.a == [bl.atten_db for bl in res.bands]  # left where it was measured
