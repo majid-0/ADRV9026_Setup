@@ -914,3 +914,37 @@ def test_a_band_that_can_never_level_stops_the_search_when_nothing_can_change(me
     last_two = [h for h in res.history if h["step"] >= res.steps - 2]
     assert all(h["move_db"] == 0.0 for h in last_two)
     assert pa.a == [bl.atten_db for bl in res.bands]  # left where it was measured
+
+
+# -- a convergence oracle, independent of the pinned golden file ------------------------------
+
+_LOCK_GRID = [(l1, l2) for l1 in (13.0, 14.5, 16.0, 17.5) for l2 in (13.0, 14.5, 16.0, 17.5)]
+
+
+def _oracle_cases(method: str):
+    """Linear PAs (``c = 4 + S (locks - a)``, noise-free) with up to 0.4 dB/dB from the other band.
+
+    The walk is left out where it limit-cycles: a 0.2 dB fine step that moves the compression
+    by more than the 0.2 dB tolerance window (own + cross slope above about 1 dB/dB with both
+    bands stepping together) can jump across it forever. Measured with the code of
+    2026-10-17: slopes at most 6 steps, mean 4.3; walk at most 9, mean 5.1.
+    """
+    for own in (0.7, 1.0):
+        for cross in (0.0, 0.1, 0.2, 0.3, 0.4):
+            for symmetric in (True, False):
+                if method == "walk" and symmetric and (own >= 1.0 or cross >= 0.4) and cross > 0:
+                    continue
+                yield [[own, cross], [cross if symmetric else 0.0, own]]
+
+
+@pytest.mark.parametrize("method, budget, mean_max", [("slopes", 8, 4.8), ("walk", 10, 5.6)])
+def test_both_methods_lock_linear_coupled_bands_within_a_step_budget(method, budget, mean_max):
+    steps = []
+    for slopes in _oracle_cases(method):
+        for locks in _LOCK_GRID:
+            pa = LinearPa(slopes, locks=locks)
+            res = pa.search(method=method, max_steps=budget)
+            assert res.converged, (method, slopes, locks, res.reason)
+            np.testing.assert_allclose(pa.comp(), 4.0, atol=0.1)  # the truth, not the reading
+            steps.append(res.steps)
+    assert np.mean(steps) <= mean_max, np.mean(steps)
