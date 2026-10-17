@@ -1,12 +1,22 @@
 """On-hardware tests. Require a connected, booted ADS9 + ADRV9026.
 
-Run ONLY on the control PC, inside myenv:
+They connect to the board directly and program it, so they never run by accident:
 
-    conda run -n myenv python -m pytest -m hardware -v
+* a default ``pytest`` run deselects them (``addopts`` in ``pyproject.toml`` has
+  ``-m "not hardware"``);
+* selected with ``-m hardware``, the ``hw`` fixture still refuses (skips) unless
+  ``ADRVTRX_ALLOW_HARDWARE_TESTS=1``, and refuses while a hardware server answers
+  on the configured ``[server] port`` (the server owns the board);
+* they skip when the board is unreachable.
 
-These are SKIPPED automatically (not failed) when the board is unreachable, so
-`-m hardware` is safe to run anywhere. They confirm the bench-only open items from
-docs/api_notes.md and exercise the TX2->ORx2 / TX3->ORx3 loopback you have wired.
+Run them deliberately, ONLY on the control PC, inside myenv, with the hardware
+server stopped (PowerShell)::
+
+    $env:ADRVTRX_ALLOW_HARDWARE_TESTS = "1"
+    conda run -n myenv python -m pytest -m hardware -o addopts="" -v
+
+They confirm the bench-only open items from docs/api_notes.md and exercise the
+TX2->ORx2 / TX3->ORx3 loopback you have wired.
 
 The whole module shares one connected+programmed session (module-scoped fixture);
 TX is forced safe and the board disconnected at teardown.
@@ -21,6 +31,7 @@ import numpy as np
 import pytest
 
 from adrvtrx import RxChannel, TxChannel
+from adrvtrx._hwlink import HOST
 from adrvtrx.capture import capture
 from adrvtrx.config import load_config
 from adrvtrx.experiment import session
@@ -33,6 +44,9 @@ pytestmark = pytest.mark.hardware
 PAIRS = [(TxChannel.TX2, RxChannel.ORX2), (TxChannel.TX3, RxChannel.ORX3)]
 CAPTURE_MS = 0.1
 
+#: The opt-in: without ``ADRVTRX_ALLOW_HARDWARE_TESTS=1`` the ``hw`` fixture refuses.
+ALLOW_ENV = "ADRVTRX_ALLOW_HARDWARE_TESTS"
+
 
 def _reachable(ip: str, port: int, timeout: float = 2.0) -> bool:
     try:
@@ -42,12 +56,32 @@ def _reachable(ip: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def hardware_refusal(cfg, environ=os.environ) -> str | None:
+    """Why these tests must not touch the board now, or ``None`` when they may.
+
+    Checked in this order, so a refusal opens no connection it does not need: the
+    opt-in variable, then a hardware server on ``[server] port`` (it owns the board, and
+    these tests would connect and program beside it), then the board itself.
+    """
+    if environ.get(ALLOW_ENV) != "1":
+        return f"set {ALLOW_ENV}=1 to run the hardware tests (they program the real board)"
+    if _reachable(HOST, cfg.server.port, timeout=1.0):
+        return (
+            f"a hardware server answers on {HOST}:{cfg.server.port} and owns the board: "
+            "stop it (adrvtrx-server stop) before running the hardware tests"
+        )
+    if not _reachable(cfg.board.ip, cfg.board.port):
+        return f"ADS9 not reachable at {cfg.board.ip}:{cfg.board.port}"
+    return None
+
+
 @pytest.fixture(scope="module")
 def hw():
     """Connected + programmed (radio, profile_info), safe-stated on teardown."""
     cfg = load_config()
-    if not _reachable(cfg.board.ip, cfg.board.port):
-        pytest.skip(f"ADS9 not reachable at {cfg.board.ip}:{cfg.board.port}")
+    refusal = hardware_refusal(cfg)
+    if refusal is not None:
+        pytest.skip(refusal)
     # conftest forbids the real DLL for every other test; this module is the exception.
     forbid = os.environ.pop("ADRVTRX_FORBID_HARDWARE", None)
     try:
