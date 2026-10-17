@@ -324,6 +324,7 @@ def autolevel_capture(
     coarse_ms: float = 0.1,
     verify_capture_ms: float | None = None,
     max_iterations: int = 16,
+    start_gain: int | None = None,
 ) -> AgcResult:
     """End-to-end software ORx AGC against live hardware (TX must already be running).
 
@@ -341,6 +342,8 @@ def autolevel_capture(
 
     ``orx_rate_hz`` is the ORx datapath rate (``ProfileInfo.orx_rate_hz``); the caller
     typically derives ``verify_capture_ms`` from it and the waveform length.
+
+    ``start_gain`` skips Stage A and trims from that gain (see :func:`autolevel_orx`).
     """
 
     def set_gain(g: int) -> None:
@@ -358,6 +361,7 @@ def autolevel_capture(
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
         max_iterations=max_iterations,
+        start_gain=start_gain,
     )
     if lr.fatal:
         radio.safe_state()

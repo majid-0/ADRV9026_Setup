@@ -144,6 +144,7 @@ def autolevel_orx(
     gain_max: int = ORX_GAIN_MAX,
     db_per_index: float = ORX_DB_PER_INDEX,
     max_iterations: int = 16,
+    start_gain: int | None = None,
 ) -> LevelResult:
     """Software ORx AGC -- Stage A (coarse) + Stage B (fine trim).
 
@@ -159,12 +160,34 @@ def autolevel_orx(
 
     If the signal is below band even at ``gain_max`` it ACCEPTS ``gain_max`` as the
     best achievable (``at_max_gain=True``, not fatal).
+
+    ``start_gain`` (a gain already known to be close, e.g. predicted from an earlier
+    level) skips Stage A: Stage B trims from there, and a clip at ``gain_min`` is FATAL
+    at once (Stage A's floor check). ``None`` (the default) runs Stage A as always.
     """
     band_lo = target_dbfs - tol_down_db
     band_hi = target_dbfs + tol_up_db
 
     def _clamp(g: int) -> int:
         return int(min(max(g, gain_min), gain_max))
+
+    if start_gain is not None:
+        gain = _clamp(int(start_gain))
+        set_gain(gain)
+        return _fine_trim(
+            set_gain,
+            measure,
+            gain,
+            (float("nan"), 0),
+            band_lo,
+            band_hi,
+            target_dbfs,
+            gain_min,
+            gain_max,
+            db_per_index,
+            max_iterations,
+            floor_is_fatal=True,
+        )
 
     # -- Stage A: start at the floor, one computed jump --------------------------
     gain = gain_min
@@ -194,12 +217,58 @@ def autolevel_orx(
     steps = round((target_dbfs - peak) / db_per_index)
     gain = _clamp(gain_min + steps)
     set_gain(gain)
+    return _fine_trim(
+        set_gain,
+        measure,
+        gain,
+        (peak, railed),
+        band_lo,
+        band_hi,
+        target_dbfs,
+        gain_min,
+        gain_max,
+        db_per_index,
+        max_iterations,
+    )
 
-    # -- Stage B: fine trim ------------------------------------------------------
+
+def _fine_trim(
+    set_gain,
+    measure,
+    gain: int,
+    last: tuple[float, int],
+    band_lo: float,
+    band_hi: float,
+    target_dbfs: float,
+    gain_min: int,
+    gain_max: int,
+    db_per_index: float,
+    max_iterations: int,
+    *,
+    floor_is_fatal: bool = False,
+) -> LevelResult:
+    """Stage B of :func:`autolevel_orx` from ``gain`` (already set); ``last`` = the reading
+    before it ``(peak_dbfs, railed)``, reported if no iteration runs."""
+
+    def _clamp(g: int) -> int:
+        return int(min(max(g, gain_min), gain_max))
+
+    peak, railed = last
     fine_iters = 0
     for _ in range(max_iterations):
         fine_iters += 1
         peak, railed = measure()
+        if railed > 0 and floor_is_fatal and gain <= gain_min:  # Stage A's floor check
+            return LevelResult(
+                False,
+                gain,
+                peak,
+                fine_iters,
+                f"TX too strong: clips at minimum gain ({gain_min}) -- "
+                "reduce TX power / add a pad.",
+                railed=railed,
+                fatal=True,
+            )
         if railed > 0:  # clip veto -- always back off
             gain = _clamp(gain - 1)
             set_gain(gain)

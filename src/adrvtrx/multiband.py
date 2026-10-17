@@ -648,7 +648,19 @@ def measure_band(
     return rep.peak_dbfs, rep.railed_samples, gain_comp, extra
 
 
-def _agc(radio, orx, ref, *, rx_bits, fs, oversample, target_dbfs, tol_up_db, tol_down_db) -> int:
+def _agc(
+    radio,
+    orx,
+    ref,
+    *,
+    rx_bits,
+    fs,
+    oversample,
+    target_dbfs,
+    tol_up_db,
+    tol_down_db,
+    start_gain: int | None = None,
+) -> int:
     agc = autolevel_capture(
         radio,
         orx,
@@ -658,6 +670,7 @@ def _agc(radio, orx, ref, *, rx_bits, fs, oversample, target_dbfs, tol_up_db, to
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
         verify_capture_ms=oversample * len(ref) / float(fs) * 1e3,
+        start_gain=start_gain,
     )
     return int(agc.final_gain_index)
 
@@ -807,6 +820,8 @@ def capture_case(
     ``agc=False`` captures at ``gains`` (one ORx gain index per band, set here) without leveling.
     The ORx gain cannot be read back (``RxGainGet`` returns 0 on the chip; the gain is tracked in
     software), so ``agc=False`` needs ``gains``: each :class:`BandCapture` records the gain set.
+    With ``agc=True``, ``gains`` (optional) is where each band's AGC starts its fine trim instead
+    of the gain floor (a gain predicted from the lock); a railed retake levels from the floor.
     """
     if gains is not None and len(gains) != len(bands):
         raise ValueError(f"gains needs one ORx gain index per band, got {list(gains)}")
@@ -833,6 +848,7 @@ def capture_case(
                     target_dbfs=target_dbfs,
                     tol_up_db=tol_up_db,
                     tol_down_db=tol_down_db,
+                    start_gain=None if gains is None or tries > 1 else int(gains[i]),
                 )
             else:
                 used[b.name] = int(gains[i])  # type: ignore[index]
@@ -952,6 +968,7 @@ def find_multiband_operating_point(
                 oversample=oversample,
                 check=check,
                 retakes=retakes,
+                gains=_backoff_gains(search, int(k), search_kw),
             )
     finally:
         try:
@@ -972,6 +989,20 @@ def find_multiband_operating_point(
             raise
         result.case_dir = writer.dir
     return result
+
+
+def _backoff_gains(search: MultibandSearch, k: int, search_kw: dict) -> list[int]:
+    """Each band's ORx gain predicted at ``k`` dB of backoff, where its AGC starts.
+
+    The search's rule: the output peak moves by the drive change minus the compression change,
+    with a typical own slope of 0.5 dB per dB, so the gain goes up ``k / 2`` dB. (Up the full
+    ``k`` dB overshoots: from a 4 dB lock the peak falls only ~1.5 dB in 4 dB of backoff, and a
+    railed start costs the AGC one index per capture.)
+    """
+    lo = int(search_kw.get("gain_min", ORX_GAIN_MIN))
+    hi = int(search_kw.get("gain_max", ORX_GAIN_MAX))
+    per_db = 1.0 / float(search_kw.get("db_per_index", ORX_DB_PER_INDEX))
+    return [int(min(max(bl.orx_gain + round(0.5 * k * per_db), lo), hi)) for bl in search.bands]
 
 
 # -- saving -----------------------------------------------------------------------------------

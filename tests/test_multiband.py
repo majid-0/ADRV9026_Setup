@@ -828,3 +828,37 @@ def test_a_cached_fraction_reads_the_compression_the_full_alignment_reads(bench,
         compressions.append(full)
         assert cheap == pytest.approx(full, abs=tol_db), (atten, full, cheap)
     assert compressions[-1] > 3.5  # the range covers the lock targets
+
+
+def test_each_backoff_levels_from_the_gain_predicted_from_the_lock(monkeypatch):
+    starts, real_capture_case = {}, multiband.capture_case
+
+    def capture_case_spy(*a, **k):
+        starts[len(starts)] = k["gains"]
+        return real_capture_case(*a, **k)
+
+    monkeypatch.setattr(multiband, "capture_case", capture_case_spy)
+    radio, bands = _case_radio(), _case_bands()
+    floor_starts = []
+    real_set = radio.set_rx_gain
+    radio.set_rx_gain = lambda ch, g: (floor_starts.append(g == 185), real_set(ch, g))[1]
+    res = find_multiband_operating_point(
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, backoffs=(0, 2, 4)
+    )
+    lock = [bl.orx_gain for bl in res.search.bands]
+    # 0.5 dB of output per dB of backoff, 0.5 dB per index: k indices up
+    assert starts == {0: lock, 1: [g + 2 for g in lock], 2: [g + 4 for g in lock]}
+    assert sum(floor_starts) == 2  # only the lock's own AGC (one per band) started at the floor
+    for caps in res.captures.values():
+        assert all(c.railed == 0 and -1.6 <= c.peak_dbfs <= -0.7 for c in caps)
+
+
+def test_capture_case_agc_starts_from_the_given_gains():
+    radio, bands, refs, fs = _playing_case()
+    set_gains = []
+    real_set = radio.set_rx_gain
+    radio.set_rx_gain = lambda ch, g: (set_gains.append((ch, g)), real_set(ch, g))[1]
+    caps = capture_case(radio, bands, refs, [16.0, 16.0], rx_bits=12, fs=fs, gains=[219, 221])
+    assert set_gains[0] == (RxChannel.ORX1, 219)
+    assert (RxChannel.ORX4, 221) in set_gains and (RxChannel.ORX1, 185) not in set_gains
+    assert all(c.railed == 0 for c in caps)
