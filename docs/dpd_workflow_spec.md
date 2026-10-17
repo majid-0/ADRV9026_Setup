@@ -585,6 +585,22 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
   the state at once; a failing band is captured again.
 - A fatal search (an ORx that clips at its minimum gain) captures and writes
   nothing. TX is off when the call ends or fails.
+- The search stops early when no band moved for two steps and every band not
+  within tolerance is at its limit or held at an unchanged ORx gain (a band
+  that cannot level).
+
+**Strong coupling: use the walk first.** Up to about 0.4 dB/dB from the other
+band both methods lock the synthetic PAs in 4 to 9 steps
+(`test_both_methods_lock_linear_coupled_bands_within_a_step_budget`). At about
+0.6 dB/dB the search may not lock: on the two-band test PA 6 of 16 lock pairs
+fail within 20 steps with either method, and the slopes method's restart and
+step rules are to be revisited with bench data. Until then, take the first
+bench locks with `method="walk"` and a small `max_steps` (about 8), keep the
+attenuation limits conservative, and read the real cross slope from
+`lock.csv`. The walk has a known limit cycle: when one 0.2 dB fine step moves
+a band's compression by more than the 0.2 dB tolerance window (own plus cross
+slope above about 1 dB/dB, both bands stepping together), it can jump across
+the window until `max_steps`; `lock.csv` then shows ±0.2 dB moves alternating.
 
 **Case folder** (`CaseWriter(run_dir, bands, ...)`): `<run_dir>/<case>/`, with
 `<case>` = `TX1-TX4_1440-1860MHz_80-80BW_4-4GC` (paths, carriers in MHz,
