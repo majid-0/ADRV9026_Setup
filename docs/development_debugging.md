@@ -32,7 +32,8 @@ $conda = "C:\ProgramData\anaconda3\Scripts\conda.exe"
 & $conda run -n myenv python -m black src tests scripts
 & $conda run -n myenv adrvtrx-program                          # connect + program + status
 & $conda run -n myenv python scripts/hw_smoke.py              # bench discovery / loopback
-& $conda run -n myenv python -m pytest -m hardware -v         # gated HW tests (skip if no board)
+$env:ADRVTRX_ALLOW_HARDWARE_TESTS = "1"                         # opt in (see section 6), then:
+& $conda run -n myenv python -m pytest -m hardware -o addopts="" -v  # HW tests: program the board
 ```
 
 ---
@@ -259,9 +260,24 @@ Low-level `sweep.run_sweep` remains for scripts that build `SweepAxis` setters b
 - **Hardware-free (default):** the .NET boundary is faked in `tests/conftest.py`
   (`FakeBridge` — `Types` factories produce `SimpleNamespace`; `device/board/link` are
   MagicMocks). Runs anywhere incl. CI. `pytest -m "not hardware"`.
-- **On-hardware:** `tests/test_hardware.py`, marked `@pytest.mark.hardware`,
-  **reachability-guarded** (skips if `192.168.1.10:55556` is unreachable — safe to run
-  off-bench). Module-scoped connected+programmed session, TX safe on teardown.
+- **On-hardware:** `tests/test_hardware.py`, marked `@pytest.mark.hardware`. They
+  connect to the board **directly** and program it, so they are **opt-in twice**:
+  - a plain `pytest` deselects them (`addopts = "-ra -m \"not hardware\""` in
+    `pyproject.toml`);
+  - selected with `-m hardware`, the `hw` fixture still skips them unless
+    `ADRVTRX_ALLOW_HARDWARE_TESTS=1`, and skips them while a hardware server answers on
+    `[server] port` (the server owns the board: stop it first). They also skip when
+    `192.168.1.10:55556` is unreachable.
+
+  Run them deliberately, on the control PC only, with the server stopped:
+  ```powershell
+  $env:ADRVTRX_ALLOW_HARDWARE_TESTS = "1"
+  & $conda run -n myenv python -m pytest -m hardware -o addopts="" -v
+  ```
+  (`-m hardware` alone also works: the last `-m` wins over the one in `addopts`.)
+  `tests/test_hardware_guard.py` checks that a default run selects none of them and that
+  the guard refuses before connecting. Module-scoped connected+programmed session, TX safe
+  on teardown.
 - When you change a DLL call, also update the fake if needed, and keep the mocked tests
   green — they are the regression net for the logic.
 
@@ -274,7 +290,7 @@ wait for D3 LED red→off (~3 min = booted) then CE 12 V. PC NIC `192.168.1.2/24
 `192.168.1.10:55556`. **Put pads in any TX→ORx loopback** and terminate unused TX.
 
 **Order:** `adrvtrx-program` (status, no TX) → `scripts/hw_smoke.py` (discovery + loopback,
-transmits) → `pytest -m hardware`.
+transmits) → `pytest -m hardware` with `ADRVTRX_ALLOW_HARDWARE_TESTS=1` (section 6).
 
 **Discovery-first methodology:** when behavior is unknown, **dump and measure, don't
 assume.** `hw_smoke.py`'s `channel_powers`/`print_table` pattern (per-slot sample count +
