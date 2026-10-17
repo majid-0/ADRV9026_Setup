@@ -15,6 +15,7 @@ from adrvtrx import RxChannel, TxChannel, multiband
 from adrvtrx.compression import search_tx_compression
 from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
+from adrvtrx.metrics import PA_CLIP_SLOPE
 from adrvtrx.multiband import (
     BandLock,
     BandSpec,
@@ -948,3 +949,92 @@ def test_both_methods_lock_linear_coupled_bands_within_a_step_budget(method, bud
             np.testing.assert_allclose(pa.comp(), 4.0, atol=0.1)  # the truth, not the reading
             steps.append(res.steps)
     assert np.mean(steps) <= mean_max, np.mean(steps)
+
+
+# -- behaviour the second review's injected bugs found unguarded --------------------------------
+
+
+@pytest.mark.parametrize("method, max_steps", [("walk", 5), ("slopes", 4)])
+def test_a_clipped_last_step_is_never_the_one_kept(method, max_steps):
+    """The last step clips (top slope under the guard) and is the closest to the targets; the
+    step kept at max_steps must be the best one that did not clip."""
+    pa = TwoBandPa(locks=(12.0, 14.0), cross=(0.0, 0.0), clip_below={0: 13.0}, noise=0.0)
+    res = pa.search(method=method, max_steps=max_steps)
+    steps = _counted_steps(res)
+    last = steps[max(steps)]
+    assert last["TX1"]["top_slope"] < PA_CLIP_SLOPE  # the scenario: the last step clipped
+    worst = {s: max(abs(h["error_db"]) for h in rows.values()) for s, rows in steps.items()}
+    unclipped = [
+        s
+        for s, rows in steps.items()
+        if all(h["top_slope"] >= PA_CLIP_SLOPE for h in rows.values())
+    ]
+    best = min(unclipped, key=worst.get)
+    assert worst[max(steps)] < worst[best]  # ...and it was closer to the targets
+    assert "closest" in res.reason
+    assert pa.a == [steps[best][name]["atten_db"] for name in ("TX1", "TX4")]
+    assert all(bl.top_slope >= PA_CLIP_SLOPE for bl in res.bands)
+
+
+def test_a_band_at_its_limit_is_held_and_left_out_of_the_solve():
+    """TX4 needs more drive than its 12 dB limit allows; once it is there, the slopes method
+    solves for TX1 alone (TX4's move is fixed at 0), although J has cross terms."""
+    pa = TwoBandPa(locks=(14.0, 9.0), cross=(0.3, 0.3), noise=0.0)
+    res = pa.search(method="slopes", atten_mins_db=[10.0, 12.0])
+    steps = _counted_steps(res)
+    checked = 0
+    for rows in steps.values():
+        t1, t4 = rows["TX1"], rows["TX4"]
+        if t4["action"] != "at limit":
+            continue
+        assert t4["atten_db"] == 12.0 and t4["move_db"] == 0.0
+        assert t1["action"] == "slopes"
+        jac = np.array(json.loads(t1["slopes"]))
+        assert abs(jac[0, 1]) > 0.1  # a cross term the 2x2 solve would have used
+        move = float(np.clip(t1["error_db"] / jac[0, 0], -2.5, 2.5))  # TX1's own row only
+        expected = multiband.quantize_atten(t1["atten_db"] + move) - t1["atten_db"]
+        assert t1["move_db"] == pytest.approx(expected, abs=1e-9)
+        checked += 1
+    assert checked >= 1 and res.bands[1].status == "at limit"
+
+
+def test_the_fatal_band_ends_one_fine_step_above_where_it_clipped():
+    pa = TwoBandPa(noise=0.0, orx_peak={1: 0.5})  # TX4's ORx rails at every gain
+    res = pa.search(fine_step_db=0.3)
+    assert res.fatal and "TX4" in res.reason
+    fatal_row = res.history[-1]
+    assert fatal_row["band"] == "TX4" and fatal_row["action"].startswith("ORx clips")
+    assert fatal_row["atten_db"] == 20.0  # held at its start while it re-leveled
+    assert res.bands[1].atten_db == pa.a[1] == pytest.approx(20.3)  # one fine step up
+    tx1 = [h for h in res.history if h["band"] == "TX1"]
+    assert pa.a[0] == tx1[-1]["atten_db"]  # the other band stays where it was measured
+
+
+def test_a_railed_retake_levels_from_the_floor_not_from_the_predicted_gain(monkeypatch):
+    radio, bands, refs, fs = _playing_case()
+    starts = []
+    real_agc, real_measure = multiband.autolevel_for, multiband.measure_band
+
+    def agc(radio_, orx, *a, **k):
+        starts.append((orx, k.get("start_gain")))
+        return real_agc(radio_, orx, *a, **k)
+
+    def measure(radio_, orx, *a, **k):
+        peak, railed, comp, extra = real_measure(radio_, orx, *a, **k)
+        first_tx1 = orx == RxChannel.ORX1 and sum(o == orx for o, _g in starts) == 1
+        return peak, 3 if first_tx1 else railed, comp, extra  # TX1's first capture railed
+
+    monkeypatch.setattr(multiband, "autolevel_for", agc)
+    monkeypatch.setattr(multiband, "measure_band", measure)
+    caps = capture_case(
+        radio,
+        bands,
+        refs,
+        [16.0, 16.0],
+        rx_bits=12,
+        fs=fs,
+        gains=[219, 221],
+        check=lambda cs: {c.name: {"ok": c.railed == 0} for c in cs},
+    )
+    assert starts == [(RxChannel.ORX1, 219), (RxChannel.ORX4, 221), (RxChannel.ORX1, None)]
+    assert caps[0].tries == 2 and caps[0].railed == 0
