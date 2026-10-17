@@ -853,12 +853,20 @@ def find_multiband_operating_point(
     """Lock every band together, then capture every backoff (every band ``+k`` dB together).
 
     With ``writer`` (a :class:`CaseWriter`), the inputs, every aligned output, ``conditions.csv``
-    and
-    ``lock.csv`` are written. TX is disabled when the call ends or fails. A backoff is added to
-    the lock, so it must be ``>= 0`` (a band never goes below its limit).
+    and ``lock.csv`` are written. The case folder must be empty: that is checked before the radio
+    is touched. If writing still fails, the error raised carries the result as ``case_result``
+    (the captures are not lost). TX is disabled when the call ends or fails. A backoff is added
+    to the lock, so it must be ``>= 0`` (a band never goes below its limit).
+
+    A fatal search (the ORx still clips at its minimum gain) captures and writes nothing: the
+    result has the search and no captures. A lock that did not converge (a band at its limit,
+    clip-limited) is the operating point at that limit: its backoffs are captured.
     """
     if any(k < 0 for k in backoffs):
         raise ValueError(f"backoffs must be >= 0, got {list(backoffs)}")
+    if writer is not None:
+        writer.require_empty()
+    captures: dict[int, list[BandCapture]] = {}
     try:
         search, refs = lock_bands(
             radio,
@@ -873,8 +881,7 @@ def find_multiband_operating_point(
             **search_kw,
         )
         locked = [bl.atten_db for bl in search.bands]
-        captures: dict[int, list[BandCapture]] = {}
-        for k in backoffs:
+        for k in () if search.fatal else backoffs:
             attens = [min(a + int(k), MAX_TX_ATTEN_DB) for a in locked]
             captures[int(k)] = capture_case(
                 radio,
@@ -893,13 +900,17 @@ def find_multiband_operating_point(
         except Exception:  # noqa: BLE001 - leave the bench safe on any path
             pass
     result = CaseResult(search, refs, captures)
-    if writer is not None:
-        writer.write_inputs(refs)
-        for k, caps in captures.items():
-            for c in caps:
-                writer.write_output(k, c.name, c.y_aligned)
-        writer.write_conditions(search, captures)
-        writer.write_lock(search)
+    if writer is not None and not search.fatal:
+        try:
+            writer.write_inputs(refs)
+            for k, caps in captures.items():
+                for c in caps:
+                    writer.write_output(k, c.name, c.y_aligned)
+            writer.write_conditions(search, captures)
+            writer.write_lock(search)
+        except Exception as exc:
+            exc.case_result = result  # the bench run is done: keep its captures
+            raise
         result.case_dir = writer.dir
     return result
 
@@ -958,6 +969,16 @@ class CaseWriter:
 
     def path(self, suffix: str) -> Path:
         return self.dir / f"{self.name}_{suffix}"
+
+    def require_empty(self) -> None:
+        """Raise ``FileExistsError`` unless the case folder is empty (check before a run)."""
+        found = sorted(p.name for p in self.dir.iterdir()) if self.dir.is_dir() else []
+        if found:
+            shown = ", ".join(found[:3]) + (", ..." if len(found) > 3 else "")
+            raise FileExistsError(
+                f"{self.dir} is not empty ({shown}): a case folder is written once (move it "
+                "aside to redo; write case.json after the run)"
+            )
 
     def _new(self, path: Path) -> Path:
         if path.exists():

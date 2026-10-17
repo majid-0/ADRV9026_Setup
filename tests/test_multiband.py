@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from adrvtrx import RxChannel, TxChannel
+from adrvtrx import RxChannel, TxChannel, multiband
 from adrvtrx.compression import search_tx_compression
 from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
 from adrvtrx.multiband import (
+    BandLock,
     BandSpec,
     CaseWriter,
+    MultibandSearch,
     case_name,
     find_multiband_operating_point,
     own_slopes,
@@ -410,13 +413,16 @@ def _signal(seed: int) -> np.ndarray:
     return x / np.abs(x).max()
 
 
-def test_a_whole_case_on_the_shared_pa(tmp_path):
+def _case_radio() -> FakeRadio:
     radio = FakeRadio(Config(dll=DllConfig(install_dir=Path("C:/nonexistent"))), seed=2, pa=PA)
     radio._safe_hooks_installed = True
     radio.connect()
     radio.program()
-    fs = radio.board_model.rate_hz
-    bands = [
+    return radio
+
+
+def _case_bands() -> list[BandSpec]:
+    return [
         BandSpec(
             TxChannel.TX1,
             RxChannel.ORX1,
@@ -436,6 +442,12 @@ def test_a_whole_case_on_the_shared_pa(tmp_path):
             signal_name="Signal2.txt",
         ),
     ]
+
+
+def test_a_whole_case_on_the_shared_pa(tmp_path):
+    radio = _case_radio()
+    fs = radio.board_model.rate_hz
+    bands = _case_bands()
     failed_once = []
 
     def check(caps):  # TX4's first capture of each backoff "fails" once: it is taken again
@@ -492,3 +504,69 @@ def test_a_whole_case_on_the_shared_pa(tmp_path):
 
     with pytest.raises(FileExistsError, match="written once"):
         writer.write_output(0, "TX1", res.captures[0][0].y_aligned)
+
+
+def test_a_fatal_search_captures_and_writes_nothing(tmp_path, monkeypatch):
+    radio, bands = _case_radio(), _case_bands()
+    nan = float("nan")
+
+    def fatal_search(*_a, **_k):  # band 1's ORx clipped at its minimum gain; band 2 unread
+        locks = [
+            BandLock("TX1", 20.05, 185, 1.2, 0.2, 0.4, 0.0, 9, 10.0, "not converged"),
+            BandLock("TX4", nan, 210, nan, nan, nan, nan, 0, 10.0, "not converged"),
+        ]
+        return MultibandSearch(False, "TX1: ORx still clips at minimum gain", "slopes", locks,
+                               1, 3, fatal=True)  # fmt: skip
+
+    monkeypatch.setattr(multiband, "search_multiband_compression", fatal_search)
+    captured = []
+    monkeypatch.setattr(multiband, "capture_case", lambda *a, **k: captured.append(a))
+    writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
+    res = find_multiband_operating_point(
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, writer=writer
+    )
+    assert res.search.fatal and res.captures == {} and res.case_dir is None
+    assert captured == [] and list(writer.dir.iterdir()) == []
+    assert radio.rx_tx_enable_get()[1] == 0  # TX off
+
+
+def test_a_lock_at_the_limit_is_still_captured(monkeypatch):
+    radio = _case_radio()
+    bands = [replace(b, atten_min_db=17.0) for b in _case_bands()]  # both need more drive
+    fs = radio.board_model.rate_hz
+    res = find_multiband_operating_point(
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 1)
+    )
+    assert not res.search.converged and not res.search.fatal
+    assert {bl.status for bl in res.search.bands} == {"at limit"}
+    assert sorted(res.captures) == [0, 1]
+    assert [c.atten_db for c in res.captures[1]] == [bl.atten_db + 1 for bl in res.search.bands]
+
+
+def test_a_used_case_folder_is_refused_before_the_radio_is_touched(tmp_path):
+    bands = _case_bands()
+    writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=10e6)
+    (writer.dir / "conditions.csv").write_text("from an earlier run")
+    radio = MagicMock(name="radio")
+    with pytest.raises(FileExistsError, match="not empty"):
+        find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=10e6, writer=writer)
+    assert radio.mock_calls == []
+
+
+def test_a_failed_write_keeps_the_captures_in_the_error(tmp_path, monkeypatch):
+    radio, bands = _case_radio(), _case_bands()
+    fs = radio.board_model.rate_hz
+    writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=fs)
+
+    def disk_full(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(writer, "write_conditions", disk_full)
+    with pytest.raises(OSError, match="disk full") as err:
+        find_multiband_operating_point(
+            radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 2), writer=writer
+        )
+    kept = err.value.case_result
+    assert sorted(kept.captures) == [0, 2] and kept.search.converged
+    assert all(len(caps) == 2 for caps in kept.captures.values())
+    assert radio.rx_tx_enable_get()[1] == 0
