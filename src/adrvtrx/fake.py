@@ -364,12 +364,12 @@ def _env_delays() -> dict[str, float]:
     return {str(k): float(v) for k, v in json.loads(raw).items()} if raw else {}
 
 
-def _profile_numbers(config: Config) -> tuple[float, int, int]:
-    """ORx rate and TX / Rx bits from the config's profile, or the fake defaults."""
+def _profile_numbers(config: Config, path: str | None = None) -> tuple[float, int, int]:
+    """ORx rate and TX / Rx bits from ``path`` (default: the config's profile), or defaults."""
     try:
         from .profile import read_profile
 
-        info = read_profile(config.profile_path)
+        info = read_profile(config.profile_path if path is None else path)
         return float(info.orx_rate_hz), int(info.tx_bits), int(info.rx_bits)
     except Exception:  # noqa: BLE001 - no profile on this machine: use defaults
         return DEFAULT_RATE_HZ, DEFAULT_BITS, DEFAULT_BITS
@@ -398,6 +398,7 @@ class FakeBoard:
         self.connected = False  # this process's socket, never persisted
         self.waves: dict[str, np.ndarray] = {}  # TX name -> complex codes (playback RAM)
         self.post_init: Any = None
+        self.profile_loaded: str | None = None  # the last ConfigFileLoad(path)
         self.calls: deque[str] = deque(maxlen=10_000)  # recent DLL ops, newest last
         self.state: dict[str, Any] = {
             "programmed": False,
@@ -482,6 +483,8 @@ class FakeBoard:
 
     def config_file_load(self, path: str | None = None) -> None:
         self._require_connected()
+        if path is not None:
+            self.profile_loaded = path  # what Program will run (its rates and bits)
         self._event("ConfigFileLoad", path=path)
 
     def init_struct_get(self) -> _Struct:
@@ -496,8 +499,10 @@ class FakeBoard:
     def program(self) -> None:
         self._require_connected()
         self._delay("Program")
-        # program(profile=...) may have changed the profile: rates and bits follow it
-        self.rate_hz, self.tx_bits, self.rx_bits = _profile_numbers(self.config)
+        # program(profile=...) may load another profile: rates and bits follow the loaded one
+        self.rate_hz, self.tx_bits, self.rx_bits = _profile_numbers(
+            self.config, self.profile_loaded
+        )
         rc = getattr(self.post_init, "radioCtrlInit", None)
         for name, attr in (("LO1", "lo1PllFreq_Hz"), ("LO2", "lo2PllFreq_Hz")):
             value = getattr(rc, attr, None) if rc is not None else None

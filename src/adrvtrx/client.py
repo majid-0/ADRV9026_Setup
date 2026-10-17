@@ -229,9 +229,17 @@ class RemoteRadio:
         """``Radio.program`` in the server (``profile`` changes the sample rate).
 
         Afterwards ``config`` (so ``read_profile(radio.config.profile_path)``) and
-        ``programming`` describe the newly programmed board.
+        ``programming`` describe the newly programmed board. When the server raises,
+        they are read again too (the server keeps its profile), then the error raises.
         """
-        self._call("program", (), {} if profile is None else {"profile": str(profile)})
+        try:
+            self._call("program", (), {} if profile is None else {"profile": str(profile)})
+        except BaseException:
+            try:
+                self.session_info()
+            except Exception:  # noqa: BLE001 - the program error is the one to report
+                pass
+            raise
         self.session_info()
 
     def loaded_signals(self) -> dict[str, Any]:

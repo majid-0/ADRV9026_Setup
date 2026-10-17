@@ -192,7 +192,11 @@ class Config:
     @property
     def profile_path(self) -> Path:
         """Resolve the profile to an absolute path under the install profiles dir."""
-        p = Path(os.path.expandvars(self.profile_name))
+        return self.profile_path_for(self.profile_name)
+
+    def profile_path_for(self, name: str | os.PathLike[str]) -> Path:
+        """Where a profile name would resolve (absolute, or under the profiles dir)."""
+        p = Path(os.path.expandvars(str(name)))
         return p if p.is_absolute() else self.dll.profiles_dir / p
 
     # -- loading ---------------------------------------------------------------

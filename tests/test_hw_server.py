@@ -446,6 +446,29 @@ def test_a_client_changes_the_profile_and_its_config_follows(cfg):
             assert radio.config.profile_path == data / "stub_uc61.profile"
 
 
+def test_a_failed_profile_change_leaves_server_and_client_on_the_old_profile(cfg):
+    data = Path(__file__).parent / "data"
+    with running_server(cfg) as srv:
+        with hardware("bad profile", config=cfg) as radio:
+            radio.program(profile=str(data / "stub_uc98.profile"))
+            before = radio.session_info()["programming"]
+            with pytest.raises(FileNotFoundError):  # missing file: checked before the board
+                radio.program(profile=str(data / "no_such.profile"))
+            assert radio.config.profile_path == data / "stub_uc98.profile"
+
+            def program_fails():
+                raise RuntimeError("Program failed")
+
+            srv.radio.board.Program = program_fails  # the load succeeds, programming fails
+            radio.config.profile_name = "stale.profile"  # the client re-reads it on error
+            with pytest.raises(RuntimeError, match="Program failed"):
+                radio.program(profile=str(data / "stub_uc61.profile"))
+            assert radio.config.profile_path == data / "stub_uc98.profile"
+            assert radio.programming == before  # no new programming identity
+        assert srv.config.profile_path == data / "stub_uc98.profile"
+        assert server_status(cfg)["programming"]["profile"] == "stub_uc98.profile"
+
+
 def test_programming_identity_counts_every_programming(cfg):
     with running_server(cfg):
         first = server_status(cfg)["programming"]

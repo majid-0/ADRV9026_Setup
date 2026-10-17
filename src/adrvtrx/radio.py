@@ -211,16 +211,25 @@ class Radio:
         """Reproduce the StdUseCase init sequence from config. See docs/api_notes.md.
 
         ``profile`` (a file name under the install's profiles directory, or an absolute
-        path) becomes the config's profile first: the way to change the sample rate.
-        ``None`` programs with the config's profile.
+        path) is programmed instead, and becomes the config's profile once programming
+        succeeded: the way to change the sample rate. A missing file raises
+        ``FileNotFoundError`` before the board is touched; a failed programming leaves
+        the config's profile as it was. ``None`` programs with the config's profile.
         """
+        cfg = self.config
+        path = cfg.profile_path if profile is None else cfg.profile_path_for(profile)
+        if profile is not None and not path.is_file():
+            raise FileNotFoundError(f"profile {path} not found; the board keeps {cfg.profile_name}")
+        self._program(path)
         if profile is not None:
-            self.config.profile_name = str(profile)
+            cfg.profile_name = str(profile)
+
+    def _program(self, profile_path) -> None:
         cfg = self.config
         b = self.bridge
         dev = self.device
 
-        dev.ConfigFileLoad(str(cfg.profile_path))
+        dev.ConfigFileLoad(str(profile_path))
 
         init = dev.InitStructGet()
         init.clocks.deviceClock_kHz = cfg.clocks.device_clock_khz

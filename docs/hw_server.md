@@ -198,6 +198,12 @@ programming identity records it, `status` shows it, and the next lease's
 `config` carries it. Programming clears TX RAM (§4.1). A watchdog restart
 programs with the config file's profile again; the new `program_id` and
 `profile` show it, so a client that needs another profile programs it again.
+The profile becomes the server's only once programming succeeded: a missing
+file is refused before the board is touched, and a failed load or `Program()`
+keeps the previous profile name and programming identity (the client's
+`config` and `programming` are re-read from the server before the error
+raises). After a failed `Program()` the board's state is unknown: program it
+again.
 
 ## 5. Limits
 

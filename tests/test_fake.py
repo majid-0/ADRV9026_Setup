@@ -50,6 +50,28 @@ def test_program_with_a_profile_changes_the_sample_rate_and_clears_tx_ram():
     assert radio.config.profile_path == DATA / "stub_uc61.profile"
 
 
+def test_a_profile_that_fails_to_program_does_not_become_the_configs():
+    radio = _radio()
+    radio.connect()
+    radio.program(profile=str(DATA / "stub_uc98.profile"))
+    board = radio.board_model
+    loads = board.calls.count("ConfigFileLoad")
+
+    with pytest.raises(FileNotFoundError, match="not found"):  # checked before the board
+        radio.program(profile=str(DATA / "no_such.profile"))
+    assert board.calls.count("ConfigFileLoad") == loads
+    assert radio.config.profile_path == DATA / "stub_uc98.profile"
+
+    def program_fails():
+        raise RuntimeError("Program failed")
+
+    radio.board.Program = program_fails  # the load succeeds, programming fails
+    with pytest.raises(RuntimeError, match="Program failed"):
+        radio.program(profile=str(DATA / "stub_uc61.profile"))
+    assert radio.config.profile_path == DATA / "stub_uc98.profile"
+    assert board.rate_hz == 491.52e6
+
+
 def test_program_and_status_run_the_real_radio_code():
     radio = _radio()
     radio.connect()
