@@ -155,6 +155,56 @@ def test_numpy_round_trip(server, cfg):
     assert np.abs(raw[8]).max() > 100  # ORx1 slot carries the loopback
 
 
+def _loopback_on(radio) -> None:
+    radio.set_tx_atten(TxChannel.TX1, 15.0)
+    radio.set_rx_gain(RxChannel.ORX1, 214)
+    radio.perform_tx(tx_buffers(128), int(TxChannel.TX1))
+
+
+def test_a_capture_ships_only_the_arrays_it_reads(server, cfg):
+    from adrvtrx.capture import capture
+
+    with hardware("one orx", config=cfg) as radio:
+        _loopback_on(radio)
+        radio.set_rx_enable(int(RxChannel.ORX1))
+        raw = radio.perform_rx(0x3FF, 0.0128, keep=[8, 9])
+        assert len(raw) == 20 and [len(a) for a in raw].count(128) == 2
+        assert all(len(a) == 0 for k, a in enumerate(raw) if k not in (8, 9))
+        assert np.abs(raw[8]).max() > 100  # the ORx1 slot, with the loopback
+        cap = capture(radio, int(RxChannel.ORX1), 0.0128, bits=12).channels[RxChannel.ORX1]
+        assert len(cap.i) == 128 and np.abs(cap.i).max() > 100
+    calls = [json.loads(line) for line in _server_log(server).read_text().splitlines()]
+    shipped = [c for c in calls if c.get("method") == "perform_rx"]
+    assert shipped[-1]["keep"] == [8, 9]  # capture() asked for the ORx1 slot only
+
+
+def test_keep_is_compatible_with_older_servers_and_older_clients(server, cfg, monkeypatch):
+    from adrvtrx.capture import capture
+
+    with hardware("old client", config=cfg) as radio:
+        _loopback_on(radio)
+        radio.set_rx_enable(int(RxChannel.ORX1))
+        old = radio._call("perform_rx", (0x3FF, 0.0128), {})  # no "keep" in the message
+        assert len(old) == 20 and all(len(a) == 128 for a in old)
+
+    invoke = HardwareServer._invoke  # an older server: it never reads the message's "keep"
+    monkeypatch.setattr(
+        HardwareServer,
+        "_invoke",
+        lambda self, m, a, k, client=None, keep=None: invoke(self, m, a, k, client),
+    )
+    with hardware("new client, old server", config=cfg) as radio:
+        _loopback_on(radio)
+        raw = radio.perform_rx(0x3FF, 0.0128, keep=[8, 9])
+        assert all(len(a) == 128 for a in raw)  # everything came back, as before
+        cap = capture(radio, int(RxChannel.ORX1), 0.0128, bits=12).channels[RxChannel.ORX1]
+        assert len(cap.i) == 128 and np.abs(cap.i).max() > 100
+
+
+def _server_log(server) -> Path:
+    return max(server.settings.log_path.glob("server-*.jsonl"), key=lambda p: p.stat().st_mtime)
+
+
 def test_errors_keep_their_type_and_bad_arguments_never_leave(server, cfg):
     with hardware("errors", config=cfg) as radio:
         with pytest.raises(KeyError, match="adrvtrx-server"):

@@ -11,6 +11,7 @@ therefore index a wanted channel by its absolute position in that set.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -145,17 +146,14 @@ def auto_sof_trigger(channel_mask, tx_to_orx, default=RxTrigSource.IMMEDIATE) ->
     return TX_SOF_FOR[txs[0]] if txs else default
 
 
-def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
-    """Extract ``wanted`` channels from a PerformRx result by absolute position.
+def channel_slots(order, wanted) -> dict:
+    """Readback slot of each ``wanted`` channel: ``{channel: slot}`` (arrays ``2*slot``, ``+1``).
 
-    ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
-    the result holds 2 arrays (I, Q) per entry in ``order``. Main Rx channels sit
-    at their own bit position. ORx is different: the 4 ORx inputs mux into just 2
-    ADCs, so an ORx request resolves to one of the two physical ORx ADC slots
-    (ORx1/ORx2 -> slot 0, ORx3/ORx4 -> slot 1) -- confirmed on the bench and
-    against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
+    Main Rx channels sit at their own bit position; an ORx input resolves to its physical ORx
+    ADC slot (see :func:`extract_channels`). Raises ``ValueError`` for a channel the active
+    ``rxInitChannelMask`` does not return.
     """
-    out: dict[RxChannel, ChannelCapture] = {}
+    slots: dict[RxChannel, int] = {}
     for ch in wanted:
         if is_orx(ch):
             idx = orx_slot_for(ch, order)
@@ -173,8 +171,31 @@ def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
                 f"(returned channels: {[c.name for c in order if c]}). "
                 f"Enable it in config [channels].rx_init_mask."
             )
-        i = np.fromiter(perform_rx_result[2 * idx], dtype=np.int32)
-        q = np.fromiter(perform_rx_result[2 * idx + 1], dtype=np.int32)
+        slots[ch] = idx
+    return slots
+
+
+def _int32(values) -> np.ndarray:
+    """A numpy array (the hardware server's result) as is; a .NET array element by element."""
+    if isinstance(values, np.ndarray):
+        return np.asarray(values, dtype=np.int32)
+    return np.fromiter(values, dtype=np.int32)
+
+
+def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
+    """Extract ``wanted`` channels from a PerformRx result by absolute position.
+
+    ``order`` is :func:`returned_channel_order` for the active ``rxInitChannelMask``;
+    the result holds 2 arrays (I, Q) per entry in ``order``. Main Rx channels sit
+    at their own bit position. ORx is different: the 4 ORx inputs mux into just 2
+    ADCs, so an ORx request resolves to one of the two physical ORx ADC slots
+    (ORx1/ORx2 -> slot 0, ORx3/ORx4 -> slot 1) -- confirmed on the bench and
+    against ADI's rxDataCapture sample. Returns ``{channel: ChannelCapture}``.
+    """
+    out: dict[RxChannel, ChannelCapture] = {}
+    for ch, idx in channel_slots(order, wanted).items():
+        i = _int32(perform_rx_result[2 * idx])
+        q = _int32(perform_rx_result[2 * idx + 1])
         out[ch] = ChannelCapture(ch, i, q, bits)
     return out
 
@@ -211,7 +232,16 @@ def capture(
     # Absolute set (preserving TX) so a prior capture's ORx enable can't leak in.
     orx_bits = sum(int(ch) for ch in wanted if is_orx(ch))
     radio.set_rx_enable((rx_init & 0x0F) | orx_bits)
-    raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
+    # Through the hardware server only the wanted arrays travel (``keep``).
+    keep = sorted(
+        p for slot in channel_slots(order, wanted).values() for p in (2 * slot, 2 * slot + 1)
+    )
+    if _takes_keep(radio):
+        raw = radio.perform_rx(
+            rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms, keep=keep
+        )
+    else:  # a radio stand-in without ``keep``
+        raw = radio.perform_rx(rx_init, capture_time_ms, trig=trig, timeout_ms=timeout_ms)
 
     # Self-diagnose profile/mask mismatch: the readback must hold 2 arrays (I,Q)
     # per channel in rxInitChannelMask. If a profile returns a different set, the
@@ -376,15 +406,38 @@ def autolevel_capture(
     return result
 
 
-def capture_arrays(raw) -> list[np.ndarray]:
+def capture_arrays(raw, keep=None) -> list[np.ndarray]:
     """A PerformRx result as plain ``int32`` numpy arrays ``[ch0_I, ch0_Q, ...]``.
 
     Same layout and indexing as the DLL result, so :func:`extract_channels`
     reads either. Used where the .NET object cannot travel (the hardware server).
+    With ``keep`` (array positions), only those are converted; the others are
+    empty arrays in their places.
     """
     n = _result_len(raw)
     items = raw if n is None else (raw[k] for k in range(n))
-    return [np.fromiter(a, dtype=np.int32) for a in items]
+    if keep is None:
+        return [np.fromiter(a, dtype=np.int32) for a in items]
+    kept = {int(k) for k in keep}
+    empty = np.zeros(0, dtype=np.int32)
+    return [np.fromiter(a, dtype=np.int32) if k in kept else empty for k, a in enumerate(items)]
+
+
+_TAKES_KEEP: dict[type, bool] = {}
+
+
+def _takes_keep(radio) -> bool:
+    """Whether ``radio.perform_rx`` accepts ``keep`` (Radio, RemoteRadio; not every stand-in)."""
+    kind = type(radio)
+    if kind not in _TAKES_KEEP:
+        try:
+            params = inspect.signature(radio.perform_rx).parameters
+            _TAKES_KEEP[kind] = "keep" in params or any(
+                p.kind is p.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            _TAKES_KEEP[kind] = False
+    return _TAKES_KEEP[kind]
 
 
 def _result_len(raw) -> int | None:

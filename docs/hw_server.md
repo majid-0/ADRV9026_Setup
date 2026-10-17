@@ -65,7 +65,14 @@ one experiment.
   arrays to `perform_tx`; `Radio.perform_tx` converts them to .NET arrays
   itself. `perform_rx` results come back as a list of `int32` numpy arrays
   `[ch0_I, ch0_Q, ...]`, the same layout `capture.extract_channels` already
-  reads.
+  reads. `perform_rx(..., keep=[positions])` (what `capture.capture` sends)
+  ships only those arrays; the others come back empty in their places, so the
+  layout and indexing do not change. One ORx of a 1 ms capture at 491.52 MSPS
+  is 3.9 MB instead of the 39 MB of all 20 arrays, and the server converts 2
+  .NET arrays instead of 20. `keep` travels beside the call, not as an argument
+  of it: a server older than this ignores it and ships every array (the
+  client still reads the right ones), and an older client sends none and gets
+  every array. Restart the server to get the smaller captures.
 
 ## 3. Client API
 
@@ -486,7 +493,7 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | Test | What it checks |
 |---|---|
 | forwarding | `RemoteRadio` has exactly the public `Radio` methods; each one returns what an in-process `FakeRadio` returns |
-| numpy boundary | `perform_tx` numpy → .NET conversion inside `Radio`; `perform_rx` comes back as `int32` arrays |
+| numpy boundary | `perform_tx` numpy → .NET conversion inside `Radio`; `perform_rx` comes back as `int32` arrays; with `keep` only those arrays carry data; an older server or client still works |
 | queue | FIFO order, `wait=False`, queue timeout, waiting client disconnects |
 | client killed | a client process killed with TX on → `safe_state`, next job proceeds |
 | heartbeat | silent client with TX on → revoked after the timeout |

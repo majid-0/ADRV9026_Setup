@@ -26,6 +26,8 @@ from ._enums import RxChannel, RxTrigSource, TxChannel, TxTrigSource
 from .config import Config
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ._clr import ClrBridge
 
 MAX_TX_ATTEN_DB = 41.95  # ADRV902x TxAtten table max (~42 dB)
@@ -491,11 +493,16 @@ class Radio:
         *,
         trig: RxTrigSource = RxTrigSource.IMMEDIATE,
         timeout_ms: int = 1000,
+        keep: Sequence[int] | None = None,
     ):
         """Arm + trigger a snapshot capture. Returns the DLL capture result object.
 
         The result is a flat indexable of already-scaled int arrays interleaved
         ``[ch0_I, ch0_Q, ...]``; ``capture.extract_channels`` shapes it.
+
+        ``keep`` lists the array positions the caller reads. Through the hardware server
+        only those arrays travel (the others come back empty, so positions stay the same);
+        here the DLL result is returned whole.
         """
         return self.board.PerformRx(
             self._rx_trig(trig), int(channel_mask), float(capture_time_ms), int(timeout_ms)
