@@ -32,9 +32,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ._enums import RxChannel, TxChannel
-from .align import estimate_and_align
-from .capture import autolevel_capture, capture
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
+from .capture import aligned_capture, autolevel_for
+from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN
 from .metrics import gain_compression_db, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
 
@@ -416,33 +415,31 @@ def find_compression_point(
     if lock_on not in LOCK_METRICS:
         raise ValueError(f"lock_on must be one of {LOCK_METRICS}, got {lock_on!r}")
     ref = np.asarray(ref)
-    capture_ms = oversample * len(ref) / float(fs) * 1e3
 
     radio.set_tx_atten(tx, quantize_atten(start_atten_db))
-    agc = autolevel_capture(
+    agc = autolevel_for(
         radio,
         orx,
+        ref,
         bits=rx_bits,
-        orx_rate_hz=fs,
+        fs=fs,
+        oversample=oversample,
         target_dbfs=target_dbfs,
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
-        verify_capture_ms=capture_ms,
     )
 
     def measure() -> tuple[float, int, float, dict]:
-        out = capture(radio, int(orx), capture_ms, bits=rx_bits).channels[orx]
-        rep = clip_report(out.i, out.q, rx_bits)
-        x_al, y_al, _delay = estimate_and_align(ref, out.iq, fs)
-        papr_comp, _pin, _pout = window_compression_db(x_al, y_al, fs, window_s)
-        gain_comp, slope = gain_compression_db(x_al, y_al)
+        cap = aligned_capture(radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample)
+        papr_comp, _pin, _pout = window_compression_db(cap.x_aligned, cap.y_aligned, fs, window_s)
+        gain_comp, slope = gain_compression_db(cap.x_aligned, cap.y_aligned)
         comp = gain_comp if lock_on == "gain" else papr_comp
         extra = {
             "papr_compression_db": papr_comp,
             "gain_compression_db": gain_comp,
             "top_slope": slope,
         }
-        return rep.peak_dbfs, rep.railed_samples, comp, extra
+        return cap.clip.peak_dbfs, cap.clip.railed_samples, comp, extra
 
     result = search_tx_compression(
         lambda db: radio.set_tx_atten(tx, db),

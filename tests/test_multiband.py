@@ -694,18 +694,19 @@ def test_capture_case_without_agc_records_the_gains_it_set_never_a_readback(monk
 def test_capture_case_relevels_a_railed_band_and_records_the_new_gain(monkeypatch):
     radio, bands, refs, fs = _playing_case()
     levels = []
-    real_agc, real_measure = multiband._agc, multiband.measure_band
+    real_agc, real_measure = multiband.autolevel_for, multiband.measure_band
 
     def agc(radio_, orx, *a, **k):
-        levels.append((orx, real_agc(radio_, orx, *a, **k)))
-        return levels[-1][1]
+        result = real_agc(radio_, orx, *a, **k)
+        levels.append((orx, result.final_gain_index))
+        return result
 
     def measure(radio_, orx, *a, **k):
         peak, railed, comp, extra = real_measure(radio_, orx, *a, **k)
         first_tx1 = orx == RxChannel.ORX1 and sum(o == orx for o, _g in levels) == 1
         return peak, 3 if first_tx1 else railed, comp, extra  # TX1's first capture railed
 
-    monkeypatch.setattr(multiband, "_agc", agc)
+    monkeypatch.setattr(multiband, "autolevel_for", agc)
     monkeypatch.setattr(multiband, "measure_band", measure)
     caps = capture_case(
         radio,
@@ -765,7 +766,9 @@ def test_case_json_carries_the_lock(tmp_path):
 
 def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeypatch):
     calls = {"full": 0, "fraction": 0}
-    real_full, real_fraction = multiband.estimate_and_align, multiband.align_with_fraction
+    from adrvtrx import capture as capture_module
+
+    real_full, real_fraction = capture_module.estimate_and_align, capture_module.align_with_fraction
 
     def full(*a, **k):
         calls["full"] += 1
@@ -775,8 +778,8 @@ def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeyp
         calls["fraction"] += 1
         return real_fraction(*a, **k)
 
-    monkeypatch.setattr(multiband, "estimate_and_align", full)
-    monkeypatch.setattr(multiband, "align_with_fraction", fraction)
+    monkeypatch.setattr(capture_module, "estimate_and_align", full)
+    monkeypatch.setattr(capture_module, "align_with_fraction", fraction)
     radio, bands = _case_radio(), _case_bands()
     search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
     assert search.converged

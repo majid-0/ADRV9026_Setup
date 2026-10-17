@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from ._enums import RxChannel, TxChannel, channel_name
-from .capture import AgcResult, autolevel_capture
+from .capture import AgcResult, autolevel_for
 from .compression import CompressionResult, find_compression_point, quantize_atten
 from .conditions import (
     ConditionLog,
@@ -156,15 +156,16 @@ def find_operating_point(
         if backoff_db > 0:
             atten = quantize_atten(min(locked + backoff_db, MAX_TX_ATTEN_DB))
             radio.set_tx_atten(tx, atten)
-            agc = autolevel_capture(
+            agc = autolevel_for(
                 radio,
                 orx,
+                ref,
                 bits=rx_bits,
-                orx_rate_hz=fs,
+                fs=fs,
+                oversample=oversample,
                 target_dbfs=target_dbfs,
                 tol_up_db=tol_up_db,
                 tol_down_db=tol_down_db,
-                verify_capture_ms=oversample * len(ref) / float(fs) * 1e3,
             )
             gain = agc.final_gain_index
         point = capture_point(

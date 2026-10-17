@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from ._enums import RX_SINGLE, TX_SOF_FOR, RxChannel, RxTrigSource, TxChannel, is_orx
+from .align import align_with_fraction, estimate_and_align
 from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
 from .waveform import samples_for_duration, save_tab_iq_float
 
@@ -408,6 +409,85 @@ def autolevel_capture(
             result.reason = vr.reason
 
     return result
+
+
+def reference_capture_ms(ref, fs: float, oversample: int = 2) -> float:
+    """Capture length (ms) for ``oversample`` periods of the reference ``ref`` at ``fs``."""
+    return oversample * len(ref) / float(fs) * 1e3
+
+
+@dataclass
+class AlignedCapture:
+    """One capture of ``oversample`` reference periods, one period aligned to the reference.
+
+    ``raw`` is the capture (``raw.iq`` complex codes is ``iq``), ``clip`` its clip report;
+    ``x_aligned`` / ``y_aligned`` are the reference period and the captured period aligned to it,
+    ``delay_samples`` the delay found.
+    """
+
+    raw: ChannelCapture
+    iq: np.ndarray
+    clip: ClipReport
+    x_aligned: np.ndarray
+    y_aligned: np.ndarray
+    delay_samples: float
+
+
+def aligned_capture(
+    radio,
+    channel: RxChannel,
+    ref,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    fraction: float | None = None,
+) -> AlignedCapture:
+    """Capture ``oversample`` periods of ``ref`` on ``channel``, report clipping, align a period.
+
+    TX must already be playing ``ref`` (TX codes). The alignment is
+    :func:`~adrvtrx.align.estimate_and_align`, or :func:`~adrvtrx.align.align_with_fraction`
+    with ``fraction`` (the path's ``delay % 1``, known from an earlier full alignment). The
+    capture-and-align step of the compression searches and of ``conditions.capture_point``.
+    """
+    ref = np.asarray(ref)
+    out = capture(radio, int(channel), reference_capture_ms(ref, fs, oversample), bits=bits)
+    raw = out.channels[channel]
+    rep = clip_report(raw.i, raw.q, bits)
+    iq = raw.iq
+    if fraction is None:
+        x_al, y_al, delay = estimate_and_align(ref, iq, fs)
+    else:
+        x_al, y_al, delay = align_with_fraction(ref, iq, fraction)
+    return AlignedCapture(raw, iq, rep, x_al, y_al, float(delay))
+
+
+def autolevel_for(
+    radio,
+    channel: RxChannel,
+    ref,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    target_dbfs: float = -1.0,
+    tol_up_db: float = 0.3,
+    tol_down_db: float = 0.6,
+    start_gain: int | None = None,
+) -> AgcResult:
+    """:func:`autolevel_capture` for a capture of ``oversample`` periods of ``ref``: Stage C
+    verifies the gain on exactly the capture the measurement takes. ``fs`` is the ORx rate."""
+    return autolevel_capture(
+        radio,
+        channel,
+        bits=bits,
+        orx_rate_hz=fs,
+        target_dbfs=target_dbfs,
+        tol_up_db=tol_up_db,
+        tol_down_db=tol_down_db,
+        verify_capture_ms=reference_capture_ms(ref, fs, oversample),
+        start_gain=start_gain,
+    )
 
 
 def capture_arrays(raw, keep=None) -> list[np.ndarray]:

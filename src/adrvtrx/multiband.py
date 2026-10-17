@@ -55,12 +55,11 @@ from typing import Any
 import numpy as np
 
 from ._enums import RxChannel, TxChannel, channel_name
-from .align import align_with_fraction, estimate_and_align
-from .capture import autolevel_capture, capture
+from .capture import aligned_capture, autolevel_for
 from .compression import fine_step, quantize_atten, relevel_index
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, clip_report
+from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN
 from .metrics import PA_CLIP_SLOPE, gain_compression_db, period_metrics, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
 from .transmit import transmit_bands
@@ -775,51 +774,19 @@ def measure_band(
     :func:`~adrvtrx.align.estimate_and_align` (no upsampled refinement): the search's readings
     use it; a case capture aligns in full.
     """
-    ref = np.asarray(ref)
-    ms = oversample * len(ref) / float(fs) * 1e3
-    out = capture(radio, int(orx), ms, bits=rx_bits).channels[orx]
-    rep = clip_report(out.i, out.q, rx_bits)
-    if fraction is None:
-        x_al, y_al, delay = estimate_and_align(ref, out.iq, fs)
-    else:
-        x_al, y_al, delay = align_with_fraction(ref, out.iq, fraction)
-    papr, _pin, _pout = window_compression_db(x_al, y_al, fs, window_s)
-    gain_comp, slope = gain_compression_db(x_al, y_al)
+    cap = aligned_capture(
+        radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample, fraction=fraction
+    )
+    papr, _pin, _pout = window_compression_db(cap.x_aligned, cap.y_aligned, fs, window_s)
+    gain_comp, slope = gain_compression_db(cap.x_aligned, cap.y_aligned)
     extra = {
         "papr_compression_db": papr,
         "top_slope": slope,
-        "raw": out.iq,
-        "y_aligned": y_al,
-        "delay_samples": float(delay),
+        "raw": cap.iq,
+        "y_aligned": cap.y_aligned,
+        "delay_samples": cap.delay_samples,
     }
-    return rep.peak_dbfs, rep.railed_samples, gain_comp, extra
-
-
-def _agc(
-    radio,
-    orx,
-    ref,
-    *,
-    rx_bits,
-    fs,
-    oversample,
-    target_dbfs,
-    tol_up_db,
-    tol_down_db,
-    start_gain: int | None = None,
-) -> int:
-    agc = autolevel_capture(
-        radio,
-        orx,
-        bits=rx_bits,
-        orx_rate_hz=fs,
-        target_dbfs=target_dbfs,
-        tol_up_db=tol_up_db,
-        tol_down_db=tol_down_db,
-        verify_capture_ms=oversample * len(ref) / float(fs) * 1e3,
-        start_gain=start_gain,
-    )
-    return int(agc.final_gain_index)
+    return cap.clip.peak_dbfs, cap.clip.railed_samples, gain_comp, extra
 
 
 def _check_los(bands: Sequence[BandSpec], clocks) -> None:
@@ -870,16 +837,18 @@ def lock_bands(
             radio.retune_lo(lo, hz)
     refs = play_bands(radio, bands, tx_bits=tx_bits)
     gains = [
-        _agc(
-            radio,
-            b.orx,
-            r,
-            rx_bits=rx_bits,
-            fs=fs,
-            oversample=oversample,
-            target_dbfs=target_dbfs,
-            tol_up_db=tol_up_db,
-            tol_down_db=tol_down_db,
+        int(
+            autolevel_for(
+                radio,
+                b.orx,
+                r,
+                bits=rx_bits,
+                fs=fs,
+                oversample=oversample,
+                target_dbfs=target_dbfs,
+                tol_up_db=tol_up_db,
+                tol_down_db=tol_down_db,
+            ).final_gain_index
         )
         for b, r in zip(bands, refs)
     ]
@@ -985,11 +954,11 @@ def capture_case(
         b, ref = bands[i], refs[i]
         if relevel or b.name not in used:
             if agc:
-                used[b.name] = _agc(
+                level = autolevel_for(
                     radio,
                     b.orx,
                     ref,
-                    rx_bits=rx_bits,
+                    bits=rx_bits,
                     fs=fs,
                     oversample=oversample,
                     target_dbfs=target_dbfs,
@@ -997,6 +966,7 @@ def capture_case(
                     tol_down_db=tol_down_db,
                     start_gain=None if gains is None or tries > 1 else int(gains[i]),
                 )
+                used[b.name] = int(level.final_gain_index)
             else:
                 used[b.name] = int(gains[i])  # type: ignore[index]
                 radio.set_rx_gain(b.orx, used[b.name])
