@@ -159,7 +159,6 @@ if __name__ == "__main__":
     if "--regenerate" not in sys.argv:
         sys.exit("python tests/test_multiband_golden.py --regenerate  (overwrites the golden file)")
     data = {name: run(*spec) for name, spec in sorted(_scenarios().items())}
-    GOLDEN.write_text(
-        json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
-    )
+    with open(GOLDEN, "w", encoding="utf-8", newline="\n") as fh:  # LF on every system
+        fh.write(json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n")
     print(f"wrote {GOLDEN} ({GOLDEN.stat().st_size / 1e3:.0f} kB, {len(data)} scenarios)")

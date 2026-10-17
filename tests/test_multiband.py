@@ -68,7 +68,7 @@ class TwoBandPa:
         own = self.a[i] - self.locks[i]  # 0 at this band's own lock (other band at 20 dB)
         k = 10 ** (self.p * 4.0 / 10) - 1  # 4 dB at own = 0
         c = 10 / self.p * np.log10(1 + k * 10 ** (-self.p * own / 10))
-        return float(c + self.cross[i] * (20.0 - self.a[1 - i]))
+        return float(c + self.cross[i] * (20.0 - min(self.a[1 - i], 20.0)))
 
     def measure(self, i: int):
         self.reads += 1
@@ -233,7 +233,7 @@ def _counted_steps(res, names=("TX1", "TX4")) -> dict[int, dict[str, dict]]:
     [
         ({"orx_peak": {1: 0.5}}, {"max_steps": 3, "gain_min": 100}),  # never a counted step
         ({"cross": (0.3, 0.3)}, {"max_steps": 3}),
-        ({"cross": (0.6, 0.6)}, {"max_steps": 12}),
+        ({"cross": (0.6, 0.6)}, {"max_steps": 8}),
         ({"cross": (0.6, 0.6)}, {"max_steps": 12, "method": "walk"}),
     ],
 )
@@ -255,7 +255,7 @@ def test_at_max_steps_the_radio_is_left_where_it_was_measured(pa_kw, search_kw):
 
 def test_at_max_steps_the_step_closest_to_the_targets_is_restored():
     pa = TwoBandPa(cross=(0.6, 0.6))
-    res = pa.search(max_steps=12)
+    res = pa.search(method="walk", max_steps=12)
     steps = _counted_steps(res)
     worst = {s: max(abs(h["error_db"]) for h in rows.values()) for s, rows in steps.items()}
     best = min(worst, key=worst.get)
