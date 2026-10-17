@@ -203,8 +203,11 @@ make lint      # ruff + black --check
 make test      # hardware-free unit tests (this is local "CI")
 make format    # auto-fix
 nox            # lint + tests across 3.9 / 3.11
-make test-hw   # ONLY on the control PC with ADS9 + ADRV9026 connected
+make test-hw   # ONLY on the control PC with ADS9 + ADRV9026 connected, server stopped
 ```
+
+A plain `pytest` never selects the hardware tests (they program the board); `make test-hw`
+opts in (`ADRVTRX_ALLOW_HARDWARE_TESTS=1`, docs/development_debugging.md section 6).
 
 GitHub Actions (`.github/workflows/ci.yml`) runs lint + mocked tests on push.
 
