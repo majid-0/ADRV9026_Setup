@@ -68,8 +68,10 @@ the same sample-aligned snapshot.
 **Trigger enum `adi_fpga9010_RxTollgateTrigSources_e`:**
 `IMM_TRIG=0x1`, `EXT_TRIG=0x2`, `TDD_SM=0x4`, `ARM_ACK=0x8`,
 **`TX1_SOF=0x10`, `TX2_SOF=0x20`, `TX3_SOF=0x40`, `TX4_SOF=0x80`**.
-→ Use `TXn_SOF` to align ORx/Rx capture to TX start-of-frame (deterministic
-TX↔ORx). Use `IMM_TRIG` for free-running snapshot.
+→ `TXn_SOF` would align the capture to TX start-of-frame, but on this bench it
+always times out (`RxCaptureWait timeout`: the TX datapath emits no
+start-of-frame; docs/development_debugging.md §8). Captures use `IMM_TRIG` and
+are aligned to the reference in software (`adrvtrx.align`).
 
 ## 3. TX playback (multi-band) — RESOLVED
 
@@ -100,13 +102,15 @@ Settled-state deterministic; NOT phase-continuous hop (as expected).
 
 ## 5. Profile fields (bit depth + sample rate) — RESOLVED
 
-In the `.profile` JSON (e.g. `ADRV9025Init_StdUseCase102_LinkSharing.profile`):
+In the `.profile` JSON (the default is `ADRV9025Init_StdUseCase98_LinkSharing.profile`,
+`config/default.toml` `[profile]`; this section was first worked out on StdUseCase102):
 - Sample rate: **`txInputRate_kHz`** (deframer/Tx), **`rxOutputRate_kHz`** (framer/Rx).
-  StdUseCase102 = 245760 kHz (245.76 MSPS) for both.
+  StdUseCase98: Tx and ORx 491520 kHz (491.52 MSPS), main Rx 245760 kHz.
+  StdUseCase102: 245760 kHz (245.76 MSPS) for both.
 - Bit depth: **`jesd204Np`** under `framer[]` (Rx/ORx) and `deframer[]` (Tx).
-  StdUseCase102 `jesd204Np = 16` → JESD transport word = 16-bit.
+  StdUseCase98 `jesd204Np = 12`; StdUseCase102 `jesd204Np = 16`.
 
-→ **Quantization rule:** scale = `2^(Np-1) - 1`. For Np=16 → ×32767 (signed 16-bit),
+→ **Quantization rule:** scale = `2^(Np-1) - 1`: ×2047 for Np=12 (UC98), ×32767 for Np=16,
 NOT 2^11. The user's "12-bit → base 11" generalizes to `Np` read from the loaded
 profile; confirm effective DAC range against `DacFullScale*` on hardware.
 `captureTime_ms × rxOutputRate_kHz` gives capture sample count.
@@ -124,7 +128,8 @@ profile; confirm effective DAC range against `DacFullScale*` on hardware.
 - ORx leveling = **software AGC on the captured-IQ peak + `railed` clip veto** (ORx has
   no hardware AGC; overload flags reject ORx; `RxDecPowerGet` is range-compressed; ORx
   `RxGainGet` returns 0 so the gain index is tracked in software).
-- Capture = `PerformRx` w/ `channelMask` (Rx or ORx), `captureTime_ms`, `TXn_SOF` trigger for alignment.
+- Capture = `PerformRx` w/ `channelMask` (Rx or ORx), `captureTime_ms`, `IMM_TRIG`; alignment in
+  software (`TXn_SOF` times out on this bench).
 - TX = `PerformTx` (continuous overload) with per-channel `int[]`, `channelMask` for multi-band.
 - Quantize TX waveform to signed `2^(Np-1)-1` with `Np` from profile `jesd204Np`.
 - Sample count from `captureTime_ms` × profile rate; verify via `OutputRateGet`.
@@ -167,7 +172,8 @@ Clearing the TX mask **stops** playback → used by `safe_state`/`disable_tx`.
 
 ### Full-scale code — RESOLVED
 ADI uses `20*log10(sqrt(pwr)/32768)`, i.e. dBFS reference = `2**(Np-1)` (32768 for
-Np=16). `clip_report` uses this reference; quantization clips at `2**(Np-1)-1`.
+Np=16, 2048 for Np=12). `clip_report` uses this reference; quantization clips at
+`2**(Np-1)-1`.
 
 ### Confirmed on hardware (bench, StdUseCase102_LinkSharing, rx_init=0x3FF)
 - **connect + program works**: PLLs lock (status `0xF`), LO1/LO2 read back exactly.

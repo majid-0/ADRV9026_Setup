@@ -2,8 +2,9 @@
 
 A :class:`Band` ties one TX path + waveform to a capture channel (Rx or ORx),
 a duration and an output name. Single/dual/quad = 1/2/4 bands sharing the two
-real LOs across four distinct paths. All bands transmit together and are captured
-in one sample-aligned snapshot (concern #2).
+real LOs across four distinct paths. All bands transmit together; each band is
+captured in its own snapshot (two ORx inputs enabled at once mis-route on this
+hardware), on the IMMEDIATE trigger (``TXn_SOF`` times out on this bench).
 """
 
 from __future__ import annotations
@@ -63,8 +64,8 @@ def run_bands(
     """Transmit all bands, (optionally) auto-level ORx, capture each band, save per band.
 
     ``trig`` defaults to IMMEDIATE (TX runs continuously, so the signal is always
-    there; the TXn_SOF trigger times out on this bench). Pass ``_sof_trigger(bands)``
-    to try the start-of-frame trigger.
+    there). The TXn_SOF trigger times out on this bench (no TX start-of-frame); align
+    the captures in software (:mod:`adrvtrx.align`).
     """
     # 1. Multi-band transmit (all TX channels start together).
     channel_to_iq = {b.tx_channel: b.waveform for b in bands}

@@ -160,7 +160,11 @@ bands = [
 writer = CaseWriter("captures", bands, tx_bits=12, rx_bits=12, fs=368.64e6)  # write-once case folder
 res = find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=368.64e6,
                                      backoffs=(0, 1, 2, 3, 4), check=my_checks, writer=writer)
+writer.write_case_json()   # after the run: the case folder must be empty when it starts
 ```
+
+The case folder's files are described in [docs/dpd_workflow_spec.md](docs/dpd_workflow_spec.md)
+§5.9; `load_conditions` and replay do not read them.
 
 ## Hardware server (one process owns the board)
 
@@ -247,6 +251,7 @@ src/adrvtrx/
   metrics.py     PAPR, window / gain compression, AM/AM top slope, NMSE, ACLR, corr, RMS
   compression.py TX attenuation search for a target PAPR or gain compression
   operating_point.py  transmit, lock, backoff, capture and CSV row in one call
+  multiband.py   several bands into one PA: joint compression search, backoffs, case folder
   conditions.py  Condition / DUT CSVs, aligned IQ files, capture_point
   replay.py      Replay stored waveforms (DPD files) at saved conditions
   linearize.py   Online transmit -> capture -> step() loop

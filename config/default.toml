@@ -1,6 +1,7 @@
 # Default ADRV9026 / ADS9 configuration.
-# Mirrors the working StdUseCase102_LinkSharing init script (TES build 6.4.0.x,
-# namespace adrv9010_dll). Every value here was a literal in that script.
+# Mirrors the working StdUseCase init script (TES build 6.4.0.x, namespace adrv9010_dll),
+# first run with StdUseCase102_LinkSharing; the profile is now UC98 ([profile] below).
+# Every value here was a literal in that script.
 # Copy this file and edit a few keys per experiment rather than touching code.
 
 [dll]

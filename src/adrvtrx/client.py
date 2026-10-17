@@ -12,7 +12,8 @@
 ``radio`` is a :class:`RemoteRadio`: every public :class:`~adrvtrx.radio.Radio`
 method with the same signature, run in the server's process. Existing modules
 (``transmit``, ``capture``, ``compression``, ``replay``, ``operating_point``,
-``linearize``, ``sweep``) take it in place of a ``Radio``.
+``linearize``, ``sweep``, ``sweep_plan``, ``bands``, ``multiband``) take it in place
+of a ``Radio``.
 """
 
 from __future__ import annotations

@@ -120,8 +120,8 @@ with hardware("TX1 sweep") as radio:          # waits in the queue for the board
   `connect()` is a no-op while the server is connected.
 
 `transmit`, `capture`, `compression`, `replay`, `operating_point`,
-`linearize`, `sweep`, `sweep_plan` and `bands` take a `RemoteRadio` wherever
-they take a `Radio`. The one change they needed: `capture.capture` used
+`linearize`, `sweep`, `sweep_plan`, `bands` and `multiband` take a `RemoteRadio`
+wherever they take a `Radio`. The one change they needed: `capture.capture` used
 `radio._en_tx` to keep TX enabled while it set the Rx enables; it now calls the
 new `Radio.set_rx_enable(mask)`, which sets the Rx mask and keeps TX.
 
@@ -505,5 +505,5 @@ the whole suite, so the real `Radio` cannot load the DLL even by mistake.
 | programming identity | `program_count` / `program_id` change on a client re-program, a new server and a watchdog restart |
 | TX RAM | per-channel record, survives release and safe_state; identical reload skipped (only re-enables TX), other signal / mode / channel reloads; cleared by program and restart (in-process and watchdog); switch off; fake load time grows with length |
 | fake PA | default = simple Rapp; rich model: gain lock converges at two LOs with different attenuations, GMP fit beats no DPD and needs memory, drift (file, rate, step), seed, parameter files |
-| existing modules | transmit, capture, compression, replay, operating point, linearize and sweep give the same results on a `RemoteRadio` as in-process |
+| existing modules | transmit, capture, compression, replay, operating point, linearize, sweep and a multi-band case give the same results on a `RemoteRadio` as in-process |
 | replay CLI | end to end on the fake: summary, per-label CSVs, missing files reported before the board is taken |

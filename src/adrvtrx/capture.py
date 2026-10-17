@@ -1,7 +1,10 @@
 """Snapshot capture: trigger PerformRx, shape per-channel IQ, report clipping, save.
 
 A capture is one FPGA snapshot taken in a single ``PerformRx`` call, so all channels
-are mutually sample-aligned. Use a ``TXn_SOF`` trigger to align to TX start-of-frame.
+are mutually sample-aligned. The trigger is IMMEDIATE: ``TXn_SOF`` times out on this bench
+(the TX datapath emits no start-of-frame), so a capture is aligned to its reference in
+software (:mod:`adrvtrx.align`, :func:`aligned_capture`). Through the hardware server only
+the arrays of the wanted channels travel (``perform_rx(..., keep=...)``).
 
 Confirmed on hardware (docs/api_notes.md): ``PerformRx`` ignores its mask argument
 and returns the full ``rxInitChannelMask`` set as a flat indexable of already-scaled

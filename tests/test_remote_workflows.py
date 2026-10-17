@@ -273,3 +273,35 @@ def test_sweep(remote):
 
     local, remote_res = work(local_radio()), remote(work)
     assert local == remote_res and len(remote_res) == 4
+
+
+def test_a_multiband_case(tmp_path):
+    """Two bands into the fake's shared PA: the same case in-process and through hardware()."""
+    from adrvtrx.fake import FakeRadio
+    from adrvtrx.multiband import find_multiband_operating_point
+    from test_multiband import PA, _case_bands
+
+    cfg = load_config(write_config(tmp_path))
+
+    def backend(config):
+        return FakeRadio(config, seed=SEED, pa=PA)
+
+    def work(radio):
+        fs = 10e6  # the fake's rate without a profile file
+        res = find_multiband_operating_point(
+            radio, _case_bands(), tx_bits=BITS, rx_bits=BITS, fs=fs, backoffs=(0, 2)
+        )
+        return res.search, {k: [asdict(c) for c in caps] for k, caps in res.captures.items()}
+
+    local = backend(cfg)
+    local._safe_hooks_installed = True
+    local.connect()
+    local.force_safe()  # what the server's start-up does
+    local.program()
+    search_l, caps_l = work(local)
+    with running_server(cfg, backend):
+        with hardware("multiband", config=cfg) as radio:
+            search_r, caps_r = work(radio)
+    assert search_r.converged
+    same(search_l, search_r)
+    same(caps_l, caps_r)
