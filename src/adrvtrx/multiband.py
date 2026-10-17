@@ -203,6 +203,346 @@ def update_slopes(
     return new if np.all(np.isfinite(new)) else jac  # never learn from a non-finite step
 
 
+@dataclass(frozen=True)
+class _Rules:
+    """The settings of one search (its arguments, checked)."""
+
+    targets: np.ndarray
+    names: list[str]
+    method: str
+    coarse_step_db: float
+    fine_step_db: float
+    comp_tol_db: float
+    target_dbfs: float
+    band_lo: float  # the ORx AGC band, dBFS
+    band_hi: float
+    gain_min: int
+    gain_max: int
+    db_per_index: float
+    atten_max_db: float
+    max_relevel: int
+    min_top_slope: float | None
+    slope_bounds: tuple[float, float]
+
+    def clamp_gain(self, g: float) -> int:
+        return int(min(max(int(round(g)), self.gain_min), self.gain_max))
+
+
+@dataclass
+class _State:
+    """What the search carries from one step to the next."""
+
+    a: np.ndarray  # attenuation per band (dB), applied at the next step
+    g: list[int]  # ORx gain index per band, applied at the next step
+    floor: np.ndarray  # lowest attenuation per band: its limit, raised by the clip guard
+    clip_floor: list[bool]  # the floor was raised by the clip guard
+    coarse_pending: list[bool]  # the band's coarse step is still to come
+    jac: np.ndarray | None = None  # the slope matrix J (slopes method)
+    prev: tuple[np.ndarray, np.ndarray] | None = None  # (a, c) of the last step that counted
+    prev_err: np.ndarray | None = None  # errors of the last step (NaN where they did not count)
+    best: dict | None = None  # the counted, unclipped step with the smallest worst-band error
+    last: dict | None = None  # the last step, as measured
+    history: list[dict] = field(default_factory=list)
+    captures: int = 0
+
+
+@dataclass
+class _Reading:
+    """A band's reading in a step: what counts, and its history row."""
+
+    comp: float
+    papr: float
+    slope: float
+    peak: float
+    railed: int
+    counts: bool  # leveled (or below the AGC band at maximum gain) with a finite compression
+    row: dict | None = None  # None: a band never read (after a fatal stop)
+    fatal: bool = False  # the ORx clips at its minimum gain
+
+
+@dataclass
+class _Classes:
+    """One step's readings, classified."""
+
+    c: np.ndarray  # compression per band
+    err: np.ndarray  # target - compression
+    ok: list[bool]  # the reading counts
+    trusted: bool  # every reading counts
+    clipped: list[bool]  # the clip guard: top slope below min_top_slope
+    within: list[bool]  # within tolerance
+    stuck: list[bool]  # below target at its limit
+    worst: float  # largest |err|
+
+
+def _relevel_index(peak: float, railed: int, rules: _Rules) -> int:
+    """ORx gain index change toward the AGC band: one index down on a railed capture whose peak
+    reads in band (the peak compresses near full scale), else the peak's distance in indices."""
+    if railed > 0 or peak > rules.band_hi:
+        if railed > 0 and not peak > rules.band_hi:
+            return -1
+        return -max(1, round((peak - rules.target_dbfs) / rules.db_per_index))
+    return max(1, round((rules.target_dbfs - peak) / rules.db_per_index))
+
+
+def _read_band(i: int, step: int, rules: _Rules, state: _State, measure, set_gain) -> _Reading:
+    """Band ``i``'s reading: captured again (ORx gain moved, attenuation not) until it counts.
+
+    Every capture that does not count is a history row with its re-level action; after
+    ``max_relevel`` of them the last reading is returned not counting (the band holds). A capture
+    railed or hot at the minimum gain returns ``fatal`` (its row is not recorded yet).
+    """
+    nan = float("nan")
+    for attempt in range(rules.max_relevel + 1):
+        peak, railed, comp, *rest = measure(i)
+        state.captures += 1
+        extra = dict(rest[0]) if rest and rest[0] is not None else {}
+        peak, railed, comp = float(peak), int(railed), float(comp)
+        in_band = railed == 0 and rules.band_lo <= peak <= rules.band_hi
+        at_max = railed == 0 and peak < rules.band_lo and state.g[i] >= rules.gain_max
+        leveled = in_band and math.isfinite(comp)  # NaN: a failed alignment
+        cold = at_max and math.isfinite(comp)
+        row = {
+            "step": step,
+            "band": rules.names[i],
+            "atten_db": float(state.a[i]),
+            "orx_gain": int(state.g[i]),
+            "peak_dbfs": peak,
+            "railed": railed,
+            "gain_compression_db": comp,
+            "papr_compression_db": float(extra.get("papr_compression_db", nan)),
+            "top_slope": float(extra.get("top_slope", nan)),
+            "leveled": leveled,
+            "error_db": float(rules.targets[i] - comp),
+            "move_db": 0.0,
+            "action": "",
+            "slopes": "",
+        }
+        reading = _Reading(
+            comp, row["papr_compression_db"], row["top_slope"], peak, railed, leveled or cold, row
+        )
+        if leveled or cold:
+            return reading
+        if (railed > 0 or peak > rules.band_hi) and state.g[i] <= rules.gain_min:
+            reading.fatal = True
+            return reading
+        if in_band or at_max:  # level fine, compression not finite: measure again
+            row["action"] = "measure again (compression not finite)"
+        else:
+            k = _relevel_index(peak, railed, rules)
+            state.g[i] = rules.clamp_gain(state.g[i] + k)
+            row["action"] = f"ORx gain {k:+d}"
+        if attempt == rules.max_relevel:  # this reading drives nothing: the band holds
+            row["action"] += f"; not leveled after {attempt + 1} captures, atten held"
+        state.history.append(row)
+        set_gain(i, int(state.g[i]))
+    return reading
+
+
+def _stop_fatal(i: int, reading: _Reading, readings: list[_Reading], rules: _Rules, state: _State):
+    """Band ``i``'s ORx clips at its minimum gain: record the rows of the bands read before it
+    ("stopped") and its own, raise its attenuation one fine step; the bands after it are unread.
+    Returns every band's reading and error."""
+    for r in readings:
+        if r.counts:
+            r.row["action"] = "stopped"
+            state.history.append(r.row)
+    reading.row["action"] = "ORx clips at minimum gain: TX atten up one fine step, stop"
+    state.history.append(reading.row)
+    state.a[i] = _quantize_atten(min(rules.atten_max_db, state.a[i] + rules.fine_step_db))
+    reading.counts = False
+    nan = float("nan")
+    unread = _Reading(nan, nan, nan, nan, 0, False)
+    readings = readings + [reading] + [unread] * (len(rules.names) - len(readings) - 1)
+    return readings, rules.targets - np.array([r.comp for r in readings])
+
+
+def _classify(readings: list[_Reading], rules: _Rules, state: _State) -> _Classes:
+    c = np.array([r.comp for r in readings])
+    err = rules.targets - c
+    ok = [r.counts for r in readings]
+    clipped = [
+        rules.min_top_slope is not None
+        and r.counts
+        and math.isfinite(r.slope)
+        and r.slope < rules.min_top_slope
+        for r in readings
+    ]
+    within = [ok[i] and abs(e) <= rules.comp_tol_db for i, e in enumerate(err)]
+    stuck = [
+        ok[i] and e > rules.comp_tol_db and state.a[i] <= state.floor[i] + 1e-9
+        for i, e in enumerate(err)
+    ]
+    worst = float(np.max(np.abs(err)))
+    return _Classes(c, err, ok, all(ok), clipped, within, stuck, worst)
+
+
+def _remember(readings: list[_Reading], cls: _Classes, state: _State) -> None:
+    """Keep the step as the last one, and as the best one when it is."""
+    if (
+        cls.trusted
+        and not any(cls.clipped)
+        and (state.best is None or cls.worst < state.best["worst"])
+    ):
+        state.best = {
+            "worst": cls.worst,
+            "a": state.a.copy(),
+            "g": list(state.g),
+            "readings": readings,
+            "err": cls.err.copy(),
+        }
+    state.last = {
+        "readings": readings,
+        "err": cls.err,
+        "a": state.a.copy(),
+        "g": [int(r.row["orx_gain"]) for r in readings],  # as captured
+    }
+
+
+def _fixed_moves(readings: list[_Reading], cls: _Classes, rules: _Rules, state: _State):
+    """The moves set by a rule rather than solved for: clip guard, at limit, held, coarse.
+
+    Returns ``(moves, fixed, actions)``. The clip guard raises the band's floor; a band's coarse
+    step is spent at its first reading that counts.
+    """
+    n = len(readings)
+    mv, fixed, actions = np.zeros(n), [False] * n, [""] * n
+    tol, fine, coarse = rules.comp_tol_db, rules.fine_step_db, rules.coarse_step_db
+    for i in range(n):
+        if cls.clipped[i]:
+            over = -cls.err[i]
+            up = _fine_step(over, fine, coarse) if over > 0 else fine
+            new = _quantize_atten(min(rules.atten_max_db, state.a[i] + up))
+            state.floor[i] = max(state.floor[i], new)
+            state.clip_floor[i] = True
+            mv[i], fixed[i] = new - state.a[i], True
+            actions[i] = f"clip guard (top slope {readings[i].slope:.3f})"
+        elif cls.stuck[i]:
+            fixed[i], actions[i] = True, "at limit"
+        elif not cls.ok[i]:
+            fixed[i] = True  # not leveled: its row is in the history already, atten held
+        elif state.coarse_pending[i]:  # the band's first reading that counts: single-band rule
+            if cls.err[i] > tol:
+                mv[i], actions[i] = -coarse, "coarse"
+            elif cls.err[i] < -tol:
+                mv[i], actions[i] = _fine_step(cls.err[i], fine, coarse), "fine"
+            else:
+                actions[i] = "within tolerance"
+            fixed[i] = True
+        if cls.ok[i]:
+            state.coarse_pending[i] = False
+    return mv, fixed, actions
+
+
+def _error_grew(err: np.ndarray, prev_err: np.ndarray | None, free: list[int], tol: float) -> bool:
+    """A free band's error grew since the last step (by more than 0.05 dB, outside tolerance)."""
+    return prev_err is not None and any(
+        abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > tol for i in free
+    )
+
+
+def _learn_slopes(cls: _Classes, rules: _Rules, state: _State, grew: bool) -> None:
+    """Update ``J`` from the step since the last counted one (slopes method)."""
+    if grew:
+        state.jac = None  # this step walks; J starts again from the own slopes of the next one
+    if rules.method == "slopes" and cls.trusted and state.prev is not None and not grew:
+        da, dc = state.a - state.prev[0], cls.c - state.prev[1]
+        if state.jac is None:
+            state.jac = own_slopes(da, dc, slope_bounds=rules.slope_bounds)
+        else:
+            state.jac = update_slopes(state.jac, da, dc, slope_bounds=rules.slope_bounds)
+
+
+def _walk_move(err: float, rules: _Rules) -> float:
+    step_db = _fine_step(err, rules.fine_step_db, rules.coarse_step_db)
+    return -step_db if err > 0 else step_db
+
+
+def _free_moves(mv, actions, fixed, free, err, rules: _Rules, jac, use_walk: bool) -> None:
+    """The free bands' moves (in place): the walk, or ``J @ da = err`` given the fixed moves."""
+    tol = rules.comp_tol_db
+    for i in free:
+        if abs(err[i]) <= tol and use_walk:
+            actions[i] = "within tolerance"
+    if not free:
+        return
+    if use_walk or jac is None:
+        for i in free:
+            if abs(err[i]) > tol:
+                mv[i] = _walk_move(err[i], rules)
+                actions[i] = "walk (fallback)" if rules.method == "slopes" else "walk"
+        return
+    fx = [i for i in range(len(mv)) if fixed[i]]
+    rhs = err[free] - (jac[np.ix_(free, fx)] @ mv[fx] if fx else 0.0)
+    try:
+        sol = np.linalg.solve(jac[np.ix_(free, free)], rhs)
+        if not np.all(np.isfinite(sol)):
+            raise np.linalg.LinAlgError("non-finite move")
+        mv[free] = sol
+        for i in free:
+            actions[i] = "slopes"
+    except np.linalg.LinAlgError:
+        for i in free:
+            if abs(err[i]) > tol:
+                mv[i] = _walk_move(err[i], rules)
+                actions[i] = "walk (singular slopes)"
+
+
+def _new_attens(mv, actions, free, err, rules: _Rules, state: _State) -> np.ndarray:
+    """Moves capped at the coarse step, at least one attenuator step for a band still out of
+    tolerance (slopes), then held between the floor and the maximum and quantized."""
+    mv = np.clip(mv, -rules.coarse_step_db, rules.coarse_step_db)
+    for i in free:
+        if abs(err[i]) > rules.comp_tol_db and abs(mv[i]) < 0.05 and actions[i] == "slopes":
+            mv[i] = -0.05 if err[i] > 0 else 0.05
+    return np.array(
+        [
+            _quantize_atten(min(max(state.a[i] + mv[i], state.floor[i]), rules.atten_max_db))
+            for i in range(len(mv))
+        ]
+    )
+
+
+def _predict_gains(g: list[int], moved: np.ndarray, jac, rules: _Rules) -> list[int]:
+    """The ORx gain follows the output peak, which moves by the drive change minus the
+    compression change: predicted from the slopes when known, else from a typical own slope of
+    0.5 dB per dB."""
+    dc = jac @ moved if jac is not None else -0.5 * moved
+    return [
+        rules.clamp_gain(g[i] + round((moved[i] + dc[i]) / rules.db_per_index))
+        for i in range(len(g))
+    ]
+
+
+def _band_locks(readings: list[_Reading], err, rules: _Rules, state: _State) -> list[BandLock]:
+    out = []
+    tol = rules.comp_tol_db
+    for i, r in enumerate(readings):
+        below = r.counts and err[i] > tol and state.a[i] <= state.floor[i] + 1e-9
+        if r.counts and abs(err[i]) <= tol:
+            status = "converged"
+        elif state.clip_floor[i] and below:
+            status = "clip-limited"
+        elif below:
+            status = "at limit"
+        else:
+            status = "not converged"
+        out.append(
+            BandLock(
+                rules.names[i],
+                float(state.a[i]),
+                int(state.g[i]),
+                r.comp,
+                r.papr,
+                r.slope,
+                r.peak,
+                r.railed,
+                float(state.floor[i]),
+                status,
+            )
+        )
+    return out
+
+
 def search_multiband_compression(
     set_atten: Callable[[int, float], None],
     set_gain: Callable[[int, int], None],
@@ -248,339 +588,140 @@ def search_multiband_compression(
         raise ValueError(f"max_steps must be >= 1, got {max_steps}")
     if not comp_tol_db > 0:
         raise ValueError(f"comp_tol_db must be positive, got {comp_tol_db}")
-    names = list(names) if names is not None else [f"band{i + 1}" for i in range(n)]
-    targets = np.asarray(targets_db, dtype=float)
-    band_lo, band_hi = target_dbfs - tol_down_db, target_dbfs + tol_up_db
-    nan = float("nan")
-
-    def clamp_gain(g: float) -> int:
-        return int(min(max(int(round(g)), gain_min), gain_max))
-
+    rules = _Rules(
+        targets=np.asarray(targets_db, dtype=float),
+        names=list(names) if names is not None else [f"band{i + 1}" for i in range(n)],
+        method=method,
+        coarse_step_db=coarse_step_db,
+        fine_step_db=fine_step_db,
+        comp_tol_db=comp_tol_db,
+        target_dbfs=target_dbfs,
+        band_lo=target_dbfs - tol_down_db,
+        band_hi=target_dbfs + tol_up_db,
+        gain_min=gain_min,
+        gain_max=gain_max,
+        db_per_index=db_per_index,
+        atten_max_db=atten_max_db,
+        max_relevel=max_relevel,
+        min_top_slope=min_top_slope,
+        slope_bounds=slope_bounds,
+    )
     floor = np.array([_quantize_atten(m) for m in atten_mins_db])
     for i, s in enumerate(start_attens_db):
         if floor[i] > s:
-            raise ValueError(f"{names[i]}: limit {floor[i]} dB is above the start {s} dB")
-    a = np.array(
-        [_quantize_atten(min(max(s, f), atten_max_db)) for s, f in zip(start_attens_db, floor)]
+            raise ValueError(f"{rules.names[i]}: limit {floor[i]} dB is above the start {s} dB")
+    state = _State(
+        a=np.array(
+            [_quantize_atten(min(max(s, f), atten_max_db)) for s, f in zip(start_attens_db, floor)]
+        ),
+        g=[rules.clamp_gain(x) for x in orx_gains],
+        floor=floor,
+        clip_floor=[False] * n,
+        coarse_pending=[True] * n,  # until the band's first reading that counts
     )
-    g = [clamp_gain(x) for x in orx_gains]
-    clip_floor = [False] * n
-    history: list[dict] = []
-    captures = 0
-    jac: np.ndarray | None = None
-    prev: tuple[np.ndarray, np.ndarray] | None = None
-    prev_err: np.ndarray | None = None
-    coarse_pending = [True] * n  # until the band's first reading that counts
-    best: dict | None = None
-    last: dict | None = None
 
     def apply() -> None:
         for i in range(n):
-            set_atten(i, float(a[i]))
-            set_gain(i, int(g[i]))
+            set_atten(i, float(state.a[i]))
+            set_gain(i, int(state.g[i]))
 
-    def band_locks(readings, err) -> list[BandLock]:
-        out = []
-        for i, r in enumerate(readings):
-            below = r["leveled"] and err[i] > comp_tol_db and a[i] <= floor[i] + 1e-9
-            if r["leveled"] and abs(err[i]) <= comp_tol_db:
-                status = "converged"
-            elif clip_floor[i] and below:
-                status = "clip-limited"
-            elif below:
-                status = "at limit"
-            else:
-                status = "not converged"
-            out.append(
-                BandLock(
-                    names[i],
-                    float(a[i]),
-                    int(g[i]),
-                    r["comp"],
-                    r["papr"],
-                    r["slope"],
-                    r["peak"],
-                    r["railed"],
-                    float(floor[i]),
-                    status,
-                )
-            )
-        return out
-
-    def finish(
-        converged: bool, reason: str, readings, err, *, fatal: bool = False
-    ) -> MultibandSearch:
+    def finish(converged: bool, reason: str, readings, err, *, fatal=False) -> MultibandSearch:
         apply()
         return MultibandSearch(
             converged,
             reason,
             method,
-            band_locks(readings, err),
-            len({h["step"] for h in history}),
-            captures,
+            _band_locks(readings, err, rules, state),
+            len({h["step"] for h in state.history}),
+            state.captures,
             fatal,
-            history,
+            state.history,
         )
+
+    def report(rows: list[dict]) -> None:
+        if on_step:
+            on_step(rows)
 
     for step in range(max_steps):
         apply()
-        readings = []
+        readings: list[_Reading] = []
         for i in range(n):
-            for attempt in range(max_relevel + 1):
-                peak, railed, comp, *rest = measure(i)
-                captures += 1
-                extra = dict(rest[0]) if rest and rest[0] is not None else {}
-                peak, railed, comp = float(peak), int(railed), float(comp)
-                in_band = railed == 0 and band_lo <= peak <= band_hi
-                at_max = railed == 0 and peak < band_lo and g[i] >= gain_max
-                leveled = in_band and math.isfinite(comp)  # NaN: a failed alignment
-                cold = at_max and math.isfinite(comp)
-                row = {
-                    "step": step,
-                    "band": names[i],
-                    "atten_db": float(a[i]),
-                    "orx_gain": int(g[i]),
-                    "peak_dbfs": peak,
-                    "railed": railed,
-                    "gain_compression_db": comp,
-                    "papr_compression_db": float(extra.get("papr_compression_db", nan)),
-                    "top_slope": float(extra.get("top_slope", nan)),
-                    "leveled": leveled,
-                    "error_db": float(targets[i] - comp),
-                    "move_db": 0.0,
-                    "action": "",
-                    "slopes": "",
-                }
-                if leveled or cold:
-                    break
-                if (railed > 0 or peak > band_hi) and g[i] <= gain_min:
-                    for r in readings:  # the bands read before this one this step
-                        if r["leveled"]:
-                            r["row"]["action"] = "stopped"
-                            history.append(r["row"])
-                    row["action"] = "ORx clips at minimum gain: TX atten up one fine step, stop"
-                    history.append(row)
-                    a[i] = _quantize_atten(min(atten_max_db, a[i] + fine_step_db))
-                    readings.append(
-                        {
-                            "comp": comp,
-                            "papr": row["papr_compression_db"],
-                            "slope": row["top_slope"],
-                            "peak": peak,
-                            "railed": railed,
-                            "leveled": False,
-                        }
-                    )
-                    unread = {
-                        "comp": nan,
-                        "papr": nan,
-                        "slope": nan,
-                        "peak": nan,
-                        "railed": 0,
-                        "leveled": False,
-                    }
-                    readings += [unread] * (n - len(readings))
-                    err = targets - np.array([r["comp"] for r in readings])
-                    return finish(
-                        False,
-                        f"{names[i]}: ORx still clips at minimum gain",
-                        readings,
-                        err,
-                        fatal=True,
-                    )
-                if in_band or at_max:  # level fine, compression not finite: measure again
-                    row["action"] = "measure again (compression not finite)"
-                elif railed > 0 or peak > band_hi:
-                    k = (
-                        1
-                        if (railed > 0 and not peak > band_hi)
-                        else max(1, round((peak - target_dbfs) / db_per_index))
-                    )
-                    g[i] = clamp_gain(g[i] - k)
-                    row["action"] = f"ORx gain -{k}"
-                else:
-                    k = max(1, round((target_dbfs - peak) / db_per_index))
-                    g[i] = clamp_gain(g[i] + k)
-                    row["action"] = f"ORx gain +{k}"
-                if attempt == max_relevel:  # this reading drives nothing: the band holds
-                    row["action"] += f"; not leveled after {attempt + 1} captures, atten held"
-                history.append(row)
-                set_gain(i, int(g[i]))
-            readings.append(
-                {
-                    "comp": comp,
-                    "papr": row["papr_compression_db"],
-                    "slope": row["top_slope"],
-                    "peak": peak,
-                    "railed": railed,
-                    "leveled": leveled or cold,
-                    "row": row,
-                }
-            )
-        c = np.array([r["comp"] for r in readings])
-        err = targets - c
-        ok = [r["leveled"] for r in readings]  # a reading that counts (leveled or cold)
-        trusted = all(ok)
-        clipped = [
-            min_top_slope is not None
-            and r["leveled"]
-            and math.isfinite(r["slope"])
-            and r["slope"] < min_top_slope
-            for r in readings
-        ]
-        worst = float(np.max(np.abs(err)))
-        if trusted and not any(clipped) and (best is None or worst < best["worst"]):
-            best = {
-                "worst": worst,
-                "a": a.copy(),
-                "g": list(g),
-                "readings": readings,
-                "err": err.copy(),
-            }
-        last = {
-            "readings": readings,
-            "err": err,
-            "a": a.copy(),
-            "g": [int(r["row"]["orx_gain"]) for r in readings],  # as captured
-        }
+            reading = _read_band(i, step, rules, state, measure, set_gain)
+            if reading.fatal:
+                readings, err = _stop_fatal(i, reading, readings, rules, state)
+                return finish(
+                    False,
+                    f"{rules.names[i]}: ORx still clips at minimum gain",
+                    readings,
+                    err,
+                    fatal=True,
+                )
+            readings.append(reading)
+        cls = _classify(readings, rules, state)
+        _remember(readings, cls, state)
 
-        within = [ok[i] and abs(e) <= comp_tol_db for i, e in enumerate(err)]
-        stuck = [ok[i] and e > comp_tol_db and a[i] <= floor[i] + 1e-9 for i, e in enumerate(err)]
-        if not any(clipped) and all(w or s for w, s in zip(within, stuck)):
-            rows = [r["row"] for r in readings]
+        if not any(cls.clipped) and all(w or s for w, s in zip(cls.within, cls.stuck)):
+            rows = [r.row for r in readings]
             for row in rows:
-                row["action"] = "converged" if all(within) else row["action"] or "done"
-            history.extend(rows)
-            if on_step:
-                on_step(rows)
-            if all(within):
-                return finish(True, "every band within tolerance", readings, err)
-            held = ", ".join(names[i] for i, s in enumerate(stuck) if s)
+                row["action"] = "converged" if all(cls.within) else row["action"] or "done"
+            state.history.extend(rows)
+            report(rows)
+            if all(cls.within):
+                return finish(True, "every band within tolerance", readings, cls.err)
+            held = ", ".join(rules.names[i] for i, s in enumerate(cls.stuck) if s)
             return finish(
                 False,
                 f"{held} at the attenuation limit below target; the others within tolerance",
                 readings,
-                err,
+                cls.err,
             )
         if step == max_steps - 1:  # no move after the last step: nothing would measure it
-            rows = [r["row"] for r in readings]
+            rows = [r.row for r in readings]
             for i, row in enumerate(rows):
-                if ok[i]:
+                if cls.ok[i]:
                     row["action"] = "max steps"
-                    history.append(row)
-            if on_step:
-                on_step(rows)
+                    state.history.append(row)
+            report(rows)
             break
 
-        # -- moves ----------------------------------------------------------------------
-        mv = np.zeros(n)
-        fixed = [False] * n
-        actions = [""] * n
-        for i in range(n):
-            if clipped[i]:
-                over = -err[i]
-                up = _fine_step(over, fine_step_db, coarse_step_db) if over > 0 else fine_step_db
-                new = _quantize_atten(min(atten_max_db, a[i] + up))
-                floor[i] = max(floor[i], new)
-                clip_floor[i] = True
-                mv[i], fixed[i] = new - a[i], True
-                actions[i] = f"clip guard (top slope {readings[i]['slope']:.3f})"
-            elif stuck[i]:
-                fixed[i], actions[i] = True, "at limit"
-            elif not ok[i]:
-                fixed[i] = True  # not leveled: its row is in the history already, atten held
-            elif coarse_pending[i]:  # the band's first reading that counts: the single-band rule
-                if err[i] > comp_tol_db:
-                    mv[i], actions[i] = -coarse_step_db, "coarse"
-                elif err[i] < -comp_tol_db:
-                    mv[i], actions[i] = _fine_step(err[i], fine_step_db, coarse_step_db), "fine"
-                else:
-                    actions[i] = "within tolerance"
-                fixed[i] = True
-            if ok[i]:
-                coarse_pending[i] = False
+        mv, fixed, actions = _fixed_moves(readings, cls, rules, state)
         free = [i for i in range(n) if not fixed[i]]
-        grew = prev_err is not None and any(
-            abs(err[i]) > abs(prev_err[i]) + 0.05 and abs(err[i]) > comp_tol_db for i in free
-        )
-        use_walk = method == "walk" or grew or not trusted
-        if grew:
-            jac = None  # this step walks; J starts again from the own slopes of the next one
-        if method == "slopes" and trusted and prev is not None and not grew:
-            da, dc = a - prev[0], c - prev[1]
-            if jac is None:
-                jac = own_slopes(da, dc, slope_bounds=slope_bounds)
-            else:
-                jac = update_slopes(jac, da, dc, slope_bounds=slope_bounds)
-        for i in free:
-            if abs(err[i]) <= comp_tol_db and use_walk:
-                actions[i] = "within tolerance"
-        if not free:
-            pass
-        elif use_walk or jac is None:
-            for i in free:
-                if abs(err[i]) > comp_tol_db:
-                    step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
-                    mv[i] = -step_db if err[i] > 0 else step_db
-                    actions[i] = "walk (fallback)" if method == "slopes" else "walk"
-        else:
-            fx = [i for i in range(n) if fixed[i]]
-            rhs = err[free] - (jac[np.ix_(free, fx)] @ mv[fx] if fx else 0.0)
-            try:
-                sol = np.linalg.solve(jac[np.ix_(free, free)], rhs)
-                if not np.all(np.isfinite(sol)):
-                    raise np.linalg.LinAlgError("non-finite move")
-                mv[free] = sol
-                for i in free:
-                    actions[i] = "slopes"
-            except np.linalg.LinAlgError:
-                for i in free:
-                    if abs(err[i]) > comp_tol_db:
-                        step_db = _fine_step(err[i], fine_step_db, coarse_step_db)
-                        mv[i] = -step_db if err[i] > 0 else step_db
-                        actions[i] = "walk (singular slopes)"
-        mv = np.clip(mv, -coarse_step_db, coarse_step_db)
-        # a band still outside tolerance moves at least one attenuator step toward its target
-        for i in free:
-            if abs(err[i]) > comp_tol_db and abs(mv[i]) < 0.05 and actions[i] == "slopes":
-                mv[i] = -0.05 if err[i] > 0 else 0.05
-        new_a = np.array(
-            [_quantize_atten(min(max(a[i] + mv[i], floor[i]), atten_max_db)) for i in range(n)]
-        )
-        moved = new_a - a
+        grew = _error_grew(cls.err, state.prev_err, free, comp_tol_db)
+        _learn_slopes(cls, rules, state, grew)
+        use_walk = method == "walk" or grew or not cls.trusted
+        _free_moves(mv, actions, fixed, free, cls.err, rules, state.jac, use_walk)
+        new_a = _new_attens(mv, actions, free, cls.err, rules, state)
+        moved = new_a - state.a
         rows = []
+        slopes = "" if state.jac is None else json.dumps(np.round(state.jac, 4).tolist())
         for i, r in enumerate(readings):
-            row = r["row"]
-            if ok[i]:  # a band not leveled has its row already (its own action, no move)
-                row["move_db"] = float(moved[i])
-                row["action"] = actions[i]
-                row["slopes"] = "" if jac is None else json.dumps(np.round(jac, 4).tolist())
-                history.append(row)
-            rows.append(row)
-        if on_step:
-            on_step(rows)
-        if np.all(np.abs(moved) < 1e-9) and trusted:
-            return finish(False, "no band can move further (limits)", readings, err)
-        prev = (a.copy(), c.copy()) if trusted else None
-        prev_err = np.where(ok, err, np.nan)  # an error that did not count cannot have grown
-        # The ORx gain follows the output peak, which moves by the drive change minus the
-        # compression change:
-        # predicted from the slopes when known, else from a typical own slope of 0.5 dB per dB.
-        dc = jac @ moved if jac is not None else -0.5 * moved
-        for i in range(n):
-            g[i] = clamp_gain(g[i] + round((moved[i] + dc[i]) / db_per_index))
-        a = new_a
+            if cls.ok[i]:  # a band not leveled has its row already (its own action, no move)
+                r.row.update(move_db=float(moved[i]), action=actions[i], slopes=slopes)
+                state.history.append(r.row)
+            rows.append(r.row)
+        report(rows)
+        if np.all(np.abs(moved) < 1e-9) and cls.trusted:
+            return finish(False, "no band can move further (limits)", readings, cls.err)
+        state.prev = (state.a.copy(), cls.c.copy()) if cls.trusted else None
+        state.prev_err = np.where(cls.ok, cls.err, np.nan)  # what did not count cannot grow
+        state.g = _predict_gains(state.g, moved, state.jac, rules)
+        state.a = new_a
 
-    if best is not None:
-        a, g = best["a"], best["g"]
+    if state.best is not None:
+        state.a, state.g = state.best["a"], state.best["g"]
         return finish(
             False,
             "max steps; left at the step closest to the targets",
-            best["readings"],
-            best["err"],
+            state.best["readings"],
+            state.best["err"],
         )
-    a, g = last["a"], list(last["g"])
-    return finish(False, "max steps; left at the last step measured", last["readings"], last["err"])
+    state.a, state.g = state.last["a"], list(state.last["g"])
+    return finish(
+        False,
+        "max steps; left at the last step measured",
+        state.last["readings"],
+        state.last["err"],
+    )
 
 
 # -- hardware ---------------------------------------------------------------------------------
