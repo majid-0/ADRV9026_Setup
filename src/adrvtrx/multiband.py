@@ -185,6 +185,10 @@ def search_multiband_compression(
         raise ValueError(
             "targets, start attenuations, limits and ORx gains need one value per band"
         )
+    if max_steps < 1:
+        raise ValueError(f"max_steps must be >= 1, got {max_steps}")
+    if not comp_tol_db > 0:
+        raise ValueError(f"comp_tol_db must be positive, got {comp_tol_db}")
     names = list(names) if names is not None else [f"band{i + 1}" for i in range(n)]
     targets = np.asarray(targets_db, dtype=float)
     band_lo, band_hi = target_dbfs - tol_down_db, target_dbfs + tol_up_db
@@ -765,8 +769,11 @@ def find_multiband_operating_point(
 
     With ``writer`` (a :class:`CaseWriter`), the inputs, every aligned output, ``conditions.csv``
     and
-    ``lock.csv`` are written. TX is disabled when the call ends or fails.
+    ``lock.csv`` are written. TX is disabled when the call ends or fails. A backoff is added to
+    the lock, so it must be ``>= 0`` (a band never goes below its limit).
     """
+    if any(k < 0 for k in backoffs):
+        raise ValueError(f"backoffs must be >= 0, got {list(backoffs)}")
     try:
         search, refs = lock_bands(
             radio,

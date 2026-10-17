@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -161,6 +162,28 @@ def test_one_band_ends_where_the_single_band_walk_ends():
     )
     assert one.converged and single.converged
     assert one.bands[0].atten_db == pytest.approx(single.final_atten_db, abs=0.1)
+
+
+@pytest.mark.parametrize(
+    "bad, match",
+    [({"max_steps": 0}, "max_steps"), ({"comp_tol_db": 0.0}, "comp_tol_db"),
+     ({"comp_tol_db": -0.1}, "comp_tol_db")],
+)  # fmt: skip
+def test_the_search_rejects_a_budget_or_tolerance_it_cannot_work_with(bad, match):
+    pa = TwoBandPa()
+    with pytest.raises(ValueError, match=match):
+        pa.search(**bad)
+    assert pa.reads == 0
+
+
+def test_a_negative_backoff_is_rejected_before_the_radio_is_touched():
+    radio = MagicMock(name="radio")
+    band = BandSpec(TxChannel.TX1, RxChannel.ORX1, "LO1", 1_440_000_000, 80, np.ones(64))
+    with pytest.raises(ValueError, match="backoffs must be >= 0"):
+        find_multiband_operating_point(
+            radio, [band], tx_bits=12, rx_bits=12, fs=1e6, backoffs=(0, -1)
+        )
+    assert radio.mock_calls == []
 
 
 def test_case_names_carry_paths_carriers_bandwidths_and_targets():
