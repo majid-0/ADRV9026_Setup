@@ -22,7 +22,16 @@ import numpy as np
 
 from ._enums import RX_SINGLE, TX_SOF_FOR, RxChannel, RxTrigSource, TxChannel, is_orx
 from .align import align_with_fraction, estimate_and_align
-from .gain import AgcError, ClipReport, autolevel_orx, clip_report, peak_window, verify_no_clip
+from .gain import (
+    ORX_GAIN_MAX,
+    ORX_GAIN_MIN,
+    AgcError,
+    ClipReport,
+    autolevel_orx,
+    clip_report,
+    peak_window,
+    verify_no_clip,
+)
 from .waveform import samples_for_duration, save_tab_iq_float
 
 #: Single-bit channel for each rxInitChannelMask bit we can name (bits 8/9 are
@@ -329,6 +338,8 @@ def autolevel_capture(
     verify_capture_ms: float | None = None,
     max_iterations: int = 16,
     start_gain: int | None = None,
+    gain_min: int = ORX_GAIN_MIN,
+    gain_max: int = ORX_GAIN_MAX,
 ) -> AgcResult:
     """End-to-end software ORx AGC against live hardware (TX must already be running).
 
@@ -348,6 +359,8 @@ def autolevel_capture(
     typically derives ``verify_capture_ms`` from it and the waveform length.
 
     ``start_gain`` skips Stage A and trims from that gain (see :func:`autolevel_orx`).
+    ``gain_min`` / ``gain_max`` bound the gain index (the floor is where Stage A starts and the
+    lowest gain Stage C backs off to).
     """
 
     def set_gain(g: int) -> None:
@@ -364,6 +377,8 @@ def autolevel_capture(
         target_dbfs=target_dbfs,
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
+        gain_min=gain_min,
+        gain_max=gain_max,
         max_iterations=max_iterations,
         start_gain=start_gain,
     )
@@ -397,6 +412,7 @@ def autolevel_capture(
             lr.final_gain_index,
             target_dbfs=target_dbfs,
             tol_up_db=tol_up_db,
+            gain_min=gain_min,
         )
         if vr.fatal:
             radio.safe_state()
@@ -477,6 +493,8 @@ def autolevel_for(
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     start_gain: int | None = None,
+    gain_min: int = ORX_GAIN_MIN,
+    gain_max: int = ORX_GAIN_MAX,
 ) -> AgcResult:
     """:func:`autolevel_capture` for a capture of ``oversample`` periods of ``ref``: Stage C
     verifies the gain on exactly the capture the measurement takes. ``fs`` is the ORx rate."""
@@ -490,6 +508,8 @@ def autolevel_for(
         tol_down_db=tol_down_db,
         verify_capture_ms=reference_capture_ms(ref, fs, oversample),
         start_gain=start_gain,
+        gain_min=gain_min,
+        gain_max=gain_max,
     )
 
 

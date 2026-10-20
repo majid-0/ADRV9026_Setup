@@ -902,6 +902,8 @@ def lock_bands(
                 target_dbfs=target_dbfs,
                 tol_up_db=tol_up_db,
                 tol_down_db=tol_down_db,
+                gain_min=int(search_kw.get("gain_min", ORX_GAIN_MIN)),
+                gain_max=int(search_kw.get("gain_max", ORX_GAIN_MAX)),
             ).final_gain_index
         )
         for b, r in zip(bands, refs)
@@ -979,8 +981,13 @@ def capture_case(
     retakes: int = 3,
     min_top_slope: float = PA_CLIP_SLOPE,
     gains: Sequence[int] | None = None,
+    gain_min: int = ORX_GAIN_MIN,
+    gain_max: int = ORX_GAIN_MAX,
 ) -> list[BandCapture]:
     """Every band at ``attens_db`` (TX playing): ORx AGC, one capture per band, then ``check``.
+
+    The AGC levels each band's ORx peak to ``target_dbfs`` (window ``+tol_up_db`` /
+    ``-tol_down_db``) within the gain indices ``gain_min`` .. ``gain_max``.
 
     ``check(captures)`` -> ``{band name: {"ok": bool, ...}}`` sees every band of the state at once
     (pairing needs both). A failing band is captured again (re-leveled first when it railed), up to
@@ -1019,6 +1026,8 @@ def capture_case(
                     tol_up_db=tol_up_db,
                     tol_down_db=tol_down_db,
                     start_gain=None if gains is None or tries > 1 else int(gains[i]),
+                    gain_min=gain_min,
+                    gain_max=gain_max,
                 )
                 used[b.name] = int(level.final_gain_index)
             else:
@@ -1140,6 +1149,7 @@ def find_multiband_operating_point(
                 check=check,
                 retakes=retakes,
                 gains=_backoff_gains(search, int(k), search_kw),
+                **_orx_settings(search_kw),
             )
     finally:
         try:
@@ -1160,6 +1170,13 @@ def find_multiband_operating_point(
             raise
         result.case_dir = writer.dir
     return result
+
+
+def _orx_settings(search_kw: dict) -> dict:
+    """The ORx AGC settings of a call's ``search_kw`` (level, window, gain range), so the backoff
+    captures level the ORx exactly as the lock did."""
+    keys = ("target_dbfs", "tol_up_db", "tol_down_db", "gain_min", "gain_max")
+    return {k: search_kw[k] for k in keys if k in search_kw}
 
 
 def _backoff_gains(search: MultibandSearch, k: int, search_kw: dict) -> list[int]:

@@ -1038,3 +1038,31 @@ def test_a_railed_retake_levels_from_the_floor_not_from_the_predicted_gain(monke
     )
     assert starts == [(RxChannel.ORX1, 219), (RxChannel.ORX4, 221), (RxChannel.ORX1, None)]
     assert caps[0].tries == 2 and caps[0].railed == 0
+
+
+def test_the_orx_settings_reach_the_lock_and_every_backoff_capture():
+    """The ORx level, window and gain range given to find_multiband_operating_point level the ORx
+    in the lock and in every backoff capture alike (not only in the lock)."""
+    radio = _case_radio()
+    fs = radio.board_model.rate_hz
+    bands = _case_bands()
+    orx = {
+        "target_dbfs": -3.0,
+        "tol_up_db": 0.3,
+        "tol_down_db": 0.6,
+        "gain_min": 190,
+        "gain_max": 250,
+    }
+    res = find_multiband_operating_point(
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 2), **orx
+    )
+    assert res.search.converged, res.search.reason
+    for k, caps in res.captures.items():
+        for c in caps:
+            assert -3.6 <= c.peak_dbfs <= -2.7, (
+                k,
+                c.name,
+                c.peak_dbfs,
+            )  # leveled to -3 dBFS, not -1
+            assert 190 <= c.orx_gain <= 250, (k, c.name, c.orx_gain)
+    assert all(190 <= h["orx_gain"] <= 250 for h in res.search.history)
