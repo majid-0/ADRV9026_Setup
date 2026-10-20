@@ -31,7 +31,7 @@ N = 65536
 #: own ~0.3, cross ~0.06 dB/dB near a 4 dB lock at 15 dB (measured on this model; noise-free)
 BENCH_PA = {"shared": [["TX2", "TX3"]], "coupling": 10.0, "smoothness": 0.4, "drive": 3.0,
             "noise_codes": 0.5}  # fmt: skip
-#: The probe of these signals at the fake board's 10 Msps (the bench's default is 500 / 16).
+#: The probe of these signals at the fake board's 10 Msps (the bench's default is 600 / 16).
 PROBE = ProbeSettings(window=300, crossfade=8)
 
 
@@ -123,7 +123,7 @@ def test_a_probe_that_fails_its_build_check_leaves_the_lock_on_the_full_signals(
                                probe=ProbeSettings(window=100, crossfade=8))  # fmt: skip
     assert search.probe and not search.probe["used"] and not search.probe["ok"]
     assert (
-        "PAPR" in search.probe["reason"]
+        "mean power" in search.probe["reason"]
         and "the lock plays the full signals" in search.probe["reason"]
     )
     assert {h["signal"] for h in search.history} == {"full"} and search.converged

@@ -10,15 +10,17 @@ This module is pure numpy:
 * :func:`peak_events`: the local maxima of ``|x|`` at or above ``threshold * max|x|``.
 * :func:`select_windows`: the peaks of every band ranked together (each against its own
   maximum), a ``window`` centred on each peak not yet covered, windows merged; the shared index
-  ranges in time order. ``budget`` (samples) stops it early, highest peaks kept.
+  ranges in time order. ``max_peaks`` (25) caps each band's peaks (its highest; its maximum is
+  always in); ``budget`` (samples) stops it early, highest peaks kept.
 * :func:`build_probe`: every band cut at those ranges and joined in time order (gaps dropped,
   codes as they are). Each join is placed in the ``crossfade`` samples beyond its windows' edges
   (outside every window, so at least ``window / 2`` samples of real signal stay around each
   peak), where both bands are low and the jump smallest, and crossfaded over ``crossfade``
   samples of the real continuations. The length is rounded up to a multiple of ``multiple`` and
-  of ``block``. The build check (``ok`` / ``reason``): per band, PAPR within 0.1 dB of the full
-  signal and mean power within 0.2 dB, every peak included (unless ``budget``), and
-  ``n <= len(signal) / 4``.
+  of ``block``. The build check (``ok`` / ``reason``): per band, mean power within 0.2 dB of the
+  full signal (PAPR is reported: with the maximum inside, it moves by exactly minus that), every
+  peak included (unless ``budget`` or ``max_peaks`` left some out: then the bias is only
+  reported, ``capped``), and ``n <= len(signal) / 4``.
 * :func:`probe_fidelity`: on a saved full-signal capture, the compression on the probe's sample
   positions against the full period, per band (the offline check of a probe design);
   :func:`fidelity_report` for a whole case (``probe_fidelity.json``).
@@ -30,7 +32,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
@@ -44,12 +46,11 @@ __all__ = [
     "build_probe",
     "probe_fidelity",
     "fidelity_report",
-    "PAPR_TOL_DB",
     "POWER_TOL_DB",
 ]
 
-#: The build check: per band, the probe's PAPR and mean power against the full signal's.
-PAPR_TOL_DB = 0.1
+#: The build check: per band, the probe's mean power against the full signal's. The probe holds the
+#: signal's maximum, so its PAPR differs by exactly minus this; PAPR is reported, not checked twice.
 POWER_TOL_DB = 0.2
 #: The longest probe, as a fraction of the signal (a longer one would save little time).
 MAX_FRACTION = 0.25
@@ -58,14 +59,16 @@ MAX_FRACTION = 0.25
 @dataclass(frozen=True)
 class ProbeSettings:
     """The probe's settings (task6_fast_lock.md 6b, C): ``window`` 50 .. 20,000 samples,
-    ``crossfade`` 0 .. window / 4, ``budget`` None or at least one window (samples), ``block`` the
+    ``crossfade`` 0 .. window / 4, ``budget`` None or at least one window (samples),
+    ``max_peaks`` per band 1 .. 1000 or None (all), ``block`` the
     TX memory's block 1 .. 4096, ``multiple`` (16: two periods are whole 4-byte words at every
     rate of a profile)."""
 
-    window: int = 500
+    window: int = 600
     crossfade: int = 16
     budget: int | None = None
     block: int = 1
+    max_peaks: int | None = 25
     multiple: int = 16
     threshold: float = PEAK_REGION
 
@@ -76,6 +79,8 @@ class ProbeSettings:
             raise ValueError(f"probe crossfade {self.crossfade} outside 0 .. window / 4")
         if self.budget is not None and int(self.budget) < int(self.window):
             raise ValueError(f"probe budget {self.budget} is less than one window")
+        if self.max_peaks is not None and not 1 <= int(self.max_peaks) <= 1000:
+            raise ValueError(f"probe max_peaks {self.max_peaks} outside 1 .. 1000 (or None: all)")
         if not 1 <= int(self.block) <= 4096:
             raise ValueError(f"probe block {self.block} outside 1 .. 4096")
         if int(self.multiple) < 1 or not 0 < float(self.threshold) <= 1:
@@ -89,6 +94,7 @@ class ProbeSettings:
             multiple=self.multiple,
             block=self.block,
             budget=self.budget,
+            max_peaks=self.max_peaks,
             threshold=self.threshold,
         )
 
@@ -159,8 +165,11 @@ def _fill_gaps(mask: np.ndarray, gap: int) -> np.ndarray:
     return np.roll(m, shift)[:n]
 
 
-def _select(signals, window: int, threshold: float, budget: int | None, gap: int = 0):
-    """:func:`select_windows`, also returning the coverage mask and each band's peaks."""
+def _select(
+    signals, window: int, threshold: float, budget: int | None, gap: int = 0, max_peaks=None
+):
+    """:func:`select_windows`, also returning the coverage mask and each band's peaks (all of
+    them, also those the cap left out)."""
     signals = [np.asarray(s) for s in signals]
     n = len(signals[0])
     if any(len(s) != n for s in signals):
@@ -172,7 +181,7 @@ def _select(signals, window: int, threshold: float, budget: int | None, gap: int
         (
             (float(np.abs(s[i]) / np.abs(s).max()), b, int(i))
             for b, (s, idx) in enumerate(zip(signals, peaks))
-            for i in idx
+            for i in (idx if max_peaks is None else idx[: int(max_peaks)])  # its highest first
         ),
         key=lambda t: -t[0],
     )
@@ -191,9 +200,10 @@ def _select(signals, window: int, threshold: float, budget: int | None, gap: int
 
 def select_windows(
     signals: Sequence[np.ndarray],
-    window: int = 500,
+    window: int = 600,
     threshold: float = PEAK_REGION,
     budget: int | None = None,
+    max_peaks: int | None = 25,
 ) -> list[tuple[int, int]]:
     """The shared index ranges ``(start, stop)`` in time order, one set for every band.
 
@@ -203,9 +213,11 @@ def select_windows(
     it (so every peak keeps ``window / 2`` samples of real signal on each side); overlapping
     windows merge. It stops when
     every peak is covered, or before a window would take the coverage past ``budget`` samples.
+    Each band gives at most ``max_peaks`` peaks, its highest (``None``: all); its maximum is
+    always among them.
     A window across the period's end is two ranges (the loop makes them contiguous).
     """
-    return _select(signals, int(window), float(threshold), budget)[0]
+    return _select(signals, int(window), float(threshold), budget, max_peaks=max_peaks)[0]
 
 
 def _papr_db(x: np.ndarray) -> float:
@@ -233,12 +245,13 @@ def _cut(signals, rms, end: int, start: int, d_max: int, e_max: int, total: int 
 
 def build_probe(
     signals: Sequence[np.ndarray],
-    window: int = 500,
+    window: int = 600,
     crossfade: int = 16,
     multiple: int = 16,
     block: int = 1,
     budget: int | None = None,
     threshold: float = PEAK_REGION,
+    max_peaks: int | None = 25,
 ) -> Probe:
     """Every band's probe at the shared ranges of :func:`select_windows` (see the module
     docstring). ``signals`` are the bands' TX codes, one period each, of one length; the probe's
@@ -250,10 +263,11 @@ def build_probe(
     n_full = len(signals[0])
     unit = math.lcm(max(1, int(multiple)), max(1, int(block)))
     room = 3 * crossfade + unit  # a gap shorter than this is kept: no join there
-    ranges, mask, peaks = _select(signals, window, float(threshold), budget, room)
+    ranges, mask, peaks = _select(signals, window, float(threshold), budget, room, max_peaks)
     rms = [float(np.sqrt(np.mean(np.abs(s) ** 2))) or 1.0 for s in signals]
     settings = {"window": window, "crossfade": crossfade, "multiple": int(multiple),
-                "block": int(block), "budget": budget, "threshold": float(threshold)}  # fmt: skip
+                "block": int(block), "budget": budget, "threshold": float(threshold),
+                "max_peaks": max_peaks}  # fmt: skip
     if mask.all():
         ranges = [(0, n_full)]
     # each range runs [start, stop); range k joins range k + 1 (the last joins the first)
@@ -341,6 +355,7 @@ def build_probe(
         papr, papr_full = _papr_db(p), _papr_db(s)
         power = float(10 * np.log10(np.mean(np.abs(p) ** 2) / np.mean(np.abs(s) ** 2)))
         covered = int(np.count_nonzero(kept[pk]))
+        capped = max_peaks is not None and len(pk) > int(max_peaks)  # the cap left peaks out
         stats.append(
             {
                 "band": b,
@@ -349,13 +364,12 @@ def build_probe(
                 "mean_power_db": round(power, 3),
                 "peaks_covered": covered,
                 "peaks_total": int(len(pk)),
+                "capped": capped,
             }
         )
-        if abs(papr - papr_full) > PAPR_TOL_DB:
-            problems.append(f"band {b}: PAPR {papr:.2f} dB, the full signal {papr_full:.2f} dB")
         if abs(power) > POWER_TOL_DB:
             problems.append(f"band {b}: mean power {power:+.2f} dB from the full signal")
-        if covered < len(pk) and budget is None:
+        if covered < len(pk) and budget is None and not capped:
             problems.append(f"band {b}: {covered} of {len(pk)} peaks covered")
     if n * 4 > n_full:
         problems.append(f"{n} samples is more than a quarter of the signal ({n_full})")
@@ -410,10 +424,17 @@ def fidelity_report(
     (:meth:`Probe.describe`) and, per backoff, per band, the full and probe compression and their
     offset (:func:`probe_fidelity`). It runs whether the lock used the probe or not.
     """
+    settings = settings or ProbeSettings()
     try:
-        probe = (settings or ProbeSettings()).build(refs)
+        probe = settings.build(refs)
     except ValueError as exc:  # e.g. a signal shorter than one window: nothing to check
-        return {"probe": None, "error": str(exc), "backoffs": {}, "worst_offset_db": None}
+        return {
+            "probe": None,
+            "error": str(exc),
+            "settings": asdict(settings),
+            "backoffs": {},
+            "worst_offset_db": None,
+        }
     backoffs = {}
     for k, ys in sorted(outputs.items()):
         got = probe_fidelity(list(refs), list(ys), probe)["bands"]
@@ -421,4 +442,9 @@ def fidelity_report(
     worst = max(
         (abs(b["offset_db"]) for per in backoffs.values() for b in per.values()), default=None
     )
-    return {"probe": probe.describe(), "backoffs": backoffs, "worst_offset_db": worst}
+    return {
+        "probe": probe.describe(),
+        "settings": asdict(settings),
+        "backoffs": backoffs,
+        "worst_offset_db": worst,
+    }

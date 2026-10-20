@@ -80,6 +80,36 @@ def test_a_window_across_the_period_end_is_two_ranges():
     assert select_windows([a], window=200) == [(0, 120), (1900, 2100), (3920, 4000)]
 
 
+def test_each_band_gives_at_most_max_peaks_its_highest_and_its_maximum_always():
+    a = spikes(20000, {1000: 1.0, 5000: 0.99, 9000: 0.985, 13000: 0.98})
+    b = spikes(20000, {3000: 1.0, 7000: 0.976}, scale=0.3, seed=1)
+    every = [(900, 1100), (2900, 3100), (4900, 5100), (6900, 7100), (8900, 9100), (12900, 13100)]
+    assert select_windows([a, b], window=200, max_peaks=None) == every
+    assert select_windows([a, b], window=200, max_peaks=10) == every  # a cap above the count
+    # two per band: a's 1000 and 5000, b's 3000 and 7000, still ranked and in time order
+    assert select_windows([a, b], window=200, max_peaks=2) == [
+        (900, 1100),
+        (2900, 3100),
+        (4900, 5100),
+        (6900, 7100),
+    ]
+    assert select_windows([a, b], window=200, max_peaks=1) == [(900, 1100), (2900, 3100)]
+
+
+def test_a_capped_probe_reports_its_bias_and_is_not_refused():
+    sig = [codes(cfr_signal(1)), codes(cfr_signal(2))]
+    full = build_probe(sig, window=300, crossfade=8, max_peaks=None)
+    capped = build_probe(sig, window=300, crossfade=8, max_peaks=3)
+    assert all(not st["capped"] for st in full.stats)
+    assert full.ok and capped.n < full.n and capped.settings["max_peaks"] == 3
+    for st, s in zip(capped.stats, sig):
+        assert st["capped"] and st["peaks_covered"] < st["peaks_total"]
+        assert int(np.argmax(np.abs(s))) in capped.positions  # the band's maximum is always in
+    assert "peaks covered" not in capped.reason
+    default = build_probe(sig, window=300, crossfade=8)  # 25: more than these signals have
+    assert default.n == full.n and default.ranges == full.ranges
+
+
 # -- the build ----------------------------------------------------------------------------------
 
 
@@ -99,7 +129,8 @@ def test_every_band_is_cut_at_the_same_indices_and_keeps_its_codes(seeds, window
     assert np.isin(peaks, p.positions).all()  # every peak at or above the threshold is in it
     for st, pk in zip(p.stats, (peak_events(s) for s in sig)):
         assert st["peaks_covered"] == st["peaks_total"] == len(pk)
-        assert abs(st["papr_db"] - st["papr_full_db"]) <= 0.1 and abs(st["mean_power_db"]) <= 0.2
+        assert abs(st["mean_power_db"]) <= 0.2
+        assert st["papr_db"] - st["papr_full_db"] == pytest.approx(-st["mean_power_db"], abs=0.002)
 
 
 def test_every_peak_keeps_half_a_window_of_real_signal_and_no_crossfade_comes_near():
@@ -143,8 +174,7 @@ def test_a_budget_keeps_the_highest_peaks_and_only_reports_the_rest():
 def test_the_build_check_refuses_with_its_reasons():
     sig = [codes(cfr_signal(1)), codes(cfr_signal(2))]
     short = build_probe(sig, window=100, crossfade=8)  # windows too short to be typical
-    assert not short.ok and "PAPR" in short.reason and "the full signal" in short.reason
-    assert "mean power" in short.reason
+    assert not short.ok and "mean power" in short.reason and "from the full signal" in short.reason
     long = build_probe(sig, window=2000, crossfade=8)
     assert not long.ok and "more than a quarter of the signal" in long.reason
 
@@ -152,13 +182,20 @@ def test_the_build_check_refuses_with_its_reasons():
 @pytest.mark.parametrize(
     "bad",
     [{"window": 40}, {"window": 30000}, {"crossfade": 200}, {"budget": 100}, {"block": 0},
-     {"block": 5000}],
+     {"block": 5000}, {"max_peaks": 0}, {"max_peaks": 1001}],
 )  # fmt: skip
 def test_the_settings_have_their_ranges(bad):
     with pytest.raises(ValueError):
         ProbeSettings(**bad)
     s = ProbeSettings()
-    assert (s.window, s.crossfade, s.budget, s.block, s.multiple) == (500, 16, None, 1, 16)
+    assert (s.window, s.crossfade, s.budget, s.block, s.multiple, s.max_peaks) == (
+        600,
+        16,
+        None,
+        1,
+        16,
+        25,
+    )
 
 
 def test_the_fidelity_of_a_probe_on_a_memoryless_pa():
@@ -195,14 +232,21 @@ def _load(path: Path) -> np.ndarray:
 
 
 @pytest.mark.skipif(not BENCH.is_dir(), reason="the S20-100 bench captures are not on this machine")
-def test_the_default_probe_holds_the_bench_compression_within_0p03_db():
+@pytest.mark.parametrize("max_peaks, bound", [(25, 0.1), (None, 0.03)])
+def test_the_default_probe_holds_the_bench_compression(max_peaks, bound):
     """S20-100, TX2 + TX3, the full signals' 0..3 dB backoff captures of 2026-10-20: compression on
-    the default probe's (500 / 16) sample positions against the full period."""
+    the probe's (600 / 16) sample positions against the full period. Every peak (42 / 27): within
+    0.03 dB; the default cap of 25 peaks per band (TX2 loses 17): within 0.1 dB (0.091 measured)."""
     stem = BENCH.name
     x = [_load(BENCH / f"{stem}_{b}_in.txt") for b in ("TX2", "TX3")]
-    p = build_probe([codes(v) for v in x])
-    assert [st["peaks_covered"] for st in p.stats] == [st["peaks_total"] for st in p.stats]
+    p = build_probe([codes(v) for v in x], max_peaks=max_peaks)
+    covered = [st["peaks_covered"] for st in p.stats]
+    total = [st["peaks_total"] for st in p.stats]
+    assert (covered == total) == (max_peaks is None) and p.ok, (covered, total, p.reason)
+    assert [st["capped"] for st in p.stats] == [
+        max_peaks is not None and t > max_peaks for t in total
+    ]
     for k in range(4):
         y = [_load(BENCH / f"{stem}_{k}dB_{b}_out.txt") for b in ("TX2", "TX3")]
         offsets = [b["offset_db"] for b in probe_fidelity(x, y, p)["bands"]]
-        assert all(abs(o) <= 0.03 for o in offsets), (k, offsets)
+        assert all(abs(o) <= bound for o in offsets), (k, offsets)

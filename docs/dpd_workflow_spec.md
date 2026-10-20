@@ -595,7 +595,7 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
 
 **The fast lock** (Polynomials `multiband_setup/task6_fast_lock.md`, replacing the walk and the
 old `slopes` method). One snapshot of every ORx per step. With `probe=ProbeSettings(...)` the lock
-runs on the probe (Task 6b, `adrvtrx.probe`: a 500-sample window around every peak event of every
+runs on the probe (Task 6b, `adrvtrx.probe`: a 600-sample window around every peak event of every
 band, the same indices in every band, joined with crossfades; the full signal's codes); `joint` solves `J da = target - c` for
 every band together from a slope prior (own 0.31, cross 0.06 dB/dB, the first bench lock),
 updated each step (Broyden), with own slopes in 0.1..1.5, cross terms at most half the own, and a
