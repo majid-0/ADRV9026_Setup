@@ -24,7 +24,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",
-    "black>=24.0",
+    "black==25.11.0",  # pinned: the newest black that runs on 3.9, so every CI job formats alike
     "pre-commit>=3.0",
 ]
 
