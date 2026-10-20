@@ -481,6 +481,52 @@ def aligned_capture(
     return AlignedCapture(raw, iq, rep, x_al, y_al, float(delay))
 
 
+def aligned_captures(
+    radio,
+    channels,
+    refs,
+    *,
+    bits: int,
+    fs: float,
+    oversample: int = 2,
+    fractions=None,
+) -> list[AlignedCapture]:
+    """:func:`aligned_capture` of several channels from ONE snapshot (one ``PerformRx``).
+
+    ``refs`` (one per channel, equal lengths: one ``PerformTx`` plays them) and ``fractions``
+    (one per channel, ``None`` for a full alignment) as in :func:`aligned_capture`. The channels
+    must sit on different readback slots (two ORx inputs on one ORx ADC cannot be read together).
+    """
+    refs = [np.asarray(r) for r in refs]
+    if len({len(r) for r in refs}) != 1:
+        raise ValueError(
+            f"one snapshot needs equal reference lengths, got {[len(r) for r in refs]}"
+        )
+    fractions = list(fractions) if fractions is not None else [None] * len(channels)
+    mask = 0
+    for ch in channels:
+        mask |= int(ch)
+    out = capture(radio, mask, reference_capture_ms(refs[0], fs, oversample), bits=bits)
+    result = []
+    for ch, ref, frac in zip(channels, refs, fractions):
+        raw = out.channels[ch]
+        rep = clip_report(raw.i, raw.q, bits)
+        iq = raw.iq
+        if frac is None:
+            x_al, y_al, delay = estimate_and_align(ref, iq, fs)
+        else:
+            x_al, y_al, delay = align_with_fraction(ref, iq, frac)
+        result.append(AlignedCapture(raw, iq, rep, x_al, y_al, float(delay)))
+    return result
+
+
+def shares_orx_adc(channels) -> bool:
+    """Two of the ORx ``channels`` land on one ORx ADC (ORx1/ORx2 or ORx3/ORx4): one snapshot cannot
+    read them both."""
+    adcs = [_ORX_ADC_INDEX[ch] for ch in channels if ch in _ORX_ADC_INDEX]
+    return len(adcs) != len(set(adcs))
+
+
 def autolevel_for(
     radio,
     channel: RxChannel,

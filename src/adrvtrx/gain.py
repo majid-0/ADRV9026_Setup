@@ -24,6 +24,7 @@ Bench facts that shape this design (see docs/development_debugging.md):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,6 +42,9 @@ __all__ = [
     "ORX_GAIN_MIN",
     "ORX_GAIN_MAX",
     "ORX_DB_PER_INDEX",
+    "ORX_STEP_BOUNDS",
+    "OrxStep",
+    "relevel_index",
 ]
 
 # ORx gain table, characterized on the bench (TX2->ORx2, UC98 link-sharing):
@@ -110,6 +114,101 @@ def peak_window(
     start = max(0, min(peak_index - half, n - window_samples))
     sl = slice(start, start + window_samples)
     return i[sl], q[sl]
+
+
+def relevel_index(
+    peak_dbfs: float, railed: int, *, target_dbfs: float, band_hi: float, db_per_index: float
+) -> int:
+    """ORx gain index change for a capture that is not leveled (railed, hot or cold).
+
+    One index down when it railed with its peak still in band (the peak dBFS compresses near
+    full scale, the railed count does not); otherwise the peak's distance from ``target_dbfs`` in
+    indices, at least one. The re-level rule of the single-band and the multi-band searches
+    (:class:`OrxStep` learns its ``db_per_index``).
+    """
+    if railed > 0 or peak_dbfs > band_hi:
+        if railed > 0 and not peak_dbfs > band_hi:
+            return -1
+        return -max(1, int(round((peak_dbfs - target_dbfs) / db_per_index)))
+    return max(1, int(round((target_dbfs - peak_dbfs) / db_per_index)))
+
+
+#: The range a learnt ORx gain step is held in, dB per index.
+ORX_STEP_BOUNDS = (0.25, 1.5)
+
+
+class OrxStep:
+    """One ORx's gain re-level that learns its step (dB per index), for every re-level of that ORx.
+
+    The gain table is not 0.5 dB per index everywhere (ORX3 moves about 0.8 dB per index near
+    202..204 on the bench), so a re-level sized with 0.5 overshoots and bounces across the window
+    for ever. Here:
+
+    * dB per index is the secant of the last two captures at different gains and the same TX
+      drive (``drive``: anything that names it, e.g. the attenuations), neither railed, held in
+      :data:`ORX_STEP_BOUNDS`; until there are two, ``db_per_index`` (0.5) is assumed. It is kept
+      across drives (it belongs to the gain table).
+    * Once a re-level overshoots (the peak crosses the window), the steps are 1 index, until the
+      drive changes.
+    * If a 1-index step still jumps the window, :attr:`jumped` is set and :meth:`closest` names
+      the capture to take: the one closest to the target with no railed samples.
+
+    :meth:`relevel` records a capture that is not leveled and returns the index change;
+    :meth:`indices` converts a level change in dB with the learnt step.
+    """
+
+    def __init__(self, db_per_index: float = ORX_DB_PER_INDEX, bounds=ORX_STEP_BOUNDS):
+        self.db_per_index = float(db_per_index)
+        self.bounds = (float(bounds[0]), float(bounds[1]))
+        self.single = False  # 1-index steps (a re-level overshot at this drive)
+        self.jumped = False  # a 1-index step jumped the window at this drive
+        self._caps: list[tuple] = []  # (drive, gain, peak, railed, side) at the current drive
+
+    def _side(self, peak: float, railed: int, band_lo: float, band_hi: float) -> int:
+        if railed > 0 or peak > band_hi:
+            return 1
+        return -1 if peak < band_lo else 0
+
+    def observe(self, gain: int, peak: float, railed: int, *, band_lo: float, band_hi: float,
+                drive=None) -> None:  # fmt: skip
+        """Record a capture (leveled or not): it learns the step and detects an overshoot."""
+        side = self._side(peak, railed, band_lo, band_hi)
+        if self._caps and self._caps[-1][0] != drive:  # a new drive: a new re-level episode
+            self._caps, self.single, self.jumped = [], False, False
+        if self._caps:
+            _d, g0, p0, r0, s0 = self._caps[-1]
+            if g0 != gain and r0 == 0 and railed == 0 and math.isfinite(p0 + peak):
+                slope = (peak - p0) / (gain - g0)
+                if slope > 0:  # noise or a wrong reading cannot teach a falling table
+                    self.db_per_index = float(
+                        np.clip(round(slope, 2), *self.bounds)
+                    )  # 0.01 dB: no rounding flips
+            if s0 * side < 0:  # the peak crossed the window
+                self.jumped = self.jumped or abs(gain - g0) <= 1
+                self.single = True
+        self._caps.append((drive, int(gain), float(peak), int(railed), side))
+
+    def relevel(self, gain: int, peak: float, railed: int, *, target_dbfs: float, band_lo: float,
+                band_hi: float, drive=None) -> int:  # fmt: skip
+        """Index change for a capture that is not leveled (recorded, see :meth:`observe`)."""
+        self.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi, drive=drive)
+        return self.step(peak, railed, target_dbfs=target_dbfs, band_hi=band_hi)
+
+    def step(self, peak: float, railed: int, *, target_dbfs: float, band_hi: float) -> int:
+        """Index change for a capture already recorded (:meth:`observe`)."""
+        k = relevel_index(
+            peak, railed, target_dbfs=target_dbfs, band_hi=band_hi, db_per_index=self.db_per_index
+        )
+        return (1 if k > 0 else -1) if self.single else k
+
+    def closest(self, target_dbfs: float) -> tuple[int, float] | None:
+        """``(gain, peak)`` of the capture at this drive closest to the target, not railed."""
+        ok = [(g, p) for _d, g, p, r, _s in self._caps if r == 0 and math.isfinite(p)]
+        return min(ok, key=lambda gp: abs(gp[1] - target_dbfs)) if ok else None
+
+    def indices(self, db: float) -> int:
+        """Gain indices for a level change of ``db`` dB, with the learnt step."""
+        return int(round(float(db) / self.db_per_index))
 
 
 class AgcError(Exception):
@@ -258,9 +357,11 @@ def _fine_trim(
 
     peak, railed = last
     fine_iters = 0
+    level = OrxStep(db_per_index)  # learns the table's step; 1 index after an overshoot
     for _ in range(max_iterations):
         fine_iters += 1
         peak, railed = measure()
+        level.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi)
         if railed > 0 and floor_is_fatal and gain <= gain_min:  # Stage A's floor check
             return LevelResult(
                 False,
@@ -276,13 +377,28 @@ def _fine_trim(
             gain = _clamp(gain - 1)
             set_gain(gain)
             continue
+        outside = not band_lo <= peak <= band_hi
+        closest = level.closest(target_dbfs) if level.jumped and outside else None
+        if closest is not None:  # 1-index steps jump the window: the capture closest to target
+            if closest[0] == gain:
+                return LevelResult(
+                    False,
+                    gain,
+                    peak,
+                    fine_iters,
+                    "1-index steps jump the window: the capture closest to the target taken",
+                    railed=railed,
+                )
+            gain = _clamp(closest[0])
+            set_gain(gain)
+            continue
         if peak > band_hi:  # too hot
-            step = max(1, round((peak - target_dbfs) / db_per_index))
+            step = -level.step(peak, railed, target_dbfs=target_dbfs, band_hi=band_hi)
             gain = _clamp(gain - step)
             set_gain(gain)
             continue
         if peak < band_lo:  # too cold
-            step = max(1, round((target_dbfs - peak) / db_per_index))
+            step = level.step(peak, railed, target_dbfs=target_dbfs, band_hi=band_hi)
             new = gain + step
             if new >= gain_max:
                 if gain >= gain_max:  # already maxed and still below band -> accept
