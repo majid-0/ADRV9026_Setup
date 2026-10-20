@@ -1460,13 +1460,13 @@ def confirm_lock(
     The 0 dB backoff capture is the confirmation: :func:`capture_case` at the locked
     attenuations (ORx AGC with its Stage C level check on the full signal, ``check``), then each
     band's gain compression against its target. A band outside ``±comp_tol_db`` continues the
-    search from there on full captures (the reading just taken is its first step; ``J`` as the
-    probe search left it), for at most ``confirm_steps`` moves, and the 0 dB capture is taken
-    again where it ends. Returns the 0 dB captures; ``search`` is updated in place: the bands,
-    ``converged`` and ``reason`` of the full signal, the fallback's rows (``signal`` "full") in
-    ``history``, and ``confirm``: ``offset_db`` per band (the full GC minus the probe GC at the
-    same attenuation), ``gc_full_db``, ``fallback_steps``, and ``converged_on`` ("probe",
-    "fallback" or "").
+    search from there on full captures (the reading just taken is its first step; the same
+    method, ``J`` as the probe search left it), for at most ``confirm_steps`` moves, and the 0 dB
+    capture is taken again where it ends. Returns the 0 dB captures; ``search`` is updated in
+    place: the bands, ``converged`` and ``reason`` of the full signal, the fallback's rows
+    (``signal`` "full") in ``history``, and ``confirm``: ``offset_db`` per band (the full GC
+    minus the probe GC at the same attenuation), ``gc_full_db``, ``fallback_steps``, and
+    ``converged_on`` ("probe", "fallback" or "").
     """
     tol = float(search_kw.get("comp_tol_db", 0.1))
     targets = np.array([b.target_db for b in bands])
@@ -1534,7 +1534,7 @@ def confirm_lock(
         atten_mins_db=[min(b.atten_min_db, c.atten_db) for b, c in zip(bands, caps)],
         orx_gains=[c.orx_gain for c in caps],
         names=[b.name for b in bands],
-        method="joint",
+        method=search.method,
         slopes=search.slopes,
         max_steps=int(confirm_steps) + 1,
         snapshot=search.snapshot,
