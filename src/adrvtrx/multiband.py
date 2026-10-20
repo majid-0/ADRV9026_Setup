@@ -1208,7 +1208,9 @@ def lock_bands(
     full signal's codes around its peak, ``probe_block`` the TX memory's block), the ORx AGC and
     every search reading capture ``oversample`` probe periods, each aligned in full, and after
     the lock every band swaps back to its full signal at the same attenuations and gains (the
-    caller confirms on it, :func:`confirm_lock`). ``probe_ms=None`` plays the full signals
+    caller confirms on it, :func:`confirm_lock`). A signal no longer than the probe is played
+    whole, as with ``probe_ms=None`` (``search.probe`` stays empty). ``probe_ms=None`` plays the
+    full signals
     throughout: a band's first reading inside the AGC window is aligned in full, its fractional
     delay kept, and its later readings only search the integer lag (:func:`measure_band`
     ``fraction``).
@@ -1226,9 +1228,9 @@ def lock_bands(
     _check_method(method)
     _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     refs = tx_codes(bands, tx_bits=tx_bits)
-    probes, probe_info = (
-        (None, {}) if probe_ms is None else make_probes(refs, fs, probe_ms, block=probe_block)
-    )
+    probes, probe_info = None, {}
+    if probe_ms is not None and probe_length(probe_ms, fs, probe_block) < len(refs[0]):
+        probes, probe_info = make_probes(refs, fs, probe_ms, block=probe_block)
     played = refs if probes is None else probes
     if snapshot is None:
         snapshot = not shares_orx_adc([b.orx for b in bands])
@@ -1521,7 +1523,8 @@ def confirm_lock(
             return [first[i] for i in idx]  # the confirmation capture is the first reading
         return reader(idx)
 
-    kw = {k: v for k, v in search_kw.items() if k not in ("max_steps", "slopes", "method")}
+    skip = ("max_steps", "slopes", "method", "probe_ms", "probe_block", "snapshot", "confirm_steps")
+    kw = {k: v for k, v in search_kw.items() if k not in skip}
     fb = search_multiband_compression(
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
