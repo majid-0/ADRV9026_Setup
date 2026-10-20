@@ -143,3 +143,8 @@ def init_cal_member(name: str) -> str:
 def tx_to_orx_member(orx_index: int, mapping: str) -> str:
     """``(1, "TX1_ORX1")`` -> ``"ADI_ADRV9010_MAP_TX1_ORX1"`` for orx1Map etc."""
     return f"ADI_ADRV9010_MAP_{mapping}"
+
+
+def channel_name(channel) -> str:
+    """``TxChannel.TX1`` -> ``"TX1"``; anything without a ``name`` -> ``str(channel)``."""
+    return channel.name if hasattr(channel, "name") else str(channel)

@@ -45,15 +45,21 @@ def build_tx_data(bridge, channel_iq: Mapping[TxChannel, tuple[np.ndarray, np.nd
     if len(lengths) != 1:
         raise ValueError(f"all TX I/Q buffers must be the same length, got {sorted(lengths)}")
     n = lengths.pop()
-    zeros = [0] * n
+    # A numpy bridge (the hardware server's client) takes the arrays as they are; the .NET
+    # bridge gets Python lists, as it always has.
+    as_is = getattr(bridge, "accepts_numpy", False)
+    zeros = np.zeros(n, dtype=np.int32) if as_is else [0] * n
+
+    def values(a):
+        return np.asarray(a) if as_is else np.asarray(a).tolist()
 
     mask = 0
     items = []
     for ch in TX_SINGLE:  # TX1..TX4 always emitted
         if ch in channel_iq:
             i_int, q_int = channel_iq[ch]
-            items.append(bridge.int_array(np.asarray(i_int).tolist()))
-            items.append(bridge.int_array(np.asarray(q_int).tolist()))
+            items.append(bridge.int_array(values(i_int)))
+            items.append(bridge.int_array(values(q_int)))
             mask |= int(ch)
         else:
             items.append(bridge.int_array(zeros))

@@ -2,8 +2,9 @@
 
 A :class:`Band` ties one TX path + waveform to a capture channel (Rx or ORx),
 a duration and an output name. Single/dual/quad = 1/2/4 bands sharing the two
-real LOs across four distinct paths. All bands transmit together and are captured
-in one sample-aligned snapshot (concern #2).
+real LOs across four distinct paths. All bands transmit together; each band is
+captured in its own snapshot (two ORx inputs enabled at once mis-route on this
+hardware), on the IMMEDIATE trigger (``TXn_SOF`` times out on this bench).
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ class BandRun:
 
 
 def _sof_trigger(bands: Sequence[Band]) -> RxTrigSource:
-    """Align the snapshot to the start-of-frame of the lowest-numbered TX in use."""
+    """The start-of-frame trigger of the lowest-numbered TX in use (opt-in: on this bench the
+    TXn_SOF trigger times out, so :func:`run_bands` defaults to IMMEDIATE)."""
     from ._enums import TX_SINGLE, TX_SOF_FOR
 
     for tx in TX_SINGLE:
@@ -59,7 +61,12 @@ def run_bands(
     orx_tol_down_db: float = 0.6,
     orx_coarse_ms: float = 0.1,
 ) -> BandRun:
-    """Transmit all bands, (optionally) auto-level ORx, capture one snapshot, save per band."""
+    """Transmit all bands, (optionally) auto-level ORx, capture each band, save per band.
+
+    ``trig`` defaults to IMMEDIATE (TX runs continuously, so the signal is always
+    there). The TXn_SOF trigger times out on this bench (no TX start-of-frame); align
+    the captures in software (:mod:`adrvtrx.align`).
+    """
     # 1. Multi-band transmit (all TX channels start together).
     channel_to_iq = {b.tx_channel: b.waveform for b in bands}
     transmit_bands(radio, channel_to_iq, tx_bits, continuous=True)
@@ -90,7 +97,7 @@ def run_bands(
     #    capture is required for correct multiband data. The trade-off is that the
     #    bands are no longer mutually sample-aligned -- fine for per-band level/delay/
     #    save, which is what this returns.
-    trig = trig if trig is not None else _sof_trigger(bands)
+    trig = trig if trig is not None else RxTrigSource.IMMEDIATE
     longest = max(b.capture_time_ms for b in bands)
     result = CaptureResult(capture_time_ms=longest, trig=trig)
     for b in bands:

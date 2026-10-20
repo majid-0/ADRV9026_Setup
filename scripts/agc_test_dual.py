@@ -6,8 +6,10 @@ table and a suggested static gain per band.
 
     conda run -n myenv python scripts/agc_test_dual.py
 
-LO2 drives both TX and ORx, so the frequency grid moves both bands' loopback
-together. Each band's ORx is leveled independently (different ADCs).
+Each band's TX drives its own LO (``lo_for_tx`` under the config's clocks: TX1/TX2
+on LO1, TX3/TX4 on LO2), and its ORx follows that LO, so grid point i retunes each
+band's LO to that band's i-th frequency. Each band's ORx is leveled and captured on
+its own: enabling two ORx inputs in one snapshot mis-routes on this hardware.
 """
 
 from __future__ import annotations
@@ -16,10 +18,10 @@ import statistics
 
 from adrvtrx import RxChannel, TxChannel
 from adrvtrx.capture import capture
-from adrvtrx.config import load_config
+from adrvtrx.config import load_config, lo_for_tx
 from adrvtrx.experiment import session
 from adrvtrx.gain import ORX_GAIN_MAX, ORX_GAIN_MIN, autolevel_orx, clip_report
-from adrvtrx.sweep import frequency_axis, run_sweep
+from adrvtrx.sweep import SweepAxis, run_sweep
 from adrvtrx.transmit import transmit_bands
 from adrvtrx.waveform import load_tab_iq
 
@@ -30,22 +32,21 @@ _DIR = "C:/Users/ohammi/OneDrive - aus.edu/DualBand/input_100"
 BANDS = [
     {
         "name": "band1",
-        "tx": TxChannel.TX2,
-        "orx": RxChannel.ORX2,
+        "tx": TxChannel.TX1,
+        "orx": RxChannel.ORX1,
         "signal": f"{_DIR}/Signal1.txt",
         "atten_db": 15.0,
+        "freqs_hz": [1.40e9, 1.45e9, 1.50e9],  # this band's LO (TX+ORx) at each grid point
     },
     {
         "name": "band2",
-        "tx": TxChannel.TX3,
-        "orx": RxChannel.ORX3,
+        "tx": TxChannel.TX4,
+        "orx": RxChannel.ORX4,
         "signal": f"{_DIR}/Signal2.txt",
         "atten_db": 15.0,
+        "freqs_hz": [1.80e9, 1.85e9, 1.90e9],
     },
 ]
-
-# Test grid -------------------------------------------------------------------
-FREQS_HZ = [0.90e9, 1.00e9, 1.10e9]  # LO2 (TX+ORx) frequencies
 
 # ORx AGC ---------------------------------------------------------------------
 ORX_TARGET_DBFS = -1.0
@@ -58,6 +59,10 @@ CAPTURE_MS = 0.1
 def main() -> None:
     cfg = load_config()
     cfg.profile_name = PROFILE
+    for b in BANDS:
+        b["lo"] = lo_for_tx(cfg.clocks, b["tx"])
+    assert len({b["lo"] for b in BANDS}) == len(BANDS), "each band needs its own LO"
+    assert len({len(b["freqs_hz"]) for b in BANDS}) == 1, "one frequency per band per grid point"
     with session(cfg) as (radio, info):
         for b in BANDS:
             b["wave"] = load_tab_iq(b["signal"])
@@ -70,7 +75,7 @@ def main() -> None:
         )
         for b in BANDS:
             print(
-                f"  {b['name']}: {b['tx'].name}->{b['orx'].name} @ "
+                f"  {b['name']}: {b['tx'].name}->{b['orx'].name} on {b['lo']} @ "
                 f"{b['atten_db']:.1f} dB atten, {len(b['wave'])} samples"
             )
         print(
@@ -88,17 +93,18 @@ def main() -> None:
             do_normalize=True,
         )
 
-        cap_mask = 0
-        for b in BANDS:
-            cap_mask |= int(b["orx"])
-
         def measure(ch):
             cap = capture(radio, int(ch), CAPTURE_MS, bits=info.rx_bits).channels[ch]
             rep = clip_report(cap.i, cap.q, info.rx_bits)
             return rep.peak_dbfs, rep.railed_samples
 
+        def tune(i):
+            for b in BANDS:
+                radio.retune_lo(b["lo"], int(b["freqs_hz"][i]))
+
         def action(point):
-            row = dict(point)
+            i = point["point"]
+            row = {f"{b['name']}_hz": b["freqs_hz"][i] for b in BANDS}
             for b in BANDS:
                 lr = autolevel_orx(
                     lambda g, ch=b["orx"]: radio.set_rx_gain(ch, g),
@@ -110,31 +116,29 @@ def main() -> None:
                 row[f"{b['name']}_gain"] = lr.final_gain_index
                 row[f"{b['name']}_ok"] = lr.converged
                 row[f"{b['name']}_note"] = lr.reason
-            res = capture(radio, cap_mask, CAPTURE_MS, bits=info.rx_bits)  # aligned snapshot
-            for b in BANDS:
-                cap = res.channels[b["orx"]]
-                rep = clip_report(cap.i, cap.q, info.rx_bits)
-                row[f"{b['name']}_peak"] = rep.peak_dbfs
-                row[f"{b['name']}_railed"] = rep.railed_samples
+            for b in BANDS:  # one ORx per snapshot
+                peak, railed = measure(b["orx"])
+                row[f"{b['name']}_peak"] = peak
+                row[f"{b['name']}_railed"] = railed
             return row
 
-        axis = frequency_axis(radio, "LO2", [int(f) for f in FREQS_HZ], name="lo2_hz")
-        records = run_sweep([axis], action)
+        n = len(BANDS[0]["freqs_hz"])
+        records = run_sweep([SweepAxis("point", tune, list(range(n)))], action)
         radio.disable_tx()
         _print_table(records)
 
 
 def _print_table(records) -> None:
-    hdr = f"\n  {'LO2_MHz':>9}"
+    hdr = "\n "
     for b in BANDS:
-        hdr += f" | {b['name']:>5} {'gain':>5}{'peak':>8}{'ok':>6}{'rail':>5}"
+        hdr += f" | {b['name']:>5} {'MHz':>7} {'gain':>5}{'peak':>8}{'ok':>6}{'rail':>5}"
     print(hdr)
     for r in records:
-        line = f"  {r['lo2_hz']/1e6:>9.1f}"
+        line = " "
         for b in BANDS:
             n = b["name"]
             line += (
-                f" | {'':>5} {r[f'{n}_gain']:>5}{r[f'{n}_peak']:>8.1f}"
+                f" | {'':>5} {r[f'{n}_hz']/1e6:>7.1f} {r[f'{n}_gain']:>5}{r[f'{n}_peak']:>8.1f}"
                 f"{str(r[f'{n}_ok']):>6}{r[f'{n}_railed']:>5}"
             )
         print(line)

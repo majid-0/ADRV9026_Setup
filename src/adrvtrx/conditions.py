@@ -25,10 +25,9 @@ from typing import Any
 
 import numpy as np
 
-from ._enums import RxChannel
-from .align import estimate_and_align
-from .capture import capture
-from .gain import ClipReport, clip_report
+from ._enums import RxChannel, channel_name
+from .capture import aligned_capture
+from .gain import ClipReport
 from .metrics import PA_CLIP_SLOPE, period_metrics
 from .waveform import full_scale, load_tab_iq
 
@@ -175,8 +174,7 @@ _CONDITION_KEYS = (*CSV_FIELDS[: CSV_FIELDS.index("converged") + 1], "lock_on")
 
 def condition_name(tx, backoff_db: int, freq_hz: int, bw_mhz: int) -> str:
     """``{TX}_{backoff}dB_{freq_MHz}MHz_{bw}BW``, e.g. ``TX1_0dB_2000MHz_100BW``."""
-    tx_name = tx.name if hasattr(tx, "name") else str(tx)
-    return f"{tx_name}_{int(backoff_db)}dB_{int(freq_hz) // 1_000_000}MHz_{int(bw_mhz)}BW"
+    return f"{channel_name(tx)}_{int(backoff_db)}dB_{int(freq_hz) // 1_000_000}MHz_{int(bw_mhz)}BW"
 
 
 def condition_keys(condition: OperatingCondition) -> dict[str, Any]:
@@ -301,21 +299,22 @@ def capture_point(
     always against ``ref``. ``pa_clipped`` uses ``min_top_slope``.
     """
     ref = np.asarray(ref)
-    capture_ms = oversample * len(ref) / float(fs) * 1e3
-    out = capture(radio, int(orx), capture_ms, bits=rx_bits).channels[orx]
-    rep = clip_report(out.i, out.q, rx_bits)
-    _x_al, y_al, delay = estimate_and_align(ref, out.iq, fs)
+    cap = aligned_capture(radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample)
     x = ref if metric_ref is None else np.asarray(metric_ref)
-    if len(x) != len(y_al):
-        raise ValueError(f"metric reference has {len(x)} samples, aligned period {len(y_al)}")
+    if len(x) != len(cap.y_aligned):
+        raise ValueError(
+            f"metric reference has {len(x)} samples, aligned period {len(cap.y_aligned)}"
+        )
     metrics = period_metrics(
         x,
-        y_al,
+        cap.y_aligned,
         fs=fs,
         bw_hz=bw_hz,
         rx_bits=rx_bits,
-        delay_samples=delay,
+        delay_samples=cap.delay_samples,
         corr_ref=ref,
         min_top_slope=min_top_slope,
     )
-    return PointCapture(y_aligned=y_al, delay_samples=float(delay), clip=rep, metrics=metrics)
+    return PointCapture(
+        y_aligned=cap.y_aligned, delay_samples=cap.delay_samples, clip=cap.clip, metrics=metrics
+    )

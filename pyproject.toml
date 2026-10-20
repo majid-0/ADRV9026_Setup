@@ -39,9 +39,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "hardware: tests that require a connected ADS9 + ADRV9026 (skipped in CI)",
+    "hardware: program the real ADS9 + ADRV9026 (deselected by default; tests/test_hardware.py)",
 ]
-addopts = "-ra"
+# The hardware tests program the real board: a plain `pytest` deselects them. Run them
+# deliberately (docs/development_debugging.md, section 6):
+#   ADRVTRX_ALLOW_HARDWARE_TESTS=1 pytest -m hardware -o addopts=""
+addopts = "-ra -m \"not hardware\""
 
 [tool.ruff]
 line-length = 100

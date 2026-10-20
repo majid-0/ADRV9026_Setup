@@ -14,9 +14,9 @@ parameterized from config.
   quantizes to the profile's `jesd204Np` bit depth.
 - **Transmits** one waveform per TX path (single → dual → "quad" = 4 paths / 2 LOs)
   with looping `PerformTx`; all paths start together.
-- **Captures** one sample-aligned snapshot (`PerformRx`) over any Rx **or** ORx
-  channels, aligned to TX start-of-frame (`TXn_SOF` trigger). Saves normalized
-  float `I⟶Q`.
+- **Captures** snapshots (`PerformRx`) of any Rx **or** ORx channel, on the
+  IMMEDIATE trigger (the `TXn_SOF` start-of-frame trigger times out on this bench;
+  alignment is done in software), one ORx per snapshot. Saves normalized float `I⟶Q`.
 - **Levels ORx** in software — an **ORx AGC** (`autolevel_capture`) on the captured-IQ
   peak with a railed-sample clip veto, targeting an asymmetric dBFS band. ORx has no
   hardware AGC and its overload flags / gain readback are unusable, so the gain index
@@ -144,6 +144,28 @@ from the captured signals to the next waveform) and
 [docs/linearize_notebook.md](docs/linearize_notebook.md) (the whole notebook).
 `adrvtrx` imports no external model library; the GMP is the reference DPD.
 
+Several bands at once (dual band: TX1 and TX4 into one PA). Every band is locked to its own
+compression target together, then backed off together; `method="slopes"` learns how each band's
+attenuation moves every band's compression, `method="walk"` steps each band by the single-band rule:
+
+```python
+from adrvtrx.multiband import BandSpec, CaseWriter, find_multiband_operating_point
+
+bands = [
+    BandSpec(TxChannel.TX1, RxChannel.ORX1, "LO1", 1_440_000_000, 80, sig1, target_db=4.0,
+             atten_start_db=20, atten_min_db=10),
+    BandSpec(TxChannel.TX4, RxChannel.ORX4, "LO2", 1_860_000_000, 80, sig2, target_db=4.0,
+             atten_start_db=20, atten_min_db=10),
+]
+writer = CaseWriter("captures", bands, tx_bits=12, rx_bits=12, fs=368.64e6)  # write-once case folder
+res = find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=368.64e6,
+                                     backoffs=(0, 1, 2, 3, 4), check=my_checks, writer=writer)
+writer.write_case_json()   # after the run: the case folder must be empty when it starts
+```
+
+The case folder's files are described in [docs/dpd_workflow_spec.md](docs/dpd_workflow_spec.md)
+§5.9; `load_conditions` and replay do not read them.
+
 ## Hardware server (one process owns the board)
 
 Scripts and notebooks should not each load the DLL and connect: they race for
@@ -203,8 +225,11 @@ make lint      # ruff + black --check
 make test      # hardware-free unit tests (this is local "CI")
 make format    # auto-fix
 nox            # lint + tests across 3.9 / 3.11
-make test-hw   # ONLY on the control PC with ADS9 + ADRV9026 connected
+make test-hw   # ONLY on the control PC with ADS9 + ADRV9026 connected, server stopped
 ```
+
+A plain `pytest` never selects the hardware tests (they program the board); `make test-hw`
+opts in (`ADRVTRX_ALLOW_HARDWARE_TESTS=1`, docs/development_debugging.md section 6).
 
 GitHub Actions (`.github/workflows/ci.yml`) runs lint + mocked tests on push.
 
@@ -226,6 +251,7 @@ src/adrvtrx/
   metrics.py     PAPR, window / gain compression, AM/AM top slope, NMSE, ACLR, corr, RMS
   compression.py TX attenuation search for a target PAPR or gain compression
   operating_point.py  transmit, lock, backoff, capture and CSV row in one call
+  multiband.py   several bands into one PA: joint compression search, backoffs, case folder
   conditions.py  Condition / DUT CSVs, aligned IQ files, capture_point
   replay.py      Replay stored waveforms (DPD files) at saved conditions
   linearize.py   Online transmit -> capture -> step() loop

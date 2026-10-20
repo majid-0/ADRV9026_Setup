@@ -137,7 +137,9 @@ class SimRadio:
         self.transmitted.append(self.loop.copy())
         self.rx_tx_enable(self._en_rx, self._en_tx | int(channel_mask))
 
-    def perform_rx(self, channel_mask: int, capture_time_ms: float, *, trig=None, timeout_ms=0):
+    def perform_rx(
+        self, channel_mask: int, capture_time_ms: float, *, trig=None, timeout_ms=0, keep=None
+    ):  # ``keep`` as Radio takes it: the whole readback comes back, as from a local Radio
         n = int(round(capture_time_ms * 1e-3 * FS))
         order = returned_channel_order(channel_mask)
         raw = [np.zeros(n, dtype=np.int32) for _ in range(2 * len(order))]

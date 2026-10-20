@@ -554,6 +554,84 @@ find_operating_point(radio, tx, orx, signal, *, tx_bits, rx_bits, fs,
 
 The radio is left at the condition's attenuation and ORx gain.
 
+### 5.9 `adrvtrx.multiband` (several bands into one PA)
+
+On the dual-band bench TX1 and TX4 drive one PA, so each band's compression
+depends on every band's attenuation. The module's docstring has the search
+rules; this section is the API and the files.
+
+```python
+BandSpec(tx, orx, lo, freq_hz, bw_mhz, signal, target_db=4.0,
+         atten_start_db=20.0, atten_min_db=10.0, signal_name="")
+search_multiband_compression(set_atten, set_gain, measure, *, targets_db,
+    start_attens_db, atten_mins_db, orx_gains, names=None, method="slopes",
+    coarse_step_db=2.5, fine_step_db=0.2, comp_tol_db=0.1, ..., max_steps=20,
+    max_relevel=6, min_top_slope=PA_CLIP_SLOPE, on_step=None) -> MultibandSearch
+lock_bands(radio, bands, *, tx_bits, rx_bits, fs, ...) -> (MultibandSearch, refs)
+capture_case(radio, bands, refs, attens_db, *, rx_bits, fs, agc=True,
+    gains=None, check=None, retakes=3, ...) -> list[BandCapture]
+find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
+    backoffs=(0, 1, 2, 3, 4), method="slopes", check=None, writer=None, ...)
+    -> CaseResult
+```
+
+- The search steers on gain compression (§3), every band within
+  `comp_tol_db` of its own target together; a band at `atten_min_db` below its
+  target stops there (`at limit`), the others go on. Each band's `lo` must be
+  the LO `[clocks]` routes its TX to; bands sharing an LO share its frequency.
+- Per backoff `k` every band goes to `lock + k` dB together, the ORx AGC runs
+  per band (starting from the lock gain + `k/2` dB) and one capture per band is
+  aligned and scored (`period_metrics`). `check(captures)` sees every band of
+  the state at once; a failing band is captured again.
+- A fatal search (an ORx that clips at its minimum gain) captures and writes
+  nothing. TX is off when the call ends or fails.
+- The search stops early when no band moved for two steps and every band not
+  within tolerance is at its limit or held at an unchanged ORx gain (a band
+  that cannot level).
+
+**Strong coupling: use the walk first.** Up to about 0.4 dB/dB from the other
+band both methods lock the synthetic PAs in 4 to 9 steps
+(`test_both_methods_lock_linear_coupled_bands_within_a_step_budget`). At about
+0.6 dB/dB the search may not lock: on the two-band test PA 6 of 16 lock pairs
+fail within 20 steps with either method, and the slopes method's restart and
+step rules are to be revisited with bench data. Until then, take the first
+bench locks with `method="walk"` and a small `max_steps` (about 8), keep the
+attenuation limits conservative, and read the real cross slope from
+`lock.csv`. The walk has a known limit cycle: when one 0.2 dB fine step moves
+a band's compression by more than the 0.2 dB tolerance window (own plus cross
+slope above about 1 dB/dB, both bands stepping together), it can jump across
+the window until `max_steps`; `lock.csv` then shows ±0.2 dB moves alternating.
+
+**Case folder** (`CaseWriter(run_dir, bands, ...)`): `<run_dir>/<case>/`, with
+`<case>` = `TX1-TX4_1440-1860MHz_80-80BW_4-4GC` (paths, carriers in MHz,
+bandwidths, compression targets). Write-once: a file that exists is an error,
+and `find_multiband_operating_point` refuses a non-empty folder before it
+touches the radio (if writing still fails, the error carries the result as
+`case_result`).
+
+| File | Content |
+|---|---|
+| `<case>_<TX>_in.txt` | Each band's reference, TX codes / full scale (§2.3) |
+| `<case>_<k>dB_<TX>_out.txt` | The aligned ORx period of each band at each backoff, ORx codes / full scale |
+| `conditions.csv` | One row per backoff per band (below) |
+| `lock.csv` | The search's history, one row per capture: `step, band, atten_db, orx_gain, peak_dbfs, railed, gain_compression_db, papr_compression_db, top_slope, leveled, error_db, move_db, action, slopes` (`slopes`: J as JSON, slopes method) |
+| `case.json` | Written by the caller after the run (`write_case_json(extra)`): `case_name, written_at, bands` (each `BandSpec.describe()`: `name, tx, orx, lo, freq_hz, bw_mhz, signal, target_db, atten_start_db, atten_min_db`), `fs_hz`, `lock` (per band: `band, atten_db, orx_gain, gain_compression_db, top_slope, status`), then `meta` and `extra` |
+
+`conditions.csv` columns, in order: the `row_meta` keys (default `case,
+version, profile, program_id`, from `meta`), `band, tx, orx, lo, freq_hz,
+bw_mhz, signal, freqs_mhz` (every band's carrier, `1440/1860`), `target_db,
+backoff_db, locked_atten_db, tx_atten_db, orx_gain, lock_status,
+lock_converged, lock_reason, search_method, search_steps, search_captures,
+peak_dbfs, railed`, the `period_metrics` figures (`delay_samples, delay_ns,
+corr, nmse_db, papr_in_db, papr_out_db, papr_compression_db, aclr_lower_dbc,
+aclr_upper_dbc, rms_dbfs, gain_compression_db, amam_top_slope, pa_clipped`),
+then `fs_hz, tries, check_ok, check, out_file, in_file`.
+
+This is not the single-band capture CSV of §4.1: it has no `name`,
+`compression_db` or `converged` column, so `load_conditions`,
+`replay_conditions` and `adrvtrx replay` do not read it (and replay plays one
+TX, while a dual-band state needs both bands playing together).
+
 ---
 
 ## 6. Sample notebooks (`notebooks/`)
@@ -587,15 +665,15 @@ models:
 | File | Covers |
 |---|---|
 | `test_metrics.py` | PAPR of a constant envelope (0 dB) and of a known spike. NMSE is invariant to scale and phase and ≈ −SNR for `g·x + noise`. ACLR on synthetic band-limited noise plus a known adjacent tone. `window_compression_db` sign and magnitude on Rapp. `inband_corr` = 1 for a scaled copy. Empty and zero inputs. `gain_compression_db`: 0 dB and slope 1 for a linear PA, matches the Rapp value, slope falls with drive, a hard clipper has slope 0 and is flagged, scale and phase invariant, repeats within 0.2 dB across noisy captures |
-| `test_compression_search.py` | Converges within ±tol on the Rapp model. Stops at the attenuation floor. Stops at the ceiling. Fatal when the ORx rails at the gain floor. ORx gain moves by Δatten/0.5 per step. Attenuation quantized to 0.05 dB. Returns the best point at max iterations. Gain lock converges and records every reading. The clip guard stops a hard-limiting PA at the last unclipped attenuation; without it the search clips. `find_compression_point(lock_on="gain")` on the sim bench |
-| `test_conditions.py` | CSV round trip for both schemas. Loads a legacy `TX1_conditions.csv` header and row, with defaults for the new columns. New columns round-trip. IQ file round-trip scale. Missing-column error |
-| `test_capture_point.py` | On the sim bench, recovers the fractional delay to within 0.02 samples. NMSE and corr are sane |
-| `test_find_compression_point.py` | On the sim bench, lands within ±tol and leaves the radio at the result |
+| `test_compression_search.py` | Converges within ±tol on the Rapp model. Stops at the attenuation floor. Stops at the ceiling. Fatal when the ORx rails at the gain floor. ORx gain moves by Δatten/0.5 per step. Attenuation quantized to 0.05 dB. Returns the best point at max iterations. Gain lock converges and records every reading. The clip guard stops a hard-limiting PA at the last unclipped attenuation; without it the search clips. `find_compression_point` on the sim bench lands within ±tol and leaves the radio at the result, also with `lock_on="gain"` |
+| `test_conditions.py` | CSV round trip for both schemas. Loads a legacy `TX1_conditions.csv` header and row, with defaults for the new columns. New columns round-trip. IQ file round-trip scale. Missing-column error. `capture_point` on the sim bench recovers the fractional delay to within 0.02 samples, NMSE and corr are sane, and a metric reference of another length is refused |
 | `test_replay.py` | Pre-flight lists missing files and wrong lengths. Retunes only when the frequency changes. Applies the saved attenuation and gain without AGC. Transmits u as stored (asserts the codes). z is aligned to u and the metrics are against x. `tx_clipped` is counted. TX is disabled even if the replay raises |
 | `test_linearize.py` | With an ideal inverse-Rapp `step`, NMSE improves after iteration 0. `None` stops the loop. Stops on rail. Files and CSV written. TX disabled on exception |
 | `test_gmp.py` | Coefficient count (non-causal = dpd_kit `GMP.unified`, causal). Exact recovery of a synthetic GMP's coefficients on a block. Column scaling gives the plain least-squares answer; ridge shrinks. Chunked `predict` = one chunk. A causal model reads no future sample. Block rows = full rows. `peak_block` placement and clamping |
 | `test_dpd.py` | `peak_dbm` (10 dBm at full scale). `normalize_pair` removes gain and phase. `limit_peak`: smallest margin within `tol_db`, keeps the start margin when enough, flags an unreachable limit, finds the first good bracket of a non-monotonic peak. `IlaStep` fits the rotated `z` to `u` as is. It anchors every capture on the first one (`anchor="each"` uses each capture's own peak) and restarts at `it == 0`. The guard adds only what the limit needs and is reported apart from the target. It returns `None` over the limit, so the loop stops before sending. Loops on the sim bench through `linearize` (memoryless GMP 9,1,0, 5 iterations; targets 0, 0.1, 0.15, 0.2 dB; a tight 8.5 dBm limit) and on the real-signal fixture with a forward-model DUT (GMP 5,5,2, 5 iterations; also 8.5 dBm): NMSE improves by ≥ 20 dB. The worst ACLR of the last iteration is ≥ 20 dB better than iteration 0, and no iteration is more than 0.3 dB worse than the one before. Every DPD peak is ≤ the limit, with `tx_clipped` = 0. The output peak stays within 0.05 dB of `-(target + guard)` on every DPD iteration, and within a 0.05 dB band when the guard engages. GMP(5,5,2) on the sim: ≥ 20 dB ACLR gain and a flat output about 0.1 dB short of the target; its ACLR drift after pass 2 is documented, not asserted |
 | `test_operating_point.py` | `find_operating_point` on the sim bench: PAPR lock without backoff, backoff with the AGC (more ORx gain, less compression), gain lock with the clip guard, files written and rows appended, a CSV with other columns refused, TX disabled when the search raises |
+| `test_multiband.py` | §5.9 on a synthetic two-band PA, a linear coupled PA and the fake board's shared PA: both methods lock coupled bands; limits, clip guard, re-leveling; an ORx that never levels holds its attenuation; NaN readings are measured again; at max steps the radio is left where it was measured; the slope update (secant, bounds) and that it is what locks 0.6 dB/dB coupling in few steps; the ORx gain prediction; LO checks; a whole case (files, retakes, write-once, a fatal search, a failed write) |
+| `test_multiband_golden.py` | The search's full output on 30 noise-free benches, pinned (`tests/data/multiband_search_golden.json`) |
 | `test_notebook_linearize.py` | Runs `dpd_linearize_loop.ipynb` cell by cell on the sim bench (with `K, MEMORY, CROSS = 9, 1, 0` for the memoryless sim PA): PAPR lock, gain lock with `MIN_TOP_SLOPE = 0.08`, and a saved CSV row. Same ACLR, NMSE, peak and output-level checks, and the steps CSV columns. Skipped without matplotlib |
 
 **Real-signal fixture.** `tests/data/tx1_2400mhz_100bw_excerpt.npz` (about
@@ -624,9 +702,10 @@ existing CSVs keep loading.
 
 ## 9. Out of scope for this PR
 
-- **Dual band.** The plan is one CSV row per band with a `point_id` column,
-  plus ACLR with `center_hz` for bands away from DC. The search rule depends on
-  whether both bands share one PA. A separate PR will decide that.
+- **Dual band** is implemented in `adrvtrx.multiband` (§5.9, both bands into
+  one PA, one case folder). Still out of scope: replaying a dual-band case, and
+  ACLR with `center_hz` for a band away from DC (each band is captured on its
+  own ORx at its own LO, so it sits at DC).
 - EVM, and storing AM/AM and AM/PM curves.
 - Re-levelling the ORx during replay or the online loop.
 

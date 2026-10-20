@@ -17,8 +17,10 @@ format:
 test:
 	pytest -m "not hardware"
 
-# Run ONLY on the control PC with the ADS9 + ADRV9026 connected.
+# Run ONLY on the control PC with the ADS9 + ADRV9026 connected and the hardware
+# server stopped: these tests connect to the board directly and program it. A plain
+# `pytest` deselects them; this target opts in (tests/test_hardware.py).
 test-hw:
-	pytest -m hardware
+	ADRVTRX_ALLOW_HARDWARE_TESTS=1 pytest -m hardware -o addopts="" -v
 
 ci: lint test

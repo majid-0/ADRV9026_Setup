@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from adrvtrx.align import apply_delay, estimate_and_align, estimate_delay
+from adrvtrx.align import align_with_fraction, apply_delay, estimate_and_align, estimate_delay
 
 
 def _ref(n=2048, seed=0):
@@ -59,3 +60,25 @@ def test_shorter_capture_than_reference_does_not_crash():
     y = x[:1000].copy()  # capture shorter than ref -> trimmed path
     d = estimate_delay(x, y, fs=1.0)
     assert np.isfinite(d)
+
+
+def _looped_capture(x, delay, start, rng):
+    """Two periods of a looping ``x`` delayed by ``delay`` samples, from ``start``, with noise."""
+    from adrvtrx.align import _apply_fractional_delay_fft
+
+    period = _apply_fractional_delay_fft(x, delay)  # circular: the TX loops the waveform
+    y = np.tile(period, 3)[start : start + 2 * len(x)]
+    return y + 0.01 * (rng.standard_normal(len(y)) + 1j * rng.standard_normal(len(y)))
+
+
+@pytest.mark.parametrize("frac", [0.0, 0.25, 0.45, 0.5, 0.55, 0.75, 0.99])
+def test_a_known_fraction_aligns_as_the_full_estimate_does(frac):
+    rng = np.random.default_rng(5)
+    x = _ref(8192)
+    for start in (0, 1234, 5000, 8191):  # the IMMEDIATE capture starts anywhere in the loop
+        y = _looped_capture(x, 3 + frac, start, rng)
+        xa, ya, d = estimate_and_align(x, y, fs=1.0)
+        xb, yb, d2 = align_with_fraction(x, y, d % 1.0)
+        assert d2 == pytest.approx(d, abs=1e-9)
+        np.testing.assert_allclose(yb, ya)
+        assert align_with_fraction(x, y, frac)[2] == pytest.approx(d, abs=0.1)  # whole samples

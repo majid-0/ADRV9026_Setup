@@ -43,9 +43,10 @@ class BoardConfig:
 class ClocksConfig:
     device_clock_khz: int = 245760
     ad9528: list[int] = field(default_factory=lambda: [245760, 122880, 122880, 245760])
+    # Rx and Tx of a pair share an LO (the TX QEC init cal observes TX through the Rx path).
     rx12_lo: str = "LO1"
-    rx34_lo: str = "LO1"
-    tx12_lo: str = "LO2"
+    rx34_lo: str = "LO2"
+    tx12_lo: str = "LO1"
     tx34_lo: str = "LO2"
     orx12_lo: str = "TXLO"
     orx34_lo: str = "TXLO"
@@ -66,16 +67,25 @@ class ChannelsConfig:
 
 @dataclass
 class LoConfig:
-    lo1_hz: int = 1_800_000_000
-    lo2_hz: int = 2_000_000_000
+    lo1_hz: int = 1_100_000_000
+    lo2_hz: int = 900_000_000
     aux_hz: int = 0
+
+
+#: The init calibrations of the working StdUseCase init script (``config/default.toml``).
+DEFAULT_INIT_CALS = [
+    "TX_BB_FILTER", "ADC_TUNER", "RX_TIA", "ORX_TIA", "LBRX_TIA",
+    "RX_DC_OFFSET", "ORX_DC_OFFSET", "LBRX_DC_OFFSET", "FLASH_CAL",
+    "INTERNAL_PATH_DELAY", "TX_LO_LEAKAGE_INTERNAL", "TX_QEC_INIT",
+    "LOOPBACK_RX_LO_DELAY", "RX_QEC_INIT", "ORX_QEC_INIT", "TX_DAC",
+]  # fmt: skip
 
 
 @dataclass
 class InitCalsConfig:
     channel_mask: int = 0xF
     warm_boot: int = 0
-    mask: list[str] = field(default_factory=list)
+    mask: list[str] = field(default_factory=lambda: list(DEFAULT_INIT_CALS))
 
 
 @dataclass
@@ -176,13 +186,17 @@ class Config:
     init_cals: InitCalsConfig = field(default_factory=InitCalsConfig)
     levels: LevelsConfig = field(default_factory=LevelsConfig)
     orx_agc: OrxAgcConfig = field(default_factory=OrxAgcConfig)
-    profile_name: str = "ADRV9025Init_StdUseCase102_LinkSharing.profile"
+    profile_name: str = "ADRV9025Init_StdUseCase98_LinkSharing.profile"
     server: ServerConfig = field(default_factory=ServerConfig)
 
     @property
     def profile_path(self) -> Path:
         """Resolve the profile to an absolute path under the install profiles dir."""
-        p = Path(os.path.expandvars(self.profile_name))
+        return self.profile_path_for(self.profile_name)
+
+    def profile_path_for(self, name: str | os.PathLike[str]) -> Path:
+        """Where a profile name would resolve (absolute, or under the profiles dir)."""
+        p = Path(os.path.expandvars(str(name)))
         return p if p.is_absolute() else self.dll.profiles_dir / p
 
     # -- loading ---------------------------------------------------------------

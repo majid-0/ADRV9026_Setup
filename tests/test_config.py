@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from adrvtrx.config import Config, load_config
@@ -15,6 +17,16 @@ def test_load_bundled_default():
     assert cfg.lo.lo2_hz == 900_000_000
     assert "TX_QEC_INIT" in cfg.init_cals.mask
     assert cfg.tx_to_orx == ["TX1_ORX1", "TX2_ORX2", "TX3_ORX3", "TX4_ORX4"]
+
+
+def test_code_defaults_equal_the_bundled_toml():
+    """A Config built without a TOML section gets what config/default.toml says."""
+    toml = load_config()
+    code = Config.from_dict({"dll": {"install_dir": str(toml.dll.install_dir)}})
+    for f in fields(Config):
+        assert getattr(code, f.name) == getattr(toml, f.name), f.name
+    # Rx and Tx of a pair share an LO (TX QEC init observes TX through the Rx path)
+    assert code.clocks.rx12_lo == code.clocks.tx12_lo and code.clocks.rx34_lo == code.clocks.tx34_lo
 
 
 def test_profile_path_resolves_under_install_dir():

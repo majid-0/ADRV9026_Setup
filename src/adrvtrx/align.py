@@ -19,7 +19,13 @@ import numpy as np
 
 from .metrics import inband_corr
 
-__all__ = ["estimate_delay", "estimate_and_align", "apply_delay", "match_corr"]
+__all__ = [
+    "estimate_delay",
+    "estimate_and_align",
+    "align_with_fraction",
+    "apply_delay",
+    "match_corr",
+]
 
 
 def match_corr(ref, y, fs=1.0, energy_frac=0.05):
@@ -133,7 +139,7 @@ def _correlate_and_peak(y, template, template_start, n_ref):
     corr_abs = np.abs(corr)
     corr_safe = np.where(valid, corr_abs, -np.inf)
     peak_idx = int(np.argmax(corr_safe))
-    return peak_idx, lags
+    return peak_idx, lags, corr_safe
 
 
 def _alignment_template(x_ref, peak_window_half):
@@ -182,7 +188,7 @@ def estimate_delay(
         n_up = max(2, int(upsample_factor))
 
     x_template, template_start_in_ref = _alignment_template(x_ref, peak_window_half)
-    peak_idx, lags = _correlate_and_peak(y_meas, x_template, template_start_in_ref, n_ref)
+    peak_idx, lags, _corr = _correlate_and_peak(y_meas, x_template, template_start_in_ref, n_ref)
     lag_int = lags[peak_idx]
     delay_samples = float(lag_int) - template_start_in_ref
 
@@ -222,7 +228,6 @@ def estimate_and_align(
     """
     x_ref = np.asarray(x_ref)
     y_meas = np.asarray(y_meas)
-    N_ref = len(x_ref)
 
     delay_samples = estimate_delay(
         x_ref,
@@ -233,7 +238,40 @@ def estimate_and_align(
         upsample_factor=upsample_factor,
         refine_upsample=refine_upsample,
     )
+    return _crop_aligned(x_ref, y_meas, delay_samples, correct_fractional, align_tolerance)
 
+
+def align_with_fraction(x_ref, y_meas, fraction: float, align_tolerance=0.01):
+    """:func:`estimate_and_align` for a path whose fractional delay is already known.
+
+    ``fraction`` is ``delay % 1`` of an earlier full estimate on the same path: the capture start
+    moves by whole samples from one IMMEDIATE capture to the next, the analog path delay does
+    not. Only the integer lag is searched (the FFT cross-correlation of
+    :func:`estimate_delay`'s first stage, no upsampled refinement); a parabola through the
+    correlation at the peak and its two neighbours says which side of it the delay lies, so the
+    whole samples ``k`` of ``k + fraction`` are right even for a fraction near 0.5. The period is
+    then cropped and shifted exactly as :func:`estimate_and_align` does. Returns
+    ``(x_aligned, y_aligned, delay_samples)``.
+    """
+    x_ref = np.asarray(x_ref)
+    y_meas = np.asarray(y_meas)
+    if len(y_meas) < len(x_ref) or len(x_ref) == 0:
+        raise ValueError("align_with_fraction needs a capture at least as long as the reference")
+    peak_idx, lags, corr = _correlate_and_peak(y_meas, x_ref, 0, len(x_ref))
+    near = float(lags[peak_idx])
+    if 0 < peak_idx < len(corr) - 1:
+        y_m, y_0, y_p = corr[peak_idx - 1], corr[peak_idx], corr[peak_idx + 1]
+        bend = y_m - 2.0 * y_0 + y_p
+        if np.isfinite(y_m) and np.isfinite(y_p) and bend < 0:
+            near += float(np.clip(0.5 * (y_m - y_p) / bend, -0.5, 0.5))
+    fraction = float(fraction) % 1.0
+    delay_samples = float(round(near - fraction) + fraction)
+    return _crop_aligned(x_ref, y_meas, delay_samples, True, align_tolerance)
+
+
+def _crop_aligned(x_ref, y_meas, delay_samples, correct_fractional, align_tolerance):
+    """One reference-long period of ``y_meas`` at ``delay_samples`` (fraction shifted out)."""
+    N_ref = len(x_ref)
     if abs(delay_samples) < align_tolerance:
         n = min(len(x_ref), len(y_meas))
         return x_ref[:n].copy(), y_meas[:n].copy(), delay_samples

@@ -12,7 +12,8 @@
 ``radio`` is a :class:`RemoteRadio`: every public :class:`~adrvtrx.radio.Radio`
 method with the same signature, run in the server's process. Existing modules
 (``transmit``, ``capture``, ``compression``, ``replay``, ``operating_point``,
-``linearize``, ``sweep``) take it in place of a ``Radio``.
+``linearize``, ``sweep``, ``sweep_plan``, ``bands``, ``multiband``) take it in place
+of a ``Radio``.
 """
 
 from __future__ import annotations
@@ -69,8 +70,11 @@ class NumpyBridge:
     ``Radio.perform_tx`` in the server converts them to .NET.
     """
 
+    #: ``build_tx_data`` may hand over numpy arrays (no ``tolist()`` round trip).
+    accepts_numpy = True
+
     def int_array(self, values) -> np.ndarray:
-        return np.asarray(values).astype(np.int32)
+        return np.asarray(values, dtype=np.int32)
 
     def array_list(self, items=()) -> list:
         return list(items)
@@ -178,13 +182,14 @@ class RemoteRadio:
 
     # -- calls -----------------------------------------------------------------------
 
-    def _call(self, method: str, args: tuple, kwargs: dict) -> Any:
+    def _call(self, method: str, args: tuple, kwargs: dict, extra: dict | None = None) -> Any:
         with self._lock:
             if self._end is not None:
                 if self._revoked:
                     raise LeaseRevoked(f"job {self.name!r} no longer holds the board: {self._end}")
                 raise RuntimeError(f"job {self.name!r} no longer holds the board: {self._end}")
             message = {"op": "call", "method": method, "args": args, "kwargs": kwargs}
+            message.update(extra or {})
             try:
                 self._conn.send(message)
                 reply = receive(self._conn)
@@ -221,7 +226,35 @@ class RemoteRadio:
                 raise RuntimeError(f"job {self.name!r} no longer holds the board: {self._end}")
             info = request(self._conn, {"op": "session"})
         self.programming = info.get("programming")
+        if info.get("profile_name"):
+            self.config.profile_name = info["profile_name"]  # config follows the board's profile
         return info
+
+    def program(self, profile: str | None = None) -> None:
+        """``Radio.program`` in the server (``profile`` changes the sample rate).
+
+        Afterwards ``config`` (so ``read_profile(radio.config.profile_path)``) and
+        ``programming`` describe the newly programmed board. When the server raises,
+        they are read again too (the server keeps its profile), then the error raises.
+        """
+        try:
+            self._call("program", (), {} if profile is None else {"profile": str(profile)})
+        except BaseException:
+            try:
+                self.session_info()
+            except Exception:  # noqa: BLE001 - the program error is the one to report
+                pass
+            raise
+        self.session_info()
+
+    @functools.wraps(Radio.perform_rx)
+    def perform_rx(self, *args, **kwargs):
+        # ``keep`` goes beside the call, not into it: a server that knows it ships only those
+        # arrays (empty ones in the other places); an older server ignores it and ships all.
+        inspect.signature(Radio.perform_rx).bind(self, *args, **kwargs)
+        keep = kwargs.pop("keep", None)
+        extra = None if keep is None else {"keep": [int(k) for k in keep]}
+        return self._call("perform_rx", args, kwargs, extra)
 
     def loaded_signals(self) -> dict[str, Any]:
         """What each TX channel's playback RAM holds now, read from the server.
