@@ -1097,9 +1097,14 @@ def _band_reader(radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fract
         else:
             got = [
                 measure_band(
-                    radio, bands[i].orx, refs[i], rx_bits=rx_bits, fs=fs, oversample=oversample,
+                    radio,
+                    bands[i].orx,
+                    refs[i],
+                    rx_bits=rx_bits,
+                    fs=fs,
+                    oversample=oversample,
                     fraction=fractions.get(i),
-                )  # fmt: skip
+                )
                 for i in idx
             ]
         if learn is not None:
