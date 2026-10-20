@@ -75,6 +75,7 @@ from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep
 from .metrics import PA_CLIP_SLOPE, gain_compression_db, period_metrics, window_compression_db
+from .probe import ProbeSettings
 from .radio import MAX_TX_ATTEN_DB
 from .transmit import transmit_bands
 from .waveform import prepare_tx
@@ -102,10 +103,6 @@ __all__ = [
     "lock_details",
     "timing_text",
     "confirm_lock",
-    "make_probes",
-    "probe_cut",
-    "probe_length",
-    "PROBE_MS",
 ]
 
 METHODS = ("joint", "pingpong")
@@ -205,7 +202,7 @@ class MultibandSearch:
     ``snapshot``). ``history`` has one row per band per reading. ``slopes`` is the final ``J``.
     ``timing`` holds ``captures_s`` (each snapshot's time, capture and reading) and, from
     :func:`lock_bands`, ``agc_s``, ``swaps_s`` and ``total_s``. ``probe`` (a lock on the probe
-    signal, :func:`lock_bands` ``probe_ms``) and ``confirm`` (the full-signal confirmation,
+    signal, :func:`lock_bands` ``probe``) and ``confirm`` (the full-signal confirmation,
     :func:`confirm_lock`) describe them.
     """
 
@@ -978,11 +975,6 @@ def search_multiband_compression(
 
 # -- hardware ---------------------------------------------------------------------------------
 
-#: The probe's default length, ms (0.05 ms: 24,576 samples at 491.52 MSPS).
-PROBE_MS = 0.05
-#: The probe lengths accepted, ms.
-PROBE_MS_RANGE = (0.005, 0.5)
-
 
 def tx_codes(bands: Sequence[BandSpec], *, tx_bits: int) -> list[np.ndarray]:
     """Each band's signal in TX codes (what ``prepare_tx`` plays: unit peak, full scale)."""
@@ -1012,69 +1004,6 @@ def play_bands(radio, bands: Sequence[BandSpec], *, tx_bits: int) -> list[np.nda
     refs = tx_codes(bands, tx_bits=tx_bits)
     play_codes(radio, bands, refs, tx_bits=tx_bits)
     return refs
-
-
-def probe_length(probe_ms: float, fs: float, block: int = 1) -> int:
-    """``round(probe_ms * fs)`` samples, rounded up to a multiple of the TX memory's ``block``."""
-    if not PROBE_MS_RANGE[0] <= float(probe_ms) <= PROBE_MS_RANGE[1]:
-        raise ValueError(f"probe_ms {probe_ms} outside {PROBE_MS_RANGE[0]} .. {PROBE_MS_RANGE[1]}")
-    block = max(1, int(block))
-    n = int(round(float(probe_ms) * 1e-3 * float(fs)))
-    return max(block, -(-n // block) * block)
-
-
-def _papr(x: np.ndarray) -> float:
-    p = np.abs(x) ** 2
-    return float(10 * np.log10(p.max() / p.mean()))
-
-
-def probe_cut(ref: np.ndarray, n: int) -> tuple[np.ndarray, dict]:
-    """The probe of one band: ``n`` samples of ``ref`` (TX codes, one period of a loop) around
-    its peak, the same codes (no new normalisation, so the peak drive is the full signal's).
-
-    Centred on ``argmax|ref|``, the start moves by up to ``n // 20`` samples to make the wrap jump
-    ``|w[0] - w[-1]|`` (the probe loops) smallest. Returns ``(w, info)``: ``n``, ``start`` (in
-    ``ref``, circular), ``shift`` (from the centred cut), the jump and the centred cut's jump in
-    RMS units of ``ref``, the PAPR of the probe and of ``ref`` and the probe's mean power against
-    ``ref``'s (dB).
-    """
-    ref = np.asarray(ref)
-    m = len(ref)
-    if not 2 <= n <= m:
-        raise ValueError(f"a probe of {n} samples from a signal of {m}")
-    rms = float(np.sqrt(np.mean(np.abs(ref) ** 2)))
-    centred = int(np.argmax(np.abs(ref))) - n // 2
-    shifts = np.arange(-(n // 20), n // 20 + 1)
-    starts = centred + shifts
-    jumps = np.abs(ref[starts % m] - ref[(starts + n - 1) % m])
-    k = int(np.argmin(jumps))  # ties: the first, i.e. the most negative shift; centred wins below
-    if jumps[k] >= jumps[n // 20]:
-        k = n // 20
-    start = int(starts[k] % m)
-    w = ref[(start + np.arange(n)) % m]
-    info = {
-        "n": int(n),
-        "start": start,
-        "shift": int(shifts[k]),
-        "jump_rms": float(jumps[k] / rms),
-        "jump_centred_rms": float(jumps[n // 20] / rms),
-        "papr_db": round(_papr(w), 3),
-        "papr_full_db": round(_papr(ref), 3),
-        "mean_power_db": round(float(10 * np.log10(np.mean(np.abs(w) ** 2) / rms**2)), 3),
-    }
-    return w, info
-
-
-def make_probes(refs: Sequence[np.ndarray], fs: float, probe_ms: float, *, block: int = 1):
-    """Every band's probe (:func:`probe_cut`), all of one length (the TX loads them in one
-    ``PerformTx``): ``(probes, info)``, ``info`` per band plus ``probe_ms``, ``n``, ``block``."""
-    n = probe_length(probe_ms, fs, block)
-    probes, per = [], []
-    for r in refs:
-        w, info = probe_cut(r, n)
-        probes.append(w)
-        per.append(info)
-    return probes, {"probe_ms": float(probe_ms), "n": n, "block": int(block), "bands": per}
 
 
 def measure_band(
@@ -1196,24 +1125,25 @@ def lock_bands(
     target_dbfs: float = -1.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
-    probe_ms: float | None = PROBE_MS,
-    probe_block: int = 1,
+    probe: ProbeSettings | None = None,
     snapshot: bool | None = None,
     on_step=None,
     **search_kw: Any,
 ) -> tuple[MultibandSearch, list[np.ndarray]]:
     """Retune, play every band, ORx AGC per band at the start attenuations, then the search.
 
-    With ``probe_ms`` (default 0.05 ms) every band plays its probe (:func:`make_probes`: the
-    full signal's codes around its peak, ``probe_block`` the TX memory's block), the ORx AGC and
-    every search reading capture ``oversample`` probe periods, each aligned in full, and after
-    the lock every band swaps back to its full signal at the same attenuations and gains (the
-    caller confirms on it, :func:`confirm_lock`). A signal no longer than the probe is played
-    whole, as with ``probe_ms=None`` (``search.probe`` stays empty). ``probe_ms=None`` plays the
-    full signals
-    throughout: a band's first reading inside the AGC window is aligned in full, its fractional
-    delay kept, and its later readings only search the integer lag (:func:`measure_band`
-    ``fraction``).
+    With ``probe`` (:class:`~adrvtrx.probe.ProbeSettings`) the probe is built from the bands'
+    references (:func:`~adrvtrx.probe.build_probe`: a window around every peak of every band, the
+    same indices in every band). When its build check passes, every band plays it, the ORx AGC
+    and every search reading capture ``oversample`` probe periods, each aligned in full to the
+    probe codes as played (crossfades included), and after the lock every band swaps back to its
+    full signal at the same attenuations and gains (the caller confirms on it,
+    :func:`confirm_lock`). When the check fails, the lock plays the full signals and
+    ``search.probe`` says why. ``search.probe`` is the build result
+    (:meth:`~adrvtrx.probe.Probe.describe`) with ``used``. Without the probe (``None``, the
+    default) the full signals play throughout: a band's first reading inside the AGC window is
+    aligned in full, its fractional delay kept, and its later readings only search the integer
+    lag (:func:`measure_band` ``fraction``).
 
     One snapshot per step reads every band (``snapshot=None``: unless two bands' ORx share an
     ORx ADC; ``False``: one capture per band, for a pair whose ``two_orx_snapshot`` bench check
@@ -1229,8 +1159,13 @@ def lock_bands(
     _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
     refs = tx_codes(bands, tx_bits=tx_bits)
     probes, probe_info = None, {}
-    if probe_ms is not None and probe_length(probe_ms, fs, probe_block) < len(refs[0]):
-        probes, probe_info = make_probes(refs, fs, probe_ms, block=probe_block)
+    if probe is not None:
+        built = probe.build(refs)
+        probe_info = {**built.describe(), "used": bool(built.ok)}
+        if built.ok:
+            probes = built.codes
+        else:
+            probe_info["reason"] = f"{built.reason}: the lock plays the full signals"
     played = refs if probes is None else probes
     if snapshot is None:
         snapshot = not shares_orx_adc([b.orx for b in bands])
@@ -1286,11 +1221,11 @@ def lock_bands(
     signal = "full" if probes is None else "probe"
     for h in search.history:
         h["signal"] = signal
+    search.probe = probe_info
     if probes is not None:  # back to the full signals, same attenuations and gains
         t0 = time.perf_counter()
         play_codes(radio, bands, refs, tx_bits=tx_bits)
         swaps.append(round(time.perf_counter() - t0, 3))
-        search.probe = probe_info
     search.timing.update(
         agc_s=agc_s, swaps_s=swaps, total_s=round(time.perf_counter() - t_start, 3)
     )
@@ -1461,7 +1396,9 @@ def confirm_lock(
     attenuations (ORx AGC with its Stage C level check on the full signal, ``check``), then each
     band's gain compression against its target. A band outside ``±comp_tol_db`` continues the
     search from there on full captures (the reading just taken is its first step; the same
-    method, ``J`` as the probe search left it), for at most ``confirm_steps`` moves, and the 0 dB
+    method, ``J`` from ``slope_prior`` again, learning only from full-signal readings: the probe's
+    ``J`` moved TX2 1 dB for a 0.15 dB error on the bench), for at most ``confirm_steps`` moves,
+    and the 0 dB
     capture is taken again where it ends. Returns the 0 dB captures; ``search`` is updated in
     place: the bands, ``converged`` and ``reason`` of the full signal, the fallback's rows
     (``signal`` "full") in ``history``, and ``confirm``: ``offset_db`` per band (the full GC
@@ -1523,7 +1460,7 @@ def confirm_lock(
             return [first[i] for i in idx]  # the confirmation capture is the first reading
         return reader(idx)
 
-    skip = ("max_steps", "slopes", "method", "probe_ms", "probe_block", "snapshot", "confirm_steps")
+    skip = ("max_steps", "slopes", "method", "probe", "snapshot", "confirm_steps")
     kw = {k: v for k, v in search_kw.items() if k not in skip}
     fb = search_multiband_compression(
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
@@ -1534,8 +1471,7 @@ def confirm_lock(
         atten_mins_db=[min(b.atten_min_db, c.atten_db) for b, c in zip(bands, caps)],
         orx_gains=[c.orx_gain for c in caps],
         names=[b.name for b in bands],
-        method=search.method,
-        slopes=search.slopes,
+        method=search.method,  # J from the prior: it learns from full-signal readings only
         max_steps=int(confirm_steps) + 1,
         snapshot=search.snapshot,
         on_step=on_step,
@@ -1578,8 +1514,7 @@ def find_multiband_operating_point(
     writer: CaseWriter | None = None,
     retune: bool = True,
     oversample: int = 2,
-    probe_ms: float | None = PROBE_MS,
-    probe_block: int = 1,
+    probe: ProbeSettings | None = None,
     confirm_steps: int = 2,
     snapshot: bool | None = None,
     on_step=None,
@@ -1587,10 +1522,11 @@ def find_multiband_operating_point(
 ) -> CaseResult:
     """Lock every band together, then capture every backoff (every band ``+k`` dB together).
 
-    The lock runs on the probe (``probe_ms``, :func:`lock_bands`) and is confirmed on the full
+    With ``probe`` the lock runs on the probe (:func:`lock_bands`) and is confirmed on the full
     signals by the 0 dB capture (:func:`confirm_lock`: at most ``confirm_steps`` full-signal
-    steps when it is off); ``probe_ms=None`` locks on the full signals as before, and the 0 dB
-    capture is a backoff like the others. ``search.timing["total_s"]`` is the whole call.
+    steps when it is off); without it (or when the probe's build check fails) the lock runs on
+    the full signals, and the 0 dB capture is a backoff like the others.
+    ``search.timing["total_s"]`` is the whole call.
 
     With ``writer`` (a :class:`CaseWriter`), the inputs, every aligned output, ``conditions.csv``
     and ``lock.csv`` are written. The case folder must be empty: that is checked before the radio
@@ -1620,13 +1556,12 @@ def find_multiband_operating_point(
             retune=retune,
             method=method,
             oversample=oversample,
-            probe_ms=probe_ms,
-            probe_block=probe_block,
+            probe=probe,
             snapshot=snapshot,
             on_step=on_step,
             **search_kw,
         )
-        if search.probe and not search.fatal:
+        if search.probe.get("used") and not search.fatal:
             captures[0] = confirm_lock(
                 radio, bands, refs, search, rx_bits=rx_bits, fs=fs, oversample=oversample,
                 confirm_steps=confirm_steps, check=check, retakes=retakes, on_step=on_step,
@@ -1814,7 +1749,7 @@ class CaseWriter:
                         "search_steps": search.steps,
                         "search_captures": search.captures,
                         "search_snapshot": search.snapshot,
-                        "lock_signal": "probe" if search.probe else "full",
+                        "lock_signal": "probe" if search.probe.get("used") else "full",
                         "lock_converged_on": search.confirm.get("converged_on", ""),
                         "probe_offset_db": search.confirm.get("offset_db", {}).get(b.name, ""),
                         "peak_dbfs": c.peak_dbfs,

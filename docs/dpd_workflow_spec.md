@@ -568,15 +568,15 @@ search_multiband_compression(set_atten, set_gain, measure, *, targets_db,
     max_move_db=4.0, slope_prior=(0.31, 0.06), comp_tol_db=0.1, ..., max_steps=20,
     max_relevel=6, min_top_slope=PA_CLIP_SLOPE, snapshot=True, on_step=None)
     -> MultibandSearch
-lock_bands(radio, bands, *, tx_bits, rx_bits, fs, probe_ms=0.05, probe_block=1,
-    snapshot=None, ...) -> (MultibandSearch, refs)
+lock_bands(radio, bands, *, tx_bits, rx_bits, fs, probe=None, snapshot=None, ...)
+    -> (MultibandSearch, refs)
 confirm_lock(radio, bands, refs, search, *, rx_bits, fs, confirm_steps=2, ...)
     -> list[BandCapture]
 capture_case(radio, bands, refs, attens_db, *, rx_bits, fs, agc=True,
     gains=None, check=None, retakes=3, ...) -> list[BandCapture]
 find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
     backoffs=(0, 1, 2, 3, 4), method="joint", check=None, writer=None,
-    probe_ms=0.05, confirm_steps=2, ...) -> CaseResult
+    probe=None, confirm_steps=2, ...) -> CaseResult
 ```
 
 - The search steers on gain compression (§3), every band within
@@ -594,16 +594,18 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
   that cannot level).
 
 **The fast lock** (Polynomials `multiband_setup/task6_fast_lock.md`, replacing the walk and the
-old `slopes` method). The lock runs on a probe (`probe_ms` of each signal around its peak, the
-same DAC codes) with one snapshot of every ORx per step; `joint` solves `J da = target - c` for
+old `slopes` method). One snapshot of every ORx per step. With `probe=ProbeSettings(...)` the lock
+runs on the probe (Task 6b, `adrvtrx.probe`: a 500-sample window around every peak event of every
+band, the same indices in every band, joined with crossfades; the full signal's codes); `joint` solves `J da = target - c` for
 every band together from a slope prior (own 0.31, cross 0.06 dB/dB, the first bench lock),
 updated each step (Broyden), with own slopes in 0.1..1.5, cross terms at most half the own, and a
 trust region (`max_move_db`; a worse step is undone halfway and the cap halves). The ORx re-level
 learns its dB per index. The 0 dB capture of the full signals confirms the lock; a band off its
-target continues on full captures for at most `confirm_steps`. The probe-to-full GC offset per
+target continues on full captures for at most `confirm_steps`, its `J` from the prior again. The probe-to-full GC offset per
 band goes into `case.json` and `conditions.csv`, the timing of every capture and swap into
 `case.json` (`lock_timing`). Run notebook `01b_probe_check` once on the bench before relying on
-the probe; `probe_ms=None` locks on the full signals.
+the probe; without it (the default) the lock runs on the full signals. `probe_fidelity` /
+`fidelity_report` check a probe design on any saved full-signal capture.
 
 **Case folder** (`CaseWriter(run_dir, bands, ...)`): `<run_dir>/<case>/`, with
 `<case>` = `TX1-TX4_1440-1860MHz_80-80BW_4-4GC` (paths, carriers in MHz,

@@ -23,25 +23,23 @@ from adrvtrx.multiband import (
     BandSpec,
     find_multiband_operating_point,
     lock_bands,
-    make_probes,
-    probe_cut,
-    probe_length,
     timing_text,
 )
+from adrvtrx.probe import ProbeSettings
 
-N = 16384
+N = 65536
 #: own ~0.3, cross ~0.06 dB/dB near a 4 dB lock at 15 dB (measured on this model; noise-free)
 BENCH_PA = {"shared": [["TX2", "TX3"]], "coupling": 10.0, "smoothness": 0.4, "drive": 3.0,
             "noise_codes": 0.5}  # fmt: skip
+#: The probe of these signals at the fake board's 10 Msps (the bench's default is 500 / 16).
+PROBE = ProbeSettings(window=300, crossfade=8)
 
 
 def _signal(seed: int, n: int = N) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = np.fft.ifft(
-        np.fft.fft(rng.normal(size=n) + 1j * rng.normal(size=n))
-        * (np.abs(np.fft.fftfreq(n)) < 0.15)
-    )
-    return x / np.abs(x).max()
+    """A crest-factor-reduced band-limited signal, as test_probe's (a dozen peak events)."""
+    from test_probe import cfr_signal
+
+    return cfr_signal(seed, n)
 
 
 def _radio(pa=None, seed: int = 2) -> FakeRadio:
@@ -75,52 +73,16 @@ def _count_perform_rx(radio) -> list:
     return calls
 
 
-# -- F1: the probe ------------------------------------------------------------------------------
+# -- the probe in the lock (Task 6b B) -------------------------------------------------------------
 
 
-def test_the_probe_has_the_full_signals_codes_and_peak():
-    ref = multiband.tx_codes(_bands(), tx_bits=12)[0]
-    w, info = probe_cut(ref, 500)
-    assert len(w) == 500 and np.abs(w).max() == np.abs(ref).max()  # the same peak drive
-    start = info["start"]
-    np.testing.assert_array_equal(w, ref[(start + np.arange(500)) % len(ref)])  # cut, as is
-    peak_at = (int(np.argmax(np.abs(ref))) - start) % len(ref)
-    assert 250 - 25 <= peak_at <= 250 + 25  # centred on the peak, moved by at most n / 20
-    assert info["jump_rms"] <= info["jump_centred_rms"]  # the wrap jump is no worse than centred
-    jump = abs(w[0] - w[-1]) / np.sqrt(np.mean(np.abs(ref) ** 2))
-    assert info["jump_rms"] == pytest.approx(jump)
-    assert info["papr_full_db"] == pytest.approx(
-        10 * np.log10(np.max(np.abs(ref) ** 2) / np.mean(np.abs(ref) ** 2)), abs=1e-3
-    )
-
-
-@pytest.mark.parametrize("seed", range(6))
-def test_the_chosen_wrap_jump_is_never_larger_than_the_centred_cut(seed):
-    ref = _signal(seed, 4096) * 2047
-    _w, info = probe_cut(ref, 400)
-    assert info["jump_rms"] <= info["jump_centred_rms"] and abs(info["shift"]) <= 20
-
-
-def test_both_probes_have_one_length_rounded_up_to_the_tx_block():
-    refs = multiband.tx_codes(_bands(), tx_bits=12)
-    probes, info = make_probes(refs, 10e6, 0.05, block=64)
-    assert info["n"] == 512 and {len(p) for p in probes} == {512}  # 500 up to a block of 64
-    assert probe_length(0.05, 491.52e6) == 24576  # 0.1 ms of capture = 49,152 samples
-    assert probe_length(0.05, 491.52e6, block=1000) == 25000
-    assert probe_length(0.01, 10e6, block=7) == 105
-    for bad in (0.001, 0.6):
-        with pytest.raises(ValueError, match="probe_ms"):
-            probe_length(bad, 10e6)
-    assert [b["n"] for b in info["bands"]] == [512, 512]
-
-
-def test_probe_ms_none_captures_two_full_periods_as_before():
-    """Without the probe, every capture of the lock is 2 periods of the full signal (AGC Stage A
-    and B excepted: 0.1 ms, as always), and the TX plays the full signal throughout."""
+def test_without_the_probe_every_lock_capture_is_two_full_periods():
+    """The default: every capture of the lock is 2 periods of the full signal (AGC Stage A and B
+    excepted: 0.1 ms, as always), and the TX plays the full signal throughout."""
     radio, bands = _radio(), _bands()
     fs = radio.board_model.rate_hz
     calls = _count_perform_rx(radio)
-    search, refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe_ms=None)
+    search, refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs)
     full_ms = round(2 * N / fs * 1e3, 6)
     got = [round(c, 6) for c in calls]
     assert set(got) <= {full_ms, 0.1} and got.count(full_ms) >= search.captures
@@ -132,13 +94,39 @@ def test_with_the_probe_every_lock_capture_is_two_probe_periods_and_tx_ends_on_t
     radio, bands = _radio(), _bands()
     fs = radio.board_model.rate_hz
     calls = _count_perform_rx(radio)
-    search, refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe_ms=0.5)
-    probe_ms = round(2 * 5000 / fs * 1e3, 6)
+    played = []
+    real_play = multiband.play_codes
+    multiband.play_codes = lambda r, b, codes, **k: (
+        played.append(codes),
+        real_play(r, b, codes, **k),
+    )[1]
+    try:
+        search, refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe=PROBE)
+    finally:
+        multiband.play_codes = real_play
+    built = PROBE.build(refs)
+    assert search.probe["used"] and search.probe["n"] == built.n == len(played[0][0])
+    for a, b in zip(played[0], built.codes):
+        np.testing.assert_array_equal(a, b)  # the probe codes as built, crossfades included
+    probe_ms = round(2 * built.n / fs * 1e3, 6)
     assert {round(c, 6) for c in calls} <= {probe_ms, 0.1}  # AGC Stage C and the search: probe
     assert {h["signal"] for h in search.history} == {"probe"}
     assert radio.board_model.state["tx_len"] == N  # swapped back to the full signal
     assert len(search.timing["swaps_s"]) == 2 and len(search.timing["agc_s"]) == 2
-    assert search.probe["n"] == 5000 and len(search.probe["bands"]) == 2
+    assert search.probe["stats"][0]["peaks_covered"] == search.probe["stats"][0]["peaks_total"]
+
+
+def test_a_probe_that_fails_its_build_check_leaves_the_lock_on_the_full_signals():
+    radio, bands = _radio(), _bands()
+    fs = radio.board_model.rate_hz
+    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs,
+                               probe=ProbeSettings(window=100, crossfade=8))  # fmt: skip
+    assert search.probe and not search.probe["used"] and not search.probe["ok"]
+    assert (
+        "PAPR" in search.probe["reason"]
+        and "the lock plays the full signals" in search.probe["reason"]
+    )
+    assert {h["signal"] for h in search.history} == {"full"} and search.converged
 
 
 # -- F4: the ORx re-level learns its step --------------------------------------------------------
@@ -259,7 +247,7 @@ def test_joint_locks_the_bench_pa_from_7_db_away_in_at_most_5_snapshots(start):
 
     multiband.autolevel_for, saved = agc, multiband.autolevel_for
     try:
-        search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe_ms=0.5)
+        search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe=PROBE)
     finally:
         multiband.autolevel_for = saved
     assert search.converged, search.reason
@@ -275,7 +263,7 @@ def test_joint_locks_the_bench_pa_from_7_db_away_in_at_most_5_snapshots(start):
 def test_pingpong_locks_the_bench_pa_from_7_db_away_in_at_most_12_snapshots():
     radio, bands = _radio(), _bands()
     search, _refs = lock_bands(
-        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, probe_ms=0.5,
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, probe=PROBE,
         method="pingpong",
     )  # fmt: skip
     assert search.converged, search.reason
@@ -286,7 +274,7 @@ def test_without_a_two_orx_snapshot_each_band_is_captured_alone():
     radio, bands = _radio(), _bands()
     fs = radio.board_model.rate_hz
     search, _refs = lock_bands(
-        radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe_ms=0.5, snapshot=False
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe=PROBE, snapshot=False
     )
     assert search.converged and not search.snapshot
     assert search.captures == 2 * search.snapshots
@@ -302,7 +290,7 @@ def test_a_case_on_the_probe_is_confirmed_by_its_0_db_capture(tmp_path):
     fs = radio.board_model.rate_hz
     writer = multiband.CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=fs)
     res = find_multiband_operating_point(
-        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 1), probe_ms=0.5,
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 1), probe=PROBE,
         writer=writer,
     )  # fmt: skip
     s = res.search
@@ -350,7 +338,7 @@ def test_the_fallback_runs_when_the_full_gc_is_off_and_stops_after_confirm_steps
     radio, bands = _radio(), _bands()
     fs = radio.board_model.rate_hz
     res = find_multiband_operating_point(
-        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0,), probe_ms=0.5,
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0,), probe=PROBE,
         confirm_steps=confirm_steps,
     )  # fmt: skip
     s = res.search
@@ -364,3 +352,89 @@ def test_the_fallback_runs_when_the_full_gc_is_off_and_stops_after_confirm_steps
         assert full and all(h["signal"] == "full" for h in full)
         assert s.confirm["converged_on"] in ("fallback", "")
         assert s.converged == (s.confirm["converged_on"] == "fallback")
+
+
+def test_the_fallback_starts_from_the_prior_not_the_probes_slopes():
+    """Task 6b B: on the bench the probe-learnt J moved TX2 1 dB for a 0.15 dB error. The
+    correction steps after the 0 dB confirmation start J from SLOPE_PRIOR and learn only from
+    full-signal readings: a probe search that ended with J ten times too shallow does not
+    make the first full-signal move ten times too large."""
+    import json
+
+    from adrvtrx.multiband import SLOPE_PRIOR, BandLock, MultibandSearch, confirm_lock, prior_slopes
+
+    radio, bands = _radio(), _bands()
+    fs = radio.board_model.rate_hz
+    for b in bands:
+        radio.retune_lo(b.lo, b.freq_hz)
+        radio.set_tx_atten(b.tx, 17.0)
+    refs = multiband.play_bands(radio, bands, tx_bits=12)
+    nan = float("nan")
+    locks = [BandLock(b.name, 17.0, 210, 4.0, nan, 0.4, -1.0, 0, 5.0, "converged") for b in bands]
+    shallow = (np.diag([-0.03, -0.03])).tolist()  # what a bad probe search could leave
+    search = MultibandSearch(True, "every band within tolerance", "joint", locks, 3, 3,
+                             slopes=shallow, probe={"used": True})  # fmt: skip
+    caps = confirm_lock(radio, bands, refs, search, rx_bits=12, fs=fs, confirm_steps=1)
+    full = [h for h in search.history if h.get("signal") == "full"]
+    first = [h for h in full if h["step"] == min(r["step"] for r in full)]
+    assert first, search.reason
+    np.testing.assert_allclose(json.loads(first[0]["slopes"]), prior_slopes(2, SLOPE_PRIOR))
+    expected = np.linalg.solve(prior_slopes(2), [h["error_db"] for h in first])
+    for h, e in zip(first, expected):
+        assert h["move_db"] == pytest.approx(float(np.clip(e, -4, 4)), abs=0.05)
+    assert search.confirm["fallback_steps"] == 1 and len(caps) == 2
+
+
+@pytest.mark.parametrize(
+    "profile, rates",
+    [("ADRV9025Init_StdUseCase98_LinkSharing.profile", (245.76e6, 491.52e6)),
+     ("ADRV9025Init_StdUseCase102_LinkSharing.profile", (245.76e6,)),
+     ("ADRV9025Init_StdUseCase61_LinkSharing.profile", (368.64e6,))],
+)  # fmt: skip
+def test_a_requested_0p01_ms_capture_is_a_valid_length_at_every_rate(profile, rates):
+    """On the bench 0.01 ms failed on UC98 ("the number of bytes has to be divisible by 4"):
+    4915.2 samples at 491.52 Msps. The length is rounded up to whole 4-sample words at every
+    rate of the profile; a valid length is left as it is."""
+    from adrvtrx.capture import valid_capture_ms
+    from adrvtrx.profile import profile_rates_hz
+
+    tes = Path(r"C:\Program Files\Analog Devices\ADRV9025 Transceiver Evaluation Software_x64_FULL")
+    path = tes / "Resources" / "Adi.Adrv9025.Profiles" / "public" / profile
+    if path.is_file():
+        assert profile_rates_hz(path) == [int(r) for r in rates]
+    ms = valid_capture_ms(0.01, rates)
+    assert 0.01 <= ms < 0.0101
+    for r in rates:
+        samples = ms * 1e-3 * r
+        assert abs(samples - round(samples)) < 1e-6 and round(samples) % 4 == 0, (r, samples)
+    two_probe_periods = 2 * 24576 / rates[-1] * 1e3
+    assert valid_capture_ms(two_probe_periods, (245.76e6, 491.52e6)) == pytest.approx(
+        two_probe_periods, rel=1e-12
+    )
+    assert valid_capture_ms(0.01, ()) == 0.01
+
+
+def test_capture_rounds_the_length_with_the_radios_profile(monkeypatch):
+    from adrvtrx import capture as capture_module
+
+    radio = _radio()
+    monkeypatch.setattr(capture_module, "profile_rates", lambda _r: (245_760_000, 491_520_000))
+    calls = _count_perform_rx(radio)
+    out = capture_module.capture(radio, int(RxChannel.ORX2), 0.01, bits=12)
+    assert calls == [pytest.approx(out.capture_time_ms)] and out.capture_time_ms > 0.01
+    assert round(out.capture_time_ms * 1e-3 * 491.52e6) % 4 == 0
+
+
+def test_the_fidelity_report_of_a_case(tmp_path):
+    from adrvtrx.probe import fidelity_report
+
+    radio, bands = _radio(), _bands()
+    fs = radio.board_model.rate_hz
+    res = find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=fs,
+                                         backoffs=(0, 2), probe=PROBE)  # fmt: skip
+    outputs = {k: [c.y_aligned for c in caps] for k, caps in res.captures.items()}
+    rep = fidelity_report(res.refs, outputs, [b.name for b in bands], PROBE)
+    assert set(rep["backoffs"]) == {"0", "2"} and set(rep["backoffs"]["0"]) == {"TX2", "TX3"}
+    assert rep["probe"]["ok"] and rep["worst_offset_db"] < 0.1
+    full = rep["backoffs"]["0"]["TX2"]["full_db"]
+    assert full == pytest.approx(res.captures[0][0].metrics["gain_compression_db"], abs=1e-3)

@@ -839,28 +839,10 @@ def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeyp
     monkeypatch.setattr(capture_module, "estimate_and_align", full)
     monkeypatch.setattr(capture_module, "align_with_fraction", fraction)
     radio, bands = _case_radio(), _case_bands()
-    search, _refs = lock_bands(
-        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, probe_ms=None
-    )
+    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
     assert search.converged
     assert calls["full"] == 2  # each band's first reading came leveled from the AGC
     assert calls["fraction"] == len(search.history) - 2
-
-
-def test_on_the_probe_every_reading_is_aligned_in_full(monkeypatch):
-    from adrvtrx import capture as capture_module
-
-    calls = []
-    real_full = capture_module.estimate_and_align
-    monkeypatch.setattr(
-        capture_module,
-        "estimate_and_align",
-        lambda *a, **k: (calls.append(1), real_full(*a, **k))[1],
-    )
-    radio, bands = _case_radio(), _case_bands()
-    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
-    assert search.converged and search.probe["n"] == 500  # 0.05 ms at 10 Msps
-    assert len(calls) == len(search.history)
 
 
 @pytest.mark.parametrize("bench, tol_db", [("sim", 0.005), ("rich", 0.03)])
@@ -922,9 +904,8 @@ def test_each_backoff_levels_from_the_gain_predicted_from_the_lock(monkeypatch):
     real_set = radio.set_rx_gain
     radio.set_rx_gain = lambda ch, g: (floor_starts.append(g == 185), real_set(ch, g))[1]
     res = find_multiband_operating_point(
-        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, backoffs=(0, 2, 4),
-        probe_ms=None,
-    )  # fmt: skip
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, backoffs=(0, 2, 4)
+    )
     lock = [bl.orx_gain for bl in res.search.bands]
     # 0.5 dB of output per dB of backoff, 0.5 dB per index: k indices up
     assert starts == {0: lock, 1: [g + 2 for g in lock], 2: [g + 4 for g in lock]}

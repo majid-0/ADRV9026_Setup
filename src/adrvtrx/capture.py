@@ -15,7 +15,9 @@ therefore index a wanted channel by its absolute position in that set.
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass, field
+from functools import lru_cache, reduce
 from pathlib import Path
 
 import numpy as np
@@ -213,6 +215,38 @@ def extract_channels(perform_rx_result, order, wanted, bits: int) -> dict:
     return out
 
 
+#: A capture is a whole number of this many samples at every rate of the profile (the FPGA
+#: refuses a length whose bytes are not a multiple of 4: 0.01 ms at 491.52 MSPS is 4915.2 samples).
+CAPTURE_WORD_SAMPLES = 4
+
+
+def valid_capture_ms(capture_time_ms: float, rates_hz, word: int = CAPTURE_WORD_SAMPLES) -> float:
+    """The shortest capture length >= ``capture_time_ms`` that is a whole multiple of ``word``
+    samples at every rate in ``rates_hz`` (unchanged when it already is, or without rates)."""
+    rates = [int(round(r)) for r in rates_hz or () if r and r > 0]
+    if not rates:
+        return float(capture_time_ms)
+    g = reduce(math.gcd, rates)  # a length is valid at every rate iff it is k * word / g seconds
+    quanta = float(capture_time_ms) * 1e-3 * g / word
+    k = round(quanta) if abs(quanta - round(quanta)) < 1e-6 else math.ceil(quanta)
+    return max(1, k) * word / g * 1e3
+
+
+@lru_cache(maxsize=16)
+def _rates_of(profile_path: str) -> tuple[int, ...]:
+    from .profile import profile_rates_hz
+
+    return tuple(profile_rates_hz(profile_path))
+
+
+def profile_rates(radio) -> tuple[int, ...]:
+    """The datapath rates of ``radio``'s profile (Hz); empty when its profile cannot be read."""
+    try:
+        return _rates_of(str(radio.config.profile_path))
+    except Exception:  # noqa: BLE001 - no profile file on this machine: no rounding
+        return ()
+
+
 def capture(
     radio,
     channel_mask: int,
@@ -226,7 +260,8 @@ def capture(
 
     ``PerformRx`` returns the full ``rxInitChannelMask`` set regardless of mask, so
     we capture all of it and pick out ``channel_mask``'s channels by position.
-    ``bits`` is the Rx datapath width (``ProfileInfo.rx_bits``).
+    ``bits`` is the Rx datapath width (``ProfileInfo.rx_bits``). The length is rounded up to one
+    that is whole 4-sample words at every rate of the radio's profile (:func:`valid_capture_ms`).
 
     ``trig`` defaults to IMMEDIATE. ``trig="auto"`` would align to the start-of-frame
     of the TX tied to the requested ORx (capture ORx2 -> TX2_SOF) via the tx_to_orx
@@ -235,6 +270,7 @@ def capture(
     Keep IMMEDIATE (TX runs continuously, so the signal is always present) until SOF
     generation is sorted out.
     """
+    capture_time_ms = valid_capture_ms(capture_time_ms, profile_rates(radio))
     rx_init = radio.config.channels.rx_init_mask
     order = returned_channel_order(rx_init)
     wanted = channel_list(channel_mask)

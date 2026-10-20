@@ -98,3 +98,11 @@ def read_profile(path: str | Path) -> ProfileInfo:
         rx_rate_khz=rx_rate,
         orx_rate_khz=orx_rate,
     )
+
+
+def profile_rates_hz(path: str | Path) -> list[int]:
+    """Every datapath rate of a profile (``txInputRate_kHz`` and every ``rxOutputRate_kHz``), Hz,
+    ascending: a capture length must be whole samples at each of them."""
+    data = json.loads(Path(path).read_text())
+    rates = _all_positive(data, "txInputRate_kHz") + _all_positive(data, "rxOutputRate_kHz")
+    return sorted({r * 1000 for r in rates})

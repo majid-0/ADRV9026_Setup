@@ -19,6 +19,7 @@ import numpy as np
 
 __all__ = [
     "PA_CLIP_SLOPE",
+    "PEAK_REGION",
     "papr_db",
     "window_compression_db",
     "gain_compression_db",
@@ -28,6 +29,11 @@ __all__ = [
     "rms_dbfs",
     "period_metrics",
 ]
+
+
+#: The peak region of :func:`gain_compression_db`: every sample at or above this fraction of the
+#: signal's maximum (the probe, :mod:`adrvtrx.probe`, keeps a window around each of its peaks).
+PEAK_REGION = 0.975
 
 
 def papr_db(s) -> float:
@@ -77,7 +83,7 @@ def gain_compression_db(
     x,
     s,
     *,
-    peak_frac: float = 0.975,
+    peak_frac: float = PEAK_REGION,
     small_frac: float = 0.2,
     slope_band: tuple[float, float] = (0.8, 0.95),
     n_bins: int = 40,
