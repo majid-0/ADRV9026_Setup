@@ -2,8 +2,10 @@
 
 ``tests/data/multiband_search_golden.json`` holds, per scenario, the result, every history
 row, every ``on_step`` call and the exact sequence of ``set_atten`` / ``set_gain`` /
-``measure`` calls. It was recorded before the search was split into small functions, so a
-refactor that changes nothing passes; a change of behaviour must regenerate it on purpose:
+``measure`` calls (each a snapshot of the bands it names). It was recorded again for the fast
+lock (Task 6: the joint method, one snapshot per step, the learnt ORx step, readings outside the
+AGC window), so a refactor that changes nothing passes; a change of behaviour must regenerate it
+on purpose:
 
     python tests/test_multiband_golden.py --regenerate
 
@@ -31,7 +33,7 @@ GOLDEN = Path(__file__).parent / "data" / "multiband_search_golden.json"
 def _scenarios() -> dict[str, tuple]:
     two, coupled, own = TwoBandPa, [[1.0, 0.6], [0.6, 1.0]], [[0.5, 0.0], [0.0, 0.5]]
     out: dict[str, tuple] = {}
-    for m in ("slopes", "walk"):
+    for m in ("joint", "pingpong"):
         for cross in ((0.0, 0.0), (0.3, 0.3), (0.0, 0.4), (0.6, 0.6)):
             out[f"{m} cross {cross}"] = (two, {"cross": cross, "noise": 0.0}, {"method": m})
         out[f"{m} at limit"] = (
@@ -99,9 +101,9 @@ def run(kind, pa_kw: dict, search_kw: dict) -> dict:
         calls.append(["gain", i, g])
         set_gain(i, g)
 
-    def read(i):
-        calls.append(["measure", i])
-        return measure(i)
+    def read(idx):
+        calls.append(["measure", list(idx)])
+        return [measure(i) for i in idx]
 
     args = {
         "targets_db": [4.0, 4.0],

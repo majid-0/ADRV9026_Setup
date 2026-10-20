@@ -303,5 +303,9 @@ def test_a_multiband_case(tmp_path):
         with hardware("multiband", config=cfg) as radio:
             search_r, caps_r = work(radio)
     assert search_r.converged
+    for s in (search_l, search_r):  # wall-clock times differ between the two runs
+        s.timing = {}
+        for h in s.history:
+            h.pop("capture_s")
     same(search_l, search_r)
     same(caps_l, caps_r)

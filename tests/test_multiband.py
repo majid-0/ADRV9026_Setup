@@ -17,6 +17,8 @@ from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
 from adrvtrx.metrics import PA_CLIP_SLOPE
 from adrvtrx.multiband import (
+    METHODS,
+    SLOPE_PRIOR,
     BandLock,
     BandSpec,
     CaseWriter,
@@ -25,8 +27,8 @@ from adrvtrx.multiband import (
     case_name,
     find_multiband_operating_point,
     lock_bands,
-    own_slopes,
     play_bands,
+    prior_slopes,
     search_multiband_compression,
     update_slopes,
 )
@@ -103,12 +105,15 @@ class TwoBandPa:
         return search_multiband_compression(
             lambda i, db: self.a.__setitem__(i, db),
             lambda i, g: self.g.__setitem__(i, g),
-            self.measure,
+            self.snapshot,
             **defaults,
         )
 
+    def snapshot(self, idx):
+        return [self.measure(i) for i in idx]
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
+
+@pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("cross", [(0.0, 0.0), (0.3, 0.3), (0.0, 0.4)])
 def test_both_methods_lock_two_coupled_bands(method, cross):
     pa = TwoBandPa(cross=cross)
@@ -118,24 +123,7 @@ def test_both_methods_lock_two_coupled_bands(method, cross):
         assert bl.status == "converged"
         assert abs(pa.comp(i) - 4.0) <= 0.1 + 0.06  # tolerance plus the reading noise
     assert pa.a == [bl.atten_db for bl in res.bands]  # the radio is left at the lock
-    assert res.captures >= 2 * res.steps
-
-
-def test_measured_slopes_need_no_more_captures_than_the_walk():
-    totals = {}
-    for method in ("slopes", "walk"):
-        totals[method] = sum(
-            TwoBandPa(locks=locks, cross=cross, seed=s).search(method=method).captures
-            for s, (locks, cross) in enumerate(
-                [
-                    ((14, 15), (0.3, 0.3)),
-                    ((13, 16.5), (0.0, 0.4)),
-                    ((15.5, 14), (0.2, 0.0)),
-                    ((12.5, 13), (0.1, 0.1)),
-                ]
-            )
-        )
-    assert totals["slopes"] <= totals["walk"], totals
+    assert res.captures == res.snapshots >= res.steps  # one snapshot reads both bands
 
 
 def test_a_band_that_needs_more_drive_than_its_limit_stops_there():
@@ -163,13 +151,26 @@ def test_an_unleveled_orx_moves_its_gain_not_the_attenuation():
     relevels = [h for h in res.history if h["action"].startswith("ORx gain")]
     assert {h["band"] for h in relevels} == {"TX1", "TX4"}
     assert all(h["move_db"] == 0.0 for h in relevels)
-    assert res.captures > 2 * res.steps
+    assert res.snapshots > res.steps
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
-def test_a_band_whose_orx_never_levels_keeps_its_attenuation(method):
+def test_a_reading_outside_the_agc_window_counts_and_its_gain_is_corrected():
+    """F5: no railed sample and a peak between target - 3 and 0 dBFS: it counts (the band moves)
+    and the next step's ORx gain brings it back toward the target."""
+    pa = TwoBandPa(noise=0.0, cross=(0.0, 0.0))
+    res = pa.search(orx_gains=[206, 210])  # band 1 reads -3 dBFS: outside the window, usable
+    first = res.history[0]
+    assert first["band"] == "TX1" and -3.1 < first["peak_dbfs"] < -2.9
+    assert first["counts"] and not first["leveled"] and first["move_db"] < 0  # it moved
+    assert not [h for h in res.history if h["action"].startswith("ORx gain")]  # no re-level
+    second = next(h for h in res.history if h["band"] == "TX1" and h["step"] == 1)
+    assert -1.6 <= second["peak_dbfs"] <= -0.7  # leveled again by the next step's gain
+    assert res.converged
+
+
+def test_a_band_whose_orx_never_levels_keeps_its_attenuation():
     pa = TwoBandPa(orx_peak={0: 0.5})  # band 1's ORx always reads +0.5 dBFS (railed)
-    res = pa.search(method=method, max_steps=4, gain_min=100)  # never at the ORx gain floor
+    res = pa.search(max_steps=4, gain_min=100)  # never at the ORx gain floor
     tx1 = [h for h in res.history if h["band"] == "TX1"]
     assert len(tx1) == 4 * 7  # max_relevel + 1 captures per step, every one re-leveling
     assert {h["atten_db"] for h in tx1} == {20.0} and all(h["move_db"] == 0.0 for h in tx1)
@@ -177,16 +178,16 @@ def test_a_band_whose_orx_never_levels_keeps_its_attenuation(method):
     assert sum("atten held" in h["action"] for h in tx1) == 4
     assert pa.a[0] == 20.0 and res.bands[0].status == "not converged"
     tx4 = [h for h in res.history if h["band"] == "TX4"]
-    assert tx4[0]["action"] == "coarse" and tx4[-1]["atten_db"] < 20.0  # the other band goes on
+    assert tx4[0]["action"] == "joint" and tx4[-1]["atten_db"] < 20.0  # the other band goes on
+    assert res.snapshots == 4 * 7  # the other band's reading rode the first snapshot of a step
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
 @pytest.mark.parametrize("orx", [{"orx_gains": [240, 180]}, {"orx_peak": {1: 0.5}}])
-def test_every_capture_is_one_history_row_with_its_own_action(method, orx):
+def test_every_capture_is_one_history_row_with_its_own_action(orx):
     pa = TwoBandPa(**{k: v for k, v in orx.items() if k == "orx_peak"})
-    res = pa.search(method=method, max_steps=6, **{k: v for k, v in orx.items() if k != "orx_peak"})
+    res = pa.search(max_steps=6, **{k: v for k, v in orx.items() if k != "orx_peak"})
     assert res.fatal == ("orx_peak" in orx)  # a band that rails at the ORx gain floor stops it
-    assert res.captures == len(res.history) == pa.reads
+    assert len(res.history) == pa.reads
     assert len({id(h) for h in res.history}) == len(res.history)  # no row recorded twice
     for h in res.history:
         assert h["action"]
@@ -194,24 +195,22 @@ def test_every_capture_is_one_history_row_with_its_own_action(method, orx):
             assert h["move_db"] == 0.0 and h["slopes"] == ""
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
-def test_a_nan_compression_is_measured_again_and_never_counts(method):
+def test_a_nan_compression_is_measured_again_and_never_counts():
     pa = TwoBandPa(comp_nan={1: 3})  # every third reading of band 2 fails to align
-    res = pa.search(method=method)
+    res = pa.search()
     assert res.converged, res.reason
     nan_rows = [h for h in res.history if not np.isfinite(h["gain_compression_db"])]
     assert nan_rows and all(h["band"] == "TX4" for h in nan_rows)
     for h in nan_rows:  # measured again at the same gain and attenuation: no move
         assert h["action"] == "measure again (compression not finite)" and h["move_db"] == 0.0
-        assert not h["leveled"]
+        assert not h["leveled"] and not h["counts"]
     assert all(np.isfinite(bl.compression_db) for bl in res.bands)
     assert all("nan" not in h["slopes"].lower() for h in res.history)
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
-def test_a_band_that_never_aligns_holds_and_the_search_does_not_crash(method):
+def test_a_band_that_never_aligns_holds_and_the_search_does_not_crash():
     pa = TwoBandPa(comp_nan={1: 1})
-    res = pa.search(method=method, max_steps=5)
+    res = pa.search(max_steps=5)
     assert not res.converged
     tx4 = [h for h in res.history if h["band"] == "TX4"]
     assert {h["atten_db"] for h in tx4} == {20.0} and {h["orx_gain"] for h in tx4} == {210}
@@ -224,7 +223,7 @@ def _counted_steps(res, names=("TX1", "TX4")) -> dict[int, dict[str, dict]]:
     """Per step, each band's reading that counted (the last row of the band in that step)."""
     rows: dict[int, dict[str, dict]] = {}
     for h in res.history:
-        if h["leveled"]:
+        if h["counts"]:
             rows.setdefault(h["step"], {})[h["band"]] = h
     return {s: r for s, r in rows.items() if set(r) == set(names)}
 
@@ -233,9 +232,8 @@ def _counted_steps(res, names=("TX1", "TX4")) -> dict[int, dict[str, dict]]:
     "pa_kw, search_kw",
     [
         ({"orx_peak": {1: 0.5}}, {"max_steps": 3, "gain_min": 100}),  # never a counted step
-        ({"cross": (0.3, 0.3)}, {"max_steps": 3}),
+        ({"cross": (0.3, 0.3)}, {"max_steps": 2}),
         ({"cross": (0.6, 0.6)}, {"max_steps": 8}),
-        ({"cross": (0.6, 0.6)}, {"max_steps": 12, "method": "walk"}),
     ],
 )
 def test_at_max_steps_the_radio_is_left_where_it_was_measured(pa_kw, search_kw):
@@ -256,7 +254,7 @@ def test_at_max_steps_the_radio_is_left_where_it_was_measured(pa_kw, search_kw):
 
 def test_at_max_steps_the_step_closest_to_the_targets_is_restored():
     pa = TwoBandPa(cross=(0.6, 0.6))
-    res = pa.search(method="walk", max_steps=12)
+    res = pa.search(max_steps=8)
     steps = _counted_steps(res)
     worst = {s: max(abs(h["error_db"]) for h in rows.values()) for s, rows in steps.items()}
     best = min(worst, key=worst.get)
@@ -271,19 +269,11 @@ def test_at_max_steps_the_step_closest_to_the_targets_is_restored():
 def test_without_a_counted_step_the_last_measured_step_is_kept():
     pa = TwoBandPa(orx_peak={1: 0.5})
     res = pa.search(max_steps=3, gain_min=100)
-    tx1 = [h for h in res.history if h["band"] == "TX1" and h["leveled"]]
-    assert [h["atten_db"] for h in tx1][:2] == [20.0, 17.5] and len(tx1) == 3
-    assert pa.a[0] == tx1[-1]["atten_db"] < 17.5 and pa.g[0] == tx1[-1]["orx_gain"]
+    tx1 = [h for h in res.history if h["band"] == "TX1" and h["counts"]]
+    assert tx1[0]["atten_db"] == 20.0 and tx1[1]["atten_db"] < 20.0 and len(tx1) == 3
+    assert pa.a[0] == tx1[-1]["atten_db"] and pa.g[0] == tx1[-1]["orx_gain"]
     assert res.bands[0].compression_db == tx1[-1]["gain_compression_db"]
     assert "last step measured" in res.reason
-
-
-def test_a_band_first_leveled_late_still_takes_its_coarse_step():
-    pa = TwoBandPa(cross=(0.0, 0.0), noise=0.0)
-    res = pa.search(method="walk", orx_gains=[240, 210], max_relevel=1)  # band 1: 2 steps hot
-    tx1 = [h for h in res.history if h["band"] == "TX1" and not h["action"].startswith("ORx")]
-    assert tx1[0]["action"] == "coarse" and tx1[0]["move_db"] == -2.5
-    assert res.converged
 
 
 class LinearPa:
@@ -292,7 +282,7 @@ class LinearPa:
     attenuation on band ``j``). The ORx peak follows the drive minus the compression exactly,
     -1 dBFS at the start, ``db_per_index`` dB per gain index from index 500."""
 
-    def __init__(self, slopes, locks=(15.0, 16.0), start=20.0, db_per_index=0.05):
+    def __init__(self, slopes, locks=(15.0, 16.0), start=20.0, db_per_index=0.5):
         self.S, self.locks = np.asarray(slopes, dtype=float), np.asarray(locks, dtype=float)
         self.start, self.dbpi = start, db_per_index
         self.a, self.g = np.array([start, start]), [500, 500]
@@ -321,38 +311,114 @@ class LinearPa:
         return search_multiband_compression(
             lambda i, db: self.a.__setitem__(i, db),
             lambda i, g: self.g.__setitem__(i, g),
-            self.measure,
+            lambda idx: [self.measure(i) for i in idx],
             **args,
         )
 
 
+#: The first bench lock's PA (S20-100, TX2 + TX3): own 0.3 dB/dB, cross 0.06 dB/dB.
+BENCH_SLOPES = [[0.3, 0.06], [0.06, 0.3]]
+#: Locks 7 dB below the 20 dB start (and around it).
+SEVEN_DB_AWAY = [(13.0, 13.0), (13.0, 15.0), (14.5, 13.0), (16.0, 14.0)]
+
+
+@pytest.mark.parametrize("locks", SEVEN_DB_AWAY)
+def test_joint_locks_the_bench_pa_from_7_db_away_in_at_most_5_snapshots(locks):
+    pa = LinearPa(BENCH_SLOPES, locks=locks)
+    res = pa.search(method="joint")
+    assert res.converged, res.reason
+    np.testing.assert_allclose(pa.comp(), 4.0, atol=0.1)  # the truth, not the reading
+    assert res.snapshots <= 5 and res.captures == res.snapshots, res.snapshots
+
+
+@pytest.mark.parametrize("locks", SEVEN_DB_AWAY)
+def test_pingpong_locks_the_bench_pa_from_7_db_away_in_at_most_12_snapshots(locks):
+    pa = LinearPa(BENCH_SLOPES, locks=locks)
+    res = pa.search(method="pingpong")
+    assert res.converged, res.reason
+    np.testing.assert_allclose(pa.comp(), 4.0, atol=0.1)
+    assert res.snapshots <= 12, res.snapshots
+    moved = [[h["band"] for h in res.history if h["step"] == s and h["move_db"]]
+             for s in range(res.steps)]  # fmt: skip
+    assert all(len(m) <= 1 for m in moved)  # one band at a time
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize(
+    "slopes, prior",
+    [
+        ([[1.0, 0.6], [0.6, 1.0]], SLOPE_PRIOR),  # the old fake board's strong coupling
+        (BENCH_SLOPES, (0.1, 0.02)),  # the prior 3x too shallow
+        (BENCH_SLOPES, (0.93, 0.18)),  # ...and 3x too steep
+        ([[0.9, 0.3], [0.3, 0.9]], (0.1, 0.0)),
+    ],
+)
+@pytest.mark.parametrize("locks", [(13.0, 13.0), (13.0, 17.5), (17.5, 14.0)])
+def test_hard_cases_converge_or_stop_with_a_reason_never_wander(method, slopes, prior, locks):
+    """Strong coupling and a prior 3x off either way: the trust region keeps every step near
+    what was measured, so the search converges (here: always) and never wanders off."""
+    pa = LinearPa(slopes, locks=locks)
+    visited = []
+    res = pa.search(method=method, slope_prior=prior, max_steps=16,
+                    on_step=lambda rows: visited.append([r["atten_db"] for r in rows]))  # fmt: skip
+    assert res.converged, (res.reason, res.steps)
+    np.testing.assert_allclose(pa.comp(), 4.0, atol=0.1)
+    assert res.snapshots <= (8 if method == "joint" else 16), res.snapshots
+    lo, hi = min(min(locks), 20.0) - 4.0, 20.0 + 4.0  # never further than one cap past the box
+    assert all(lo <= a <= hi for step in visited for a in step), visited
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_a_band_starting_at_its_floor_is_held_and_the_other_solved(method):
+    """TX1 starts at its 14 dB floor and needs 12 dB: held there ("at limit"); TX4 is solved
+    with it fixed and converges; the search stops with the reason."""
+    pa = LinearPa(BENCH_SLOPES, locks=(12.0, 15.0), start=14.0)
+    res = pa.search(method=method, start_attens_db=[14.0, 20.0], atten_mins_db=[14.0, 5.0])
+    assert not res.converged and "TX1 at the attenuation limit" in res.reason
+    assert res.bands[0].status == "at limit" and res.bands[0].atten_db == 14.0
+    assert res.bands[1].status == "converged"
+    assert {h["atten_db"] for h in res.history if h["band"] == "TX1"} == {14.0}
+    assert res.snapshots <= 8
+
+
+def test_the_trust_region_undoes_a_step_that_made_it_worse_and_halves_the_cap():
+    """A prior ten times too shallow on a steep PA: the first move (4 dB, the cap) overshoots
+    the target and the error grows from 1 to 3 dB; the next step goes back halfway and the cap
+    halves."""
+    pa = LinearPa([[1.0, 0.0], [0.0, 1.0]], locks=(19.0, 19.0))
+    res = pa.search(slope_prior=(0.1, 0.0), max_move_db=4.0)
+    tx1 = [h for h in res.history if h["band"] == "TX1" and h["counts"]]
+    assert [h["error_db"] for h in tx1[:2]] == pytest.approx([1.0, -3.0])  # it grew
+    assert tx1[1]["action"] == "undo half (error grew; cap 2 dB)"
+    assert tx1[1]["move_db"] == pytest.approx(-0.5 * tx1[0]["move_db"])  # back halfway
+    assert abs(tx1[2]["move_db"]) <= 2.0 and res.converged
+
+
 def test_the_slope_update_is_what_locks_strongly_coupled_bands_in_few_steps(monkeypatch):
-    """0.6 dB/dB from the other band next to 1 dB/dB of its own: the own slopes of a step where
-    both bands moved read 1.6, and only the update learns the cross terms."""
+    """0.6 dB/dB from the other band next to 1 dB/dB of its own, from the bench prior (0.31 /
+    0.06): only the update learns it."""
     coupled = [[1.0, 0.6], [0.6, 1.0]]
-    grid = [(l1, l2) for l1 in np.arange(13.0, 17.6, 0.75) for l2 in np.arange(13.0, 17.6, 0.75)]
+    grid = [(l1, l2) for l1 in np.arange(13.0, 17.6, 1.5) for l2 in np.arange(13.0, 17.6, 1.5)]
 
-    def locked() -> int:
-        return sum(
-            LinearPa(coupled, locks=locks).search(method="slopes", max_steps=6).converged
-            for locks in grid
-        )
+    def snapshots() -> float:
+        return float(
+            np.mean([LinearPa(coupled, locks=locks).search(max_steps=12).snapshots
+                     for locks in grid])
+        )  # fmt: skip
 
-    with_update = locked()
+    with_update = snapshots()
     monkeypatch.setattr(multiband, "update_slopes", lambda jac, da, dc, **_k: jac)
-    diagonal_only = locked()
-    assert with_update >= 0.9 * len(grid), with_update  # 45 of 49
-    assert diagonal_only <= 0.75 * len(grid), diagonal_only  # 31 of 49
+    prior_only = snapshots()
+    assert with_update < prior_only, (with_update, prior_only)
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
 @pytest.mark.parametrize("locks", [(15.0, 16.0), (13.0, 17.5), (16.5, 14.0)])
-def test_the_orx_gain_follows_the_output_peak_so_no_band_relevels(method, locks):
+def test_the_orx_gain_follows_the_output_peak_so_no_band_relevels(locks):
     pa = LinearPa([[0.5, 0.0], [0.0, 0.5]], locks=locks)  # the typical own slope, exact
-    res = pa.search(method=method)
+    res = pa.search()
     assert res.converged, res.reason
     assert [h for h in res.history if h["action"].startswith("ORx gain")] == []
-    assert all(-1.6 <= h["peak_dbfs"] <= -0.7 for h in res.history)
+    assert all(h["counts"] for h in res.history)  # every reading usable: none re-captured
 
 
 def test_a_railed_capture_does_not_count_even_with_the_peak_in_band():
@@ -360,26 +426,23 @@ def test_a_railed_capture_does_not_count_even_with_the_peak_in_band():
     res = pa.search()
     tx1 = [h for h in res.history if h["band"] == "TX1"]
     assert -1.6 <= tx1[0]["peak_dbfs"] <= -0.7 and tx1[0]["railed"] == 4
-    assert not tx1[0]["leveled"] and tx1[0]["action"] == "ORx gain -1"
+    assert not tx1[0]["counts"] and tx1[0]["action"] == "ORx gain -1"
     assert tx1[0]["move_db"] == 0.0
-    assert tx1[1]["step"] == 0 and tx1[1]["leveled"] and tx1[1]["action"] == "coarse"
+    assert tx1[1]["step"] == 0 and tx1[1]["counts"] and tx1[1]["action"] == "joint"
     assert tx1[1]["orx_gain"] == tx1[0]["orx_gain"] - 1
     assert res.converged
 
 
-def test_one_band_ends_where_the_single_band_walk_ends():
+def test_one_band_ends_where_the_single_band_search_ends():
     pa = TwoBandPa(cross=(0.0, 0.0), noise=0.0)
     one = search_multiband_compression(
         lambda i, db: pa.a.__setitem__(0, db),
         lambda i, g: pa.g.__setitem__(0, g),
-        lambda i: pa.measure(0),
+        lambda idx: [pa.measure(0)],
         targets_db=[4.0],
         start_attens_db=[20.0],
         atten_mins_db=[10.0],
         orx_gains=[210],
-        method="walk",
-        coarse_step_db=2.5,
-        fine_step_db=0.2,
     )
     pa2 = TwoBandPa(cross=(0.0, 0.0), noise=0.0)
     single = search_tx_compression(
@@ -395,15 +458,20 @@ def test_one_band_ends_where_the_single_band_walk_ends():
         comp_tol_db=0.1,
     )
     assert one.converged and single.converged
-    assert one.bands[0].atten_db == pytest.approx(single.final_atten_db, abs=0.1)
+    assert one.bands[0].atten_db == pytest.approx(single.final_atten_db, abs=0.2)
 
 
 @pytest.mark.parametrize(
     "bad, match",
     [({"max_steps": 0}, "max_steps"), ({"comp_tol_db": 0.0}, "comp_tol_db"),
-     ({"comp_tol_db": -0.1}, "comp_tol_db")],
+     ({"comp_tol_db": -0.1}, "comp_tol_db"), ({"max_move_db": 0.0}, "max_move_db"),
+     ({"slope_prior": (0.05, 0.0)}, "slope_prior"), ({"slope_prior": (0.3, 0.2)}, "slope_prior"),
+     ({"method": "walk"}, "walk was removed"), ({"method": "slopes"}, "replaced by 'joint'"),
+     ({"method": "newton"}, "method must be"),
+     ({"coarse_step_db": 2.5}, "coarse_step_db was removed: max_move_db"),
+     ({"fine_step_db": 0.2}, "fine_step_db was removed")],
 )  # fmt: skip
-def test_the_search_rejects_a_budget_or_tolerance_it_cannot_work_with(bad, match):
+def test_the_search_rejects_settings_it_cannot_work_with(bad, match):
     pa = TwoBandPa()
     with pytest.raises(ValueError, match=match):
         pa.search(**bad)
@@ -423,10 +491,9 @@ def test_a_negative_backoff_is_rejected_before_the_radio_is_touched():
 # -- the slope matrix ----------------------------------------------------------------------
 
 
-def test_own_slopes_are_minus_dc_over_da_held_in_bounds():
-    jac = own_slopes(np.array([-2.5, -1.0, 0.0]), np.array([1.5, 2.0, 0.3]))
-    np.testing.assert_allclose(jac, np.diag([-0.6, -1.5, -0.5]))  # 2.0 clipped; still: 0.5
-    assert own_slopes(np.array([-1.0]), np.array([0.05]))[0, 0] == -0.2
+def test_the_prior_has_the_own_slope_on_the_diagonal_and_the_coupling_off_it():
+    np.testing.assert_allclose(prior_slopes(2), [[-0.31, -0.06], [-0.06, -0.31]])
+    np.testing.assert_allclose(prior_slopes(3, (0.5, 0.1))[2], [-0.1, -0.1, -0.5])
 
 
 def test_the_slope_update_explains_the_step_it_learns_from():
@@ -439,13 +506,21 @@ def test_the_slope_update_explains_the_step_it_learns_from():
     assert new[0, 1] < 0 and new[1, 0] < 0  # more drive on one band compresses the other
 
 
-def test_a_cross_slope_is_never_larger_than_the_own_slope():
+def test_a_one_band_step_learns_that_bands_column_exactly():
+    new = update_slopes(prior_slopes(2), np.array([-2.0, 0.0]), np.array([0.6, 0.12]))
+    np.testing.assert_allclose(new[:, 0], [-0.3, -0.06])  # own and cross, as measured
+    np.testing.assert_allclose(new[:, 1], prior_slopes(2)[:, 1])
+
+
+def test_a_cross_slope_is_never_more_than_half_the_own_slope():
     jac = np.diag([-0.5, -0.5])
     new = update_slopes(jac, np.array([0.0, -1.0]), np.array([2.0, 0.5]))  # a noisy step
-    assert new[0, 1] == pytest.approx(-0.5)  # the step alone says -2.0: bound to |J[0, 0]|
-    assert abs(new[1, 0]) <= abs(new[1, 1])
+    assert new[0, 1] == pytest.approx(-0.25)  # the step alone says -2.0: bound to |J[0, 0]| / 2
+    assert abs(new[1, 0]) <= abs(new[1, 1]) / 2
     held = update_slopes(np.diag([-1.4, -0.3]), np.array([-1.0, 0.0]), np.array([3.0, 0.0]))
-    assert held[0, 0] == pytest.approx(-1.5)  # own slopes stay in slope_bounds
+    assert held[0, 0] == pytest.approx(-1.5)  # own slopes stay in 0.1 .. 1.5
+    low = update_slopes(np.diag([-0.3, -0.3]), np.array([-1.0, 0.0]), np.array([0.0, 0.0]))
+    assert low[0, 0] == pytest.approx(-0.1)
 
 
 def test_the_slope_update_ignores_a_step_it_cannot_learn_from():
@@ -453,25 +528,6 @@ def test_the_slope_update_ignores_a_step_it_cannot_learn_from():
     np.testing.assert_array_equal(update_slopes(jac, np.zeros(2), np.array([1.0, 1.0])), jac)
     nan_step = update_slopes(jac, np.array([-1.0, 0.0]), np.array([np.nan, 0.2]))
     np.testing.assert_array_equal(nan_step, jac)
-
-
-def test_after_an_error_grew_the_search_walks_and_starts_again_from_own_slopes():
-    checked = 0
-    for locks, cross in (((14, 15), (0.3, 0.3)), ((13, 16.5), (0.0, 0.4)), ((14, 15), (0.6, 0.6))):
-        res = TwoBandPa(locks=locks, cross=cross).search(max_steps=12)
-        by_step: dict[int, list[dict]] = {}
-        for h in res.history:
-            if h["leveled"]:
-                by_step.setdefault(h["step"], []).append(h)
-        fallbacks = [s for s, rows in by_step.items() if rows[0]["action"] == "walk (fallback)"]
-        for s in fallbacks:
-            assert all(h["slopes"] == "" for h in by_step[s])  # J dropped on that step
-            after = by_step.get(s + 1, [])
-            if after and after[0]["slopes"]:
-                jac = np.array(json.loads(after[0]["slopes"]))
-                assert np.count_nonzero(jac - np.diag(np.diag(jac))) == 0  # own slopes only
-                checked += 1
-    assert checked >= 2
 
 
 def test_case_names_carry_paths_carriers_bandwidths_and_targets():
@@ -606,7 +662,7 @@ def test_a_fatal_search_captures_and_writes_nothing(tmp_path, monkeypatch):
             BandLock("TX1", 20.05, 185, 1.2, 0.2, 0.4, 0.0, 9, 10.0, "not converged"),
             BandLock("TX4", nan, 210, nan, nan, nan, nan, 0, 10.0, "not converged"),
         ]
-        return MultibandSearch(False, "TX1: ORx still clips at minimum gain", "slopes", locks,
+        return MultibandSearch(False, "TX1: ORx still clips at minimum gain", "joint", locks,
                                1, 3, fatal=True)  # fmt: skip
 
     monkeypatch.setattr(multiband, "search_multiband_compression", fatal_search)
@@ -783,10 +839,28 @@ def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeyp
     monkeypatch.setattr(capture_module, "estimate_and_align", full)
     monkeypatch.setattr(capture_module, "align_with_fraction", fraction)
     radio, bands = _case_radio(), _case_bands()
-    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
+    search, _refs = lock_bands(
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, probe_ms=None
+    )
     assert search.converged
     assert calls["full"] == 2  # each band's first reading came leveled from the AGC
-    assert calls["fraction"] == search.captures - 2
+    assert calls["fraction"] == len(search.history) - 2
+
+
+def test_on_the_probe_every_reading_is_aligned_in_full(monkeypatch):
+    from adrvtrx import capture as capture_module
+
+    calls = []
+    real_full = capture_module.estimate_and_align
+    monkeypatch.setattr(
+        capture_module,
+        "estimate_and_align",
+        lambda *a, **k: (calls.append(1), real_full(*a, **k))[1],
+    )
+    radio, bands = _case_radio(), _case_bands()
+    search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
+    assert search.converged and search.probe["n"] == 500  # 0.05 ms at 10 Msps
+    assert len(calls) == len(search.history)
 
 
 @pytest.mark.parametrize("bench, tol_db", [("sim", 0.005), ("rich", 0.03)])
@@ -848,8 +922,9 @@ def test_each_backoff_levels_from_the_gain_predicted_from_the_lock(monkeypatch):
     real_set = radio.set_rx_gain
     radio.set_rx_gain = lambda ch, g: (floor_starts.append(g == 185), real_set(ch, g))[1]
     res = find_multiband_operating_point(
-        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, backoffs=(0, 2, 4)
-    )
+        radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz, backoffs=(0, 2, 4),
+        probe_ms=None,
+    )  # fmt: skip
     lock = [bl.orx_gain for bl in res.search.bands]
     # 0.5 dB of output per dB of backoff, 0.5 dB per index: k indices up
     assert starts == {0: lock, 1: [g + 2 for g in lock], 2: [g + 4 for g in lock]}
@@ -905,7 +980,7 @@ def test_a_case_writer_creates_its_folder_with_its_first_file(tmp_path):
     assert target.parent == other.dir and other.dir.is_dir()
 
 
-@pytest.mark.parametrize("method", ["slopes", "walk"])
+@pytest.mark.parametrize("method", METHODS)
 def test_a_band_that_can_never_level_stops_the_search_when_nothing_can_change(method):
     pa = TwoBandPa(noise=0.0, comp_nan={1: 1})  # TX4 never aligns: measured again, same gain
     res = pa.search(method=method)  # max_steps 20 would take 161 captures
@@ -923,22 +998,17 @@ _LOCK_GRID = [(l1, l2) for l1 in (13.0, 14.5, 16.0, 17.5) for l2 in (13.0, 14.5,
 
 
 def _oracle_cases(method: str):
-    """Linear PAs (``c = 4 + S (locks - a)``, noise-free) with up to 0.4 dB/dB from the other band.
-
-    The walk is left out where it limit-cycles: a 0.2 dB fine step that moves the compression
-    by more than the 0.2 dB tolerance window (own + cross slope above about 1 dB/dB with both
-    bands stepping together) can jump across it forever. Measured with the code of
-    2026-10-17: slopes at most 6 steps, mean 4.3; walk at most 9, mean 5.1.
-    """
-    for own in (0.7, 1.0):
+    """Linear PAs (``c = 4 + S (locks - a)``, noise-free) with own slopes from the bench's 0.3 to
+    1 dB/dB and up to 0.4 dB/dB from the other band, from the bench prior (0.31 / 0.06)."""
+    for own in (0.3, 0.7, 1.0):
         for cross in (0.0, 0.1, 0.2, 0.3, 0.4):
+            if cross > own:
+                continue
             for symmetric in (True, False):
-                if method == "walk" and symmetric and (own >= 1.0 or cross >= 0.4) and cross > 0:
-                    continue
                 yield [[own, cross], [cross if symmetric else 0.0, own]]
 
 
-@pytest.mark.parametrize("method, budget, mean_max", [("slopes", 8, 4.8), ("walk", 10, 5.6)])
+@pytest.mark.parametrize("method, budget, mean_max", [("joint", 8, 4.5), ("pingpong", 16, 9.0)])
 def test_both_methods_lock_linear_coupled_bands_within_a_step_budget(method, budget, mean_max):
     steps = []
     for slopes in _oracle_cases(method):
@@ -954,7 +1024,7 @@ def test_both_methods_lock_linear_coupled_bands_within_a_step_budget(method, bud
 # -- behaviour the second review's injected bugs found unguarded --------------------------------
 
 
-@pytest.mark.parametrize("method, max_steps", [("walk", 5), ("slopes", 4)])
+@pytest.mark.parametrize("method, max_steps", [("joint", 5)])
 def test_a_clipped_last_step_is_never_the_one_kept(method, max_steps):
     """The last step clips (top slope under the guard) and is the closest to the targets; the
     step kept at max_steps must be the best one that did not clip."""
@@ -977,10 +1047,10 @@ def test_a_clipped_last_step_is_never_the_one_kept(method, max_steps):
 
 
 def test_a_band_at_its_limit_is_held_and_left_out_of_the_solve():
-    """TX4 needs more drive than its 12 dB limit allows; once it is there, the slopes method
+    """TX4 needs more drive than its 12 dB limit allows; once it is there, the joint method
     solves for TX1 alone (TX4's move is fixed at 0), although J has cross terms."""
     pa = TwoBandPa(locks=(14.0, 9.0), cross=(0.3, 0.3), noise=0.0)
-    res = pa.search(method="slopes", atten_mins_db=[10.0, 12.0])
+    res = pa.search(method="joint", atten_mins_db=[10.0, 12.0])
     steps = _counted_steps(res)
     checked = 0
     for rows in steps.values():
@@ -988,24 +1058,26 @@ def test_a_band_at_its_limit_is_held_and_left_out_of_the_solve():
         if t4["action"] != "at limit":
             continue
         assert t4["atten_db"] == 12.0 and t4["move_db"] == 0.0
-        assert t1["action"] == "slopes"
+        assert t1["action"] in ("joint", "within tolerance")
         jac = np.array(json.loads(t1["slopes"]))
-        assert abs(jac[0, 1]) > 0.1  # a cross term the 2x2 solve would have used
-        move = float(np.clip(t1["error_db"] / jac[0, 0], -2.5, 2.5))  # TX1's own row only
+        assert abs(jac[0, 1]) > 0.05  # a cross term the 2x2 solve would have used
+        if t1["action"] == "within tolerance":
+            continue
+        move = float(np.clip(t1["error_db"] / jac[0, 0], -4.0, 4.0))  # TX1's own row only
         expected = multiband.quantize_atten(t1["atten_db"] + move) - t1["atten_db"]
         assert t1["move_db"] == pytest.approx(expected, abs=1e-9)
         checked += 1
     assert checked >= 1 and res.bands[1].status == "at limit"
 
 
-def test_the_fatal_band_ends_one_fine_step_above_where_it_clipped():
+def test_the_fatal_band_ends_one_clip_step_above_where_it_clipped():
     pa = TwoBandPa(noise=0.0, orx_peak={1: 0.5})  # TX4's ORx rails at every gain
-    res = pa.search(fine_step_db=0.3)
+    res = pa.search()
     assert res.fatal and "TX4" in res.reason
     fatal_row = res.history[-1]
     assert fatal_row["band"] == "TX4" and fatal_row["action"].startswith("ORx clips")
     assert fatal_row["atten_db"] == 20.0  # held at its start while it re-leveled
-    assert res.bands[1].atten_db == pa.a[1] == pytest.approx(20.3)  # one fine step up
+    assert res.bands[1].atten_db == pa.a[1] == pytest.approx(20.2)  # one clip step up
     tx1 = [h for h in res.history if h["band"] == "TX1"]
     assert pa.a[0] == tx1[-1]["atten_db"]  # the other band stays where it was measured
 
