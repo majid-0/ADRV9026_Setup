@@ -16,7 +16,8 @@ The model:
 * ``PerformRx`` returns the full ``rxInitChannelMask`` set ``[ch0_I, ch0_Q, ...]``.
   An enabled ORx input whose TX (``[tx_to_orx]``) is enabled carries that TX's
   waveform through the PA model (:class:`PaModel`), a small delay, the ORx gain
-  ``(index - 210) * 0.5`` dB, noise and the ADC rail. Every capture starts at a
+  ``(index - 210) * orx_db_per_index`` dB (0.5 unless a band sets its own), noise and the ADC
+  rail. Every capture starts at a
   random point of the loop (IMMEDIATE trigger).
 
 The PA model (:class:`PaModel`, on one period of the looping waveform, circular):
@@ -189,6 +190,7 @@ class PaModel:
     memory_slope_per_ghz: float = 0.0
     delay_samples: int = 5
     orx_level: float = 0.73  # ORx output at saturation, gain index 210, x full scale
+    orx_db_per_index: float = 0.5  # the ORx gain table's step (per TX in ``bands``: its ORx path)
     noise_codes: float = 0.5
     seed: int | None = None
     drift_db_per_hour: float = 0.0
@@ -674,7 +676,8 @@ class FakeBoard:
         if pa is None:
             return np.zeros(n, dtype=np.complex128)
         scale = self.pa.orx_level * _full_scale(self.rx_bits)
-        scale *= 10 ** ((self.state["rx_gain"][orx.name] - 210) * 0.5 / 20.0)
+        step = self.pa.for_tx(tx.name).orx_db_per_index
+        scale *= 10 ** ((self.state["rx_gain"][orx.name] - 210) * step / 20.0)
         if self._snapshot_start is None:  # PerformTx loads equal-length buffers
             self._snapshot_start = int(self.rng.integers(len(pa)))
         start = self._snapshot_start

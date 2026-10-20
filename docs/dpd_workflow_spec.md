@@ -564,15 +564,19 @@ rules; this section is the API and the files.
 BandSpec(tx, orx, lo, freq_hz, bw_mhz, signal, target_db=4.0,
          atten_start_db=20.0, atten_min_db=10.0, signal_name="")
 search_multiband_compression(set_atten, set_gain, measure, *, targets_db,
-    start_attens_db, atten_mins_db, orx_gains, names=None, method="slopes",
-    coarse_step_db=2.5, fine_step_db=0.2, comp_tol_db=0.1, ..., max_steps=20,
-    max_relevel=6, min_top_slope=PA_CLIP_SLOPE, on_step=None) -> MultibandSearch
-lock_bands(radio, bands, *, tx_bits, rx_bits, fs, ...) -> (MultibandSearch, refs)
+    start_attens_db, atten_mins_db, orx_gains, names=None, method="joint",
+    max_move_db=4.0, slope_prior=(0.31, 0.06), comp_tol_db=0.1, ..., max_steps=20,
+    max_relevel=6, min_top_slope=PA_CLIP_SLOPE, snapshot=True, on_step=None)
+    -> MultibandSearch
+lock_bands(radio, bands, *, tx_bits, rx_bits, fs, probe=None, snapshot=None, ...)
+    -> (MultibandSearch, refs)
+confirm_lock(radio, bands, refs, search, *, rx_bits, fs, confirm_steps=2, ...)
+    -> list[BandCapture]
 capture_case(radio, bands, refs, attens_db, *, rx_bits, fs, agc=True,
     gains=None, check=None, retakes=3, ...) -> list[BandCapture]
 find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
-    backoffs=(0, 1, 2, 3, 4), method="slopes", check=None, writer=None, ...)
-    -> CaseResult
+    backoffs=(0, 1, 2, 3, 4), method="joint", check=None, writer=None,
+    probe=None, confirm_steps=2, ...) -> CaseResult
 ```
 
 - The search steers on gain compression (§3), every band within
@@ -589,18 +593,19 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
   within tolerance is at its limit or held at an unchanged ORx gain (a band
   that cannot level).
 
-**Strong coupling: use the walk first.** Up to about 0.4 dB/dB from the other
-band both methods lock the synthetic PAs in 4 to 9 steps
-(`test_both_methods_lock_linear_coupled_bands_within_a_step_budget`). At about
-0.6 dB/dB the search may not lock: on the two-band test PA 6 of 16 lock pairs
-fail within 20 steps with either method, and the slopes method's restart and
-step rules are to be revisited with bench data. Until then, take the first
-bench locks with `method="walk"` and a small `max_steps` (about 8), keep the
-attenuation limits conservative, and read the real cross slope from
-`lock.csv`. The walk has a known limit cycle: when one 0.2 dB fine step moves
-a band's compression by more than the 0.2 dB tolerance window (own plus cross
-slope above about 1 dB/dB, both bands stepping together), it can jump across
-the window until `max_steps`; `lock.csv` then shows ±0.2 dB moves alternating.
+**The fast lock** (Polynomials `multiband_setup/task6_fast_lock.md`, replacing the walk and the
+old `slopes` method). One snapshot of every ORx per step. With `probe=ProbeSettings(...)` the lock
+runs on the probe (Task 6b, `adrvtrx.probe`: a 600-sample window around every peak event of every
+band, the same indices in every band, joined with crossfades; the full signal's codes); `joint` solves `J da = target - c` for
+every band together from a slope prior (own 0.31, cross 0.06 dB/dB, the first bench lock),
+updated each step (Broyden), with own slopes in 0.1..1.5, cross terms at most half the own, and a
+trust region (`max_move_db`; a worse step is undone halfway and the cap halves). The ORx re-level
+learns its dB per index. The 0 dB capture of the full signals confirms the lock; a band off its
+target continues on full captures for at most `confirm_steps`, its `J` from the prior again. The probe-to-full GC offset per
+band goes into `case.json` and `conditions.csv`, the timing of every capture and swap into
+`case.json` (`lock_timing`). Run notebook `01b_probe_check` once on the bench before relying on
+the probe; without it (the default) the lock runs on the full signals. `probe_fidelity` /
+`fidelity_report` check a probe design on any saved full-signal capture.
 
 **Case folder** (`CaseWriter(run_dir, bands, ...)`): `<run_dir>/<case>/`, with
 `<case>` = `TX1-TX4_1440-1860MHz_80-80BW_4-4GC` (paths, carriers in MHz,

@@ -33,7 +33,7 @@ import numpy as np
 
 from ._enums import RxChannel, TxChannel
 from .capture import aligned_capture, autolevel_for
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN
+from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep, relevel_index
 from .metrics import gain_compression_db, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
 
@@ -94,22 +94,6 @@ def fine_step(error_db: float, fine_db: float, coarse_db: float) -> float:
     return min(coarse_db, steps * fine_db)
 
 
-def relevel_index(
-    peak_dbfs: float, railed: int, *, target_dbfs: float, band_hi: float, db_per_index: float
-) -> int:
-    """ORx gain index change for a capture that is not leveled (railed, hot or cold).
-
-    One index down when it railed with its peak still in band (the peak dBFS compresses near
-    full scale, the railed count does not); otherwise the peak's distance from ``target_dbfs`` in
-    indices, at least one. The re-level rule of the single-band and the multi-band searches.
-    """
-    if railed > 0 or peak_dbfs > band_hi:
-        if railed > 0 and not peak_dbfs > band_hi:
-            return -1
-        return -max(1, int(round((peak_dbfs - target_dbfs) / db_per_index)))
-    return max(1, int(round((target_dbfs - peak_dbfs) / db_per_index)))
-
-
 def search_tx_compression(
     set_tx_atten,
     set_orx_gain,
@@ -144,6 +128,11 @@ def search_tx_compression(
     (``round(delta / db_per_index)`` indices). The radio is left at the returned
     attenuation and gain.
 
+    The ORx re-level learns the gain table's step (:class:`~adrvtrx.gain.OrxStep`, shared with
+    the multi-band search): ``db_per_index`` until two captures at one attenuation tell it, then
+    their secant; 1-index steps after an overshoot; the closest capture when even those jump the
+    window.
+
     With ``min_top_slope`` set, a trusted reading whose ``extra["top_slope"]`` is
     below it is PA clipping: the attenuation goes up (by the remaining error, at
     least one fine step), and that attenuation becomes the new floor. A target the
@@ -176,6 +165,7 @@ def search_tx_compression(
 
     atten = quantize_atten(max(atten_min_db, min(start_atten_db, atten_max_db)))
     gain = clamp_gain(orx_gain)
+    orx = OrxStep(db_per_index)  # the re-level learns the gain table's step
     floor = quantize_atten(atten_min_db)  # raised by the clip guard
     guard_floor = False
     coarse_pending = True
@@ -231,6 +221,10 @@ def search_tx_compression(
         leveled = in_band(peak, railed)
         cold_at_max = (not leveled) and railed == 0 and peak < band_lo and gain >= gain_max
         trusted = leveled or cold_at_max
+        orx.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi, drive=atten)
+        closest = orx.closest(target_dbfs) if orx.jumped and not trusted else None
+        if closest is not None and closest[0] == gain and railed == 0:
+            trusted = True  # 1-index steps jump the window: the capture closest to the target
         rec = {
             "atten_db": atten,
             "orx_gain": gain,
@@ -266,7 +260,7 @@ def search_tx_compression(
             atten = new
             floor = max(floor, atten)
             guard_floor = True
-            gain = clamp_gain(gain + int(round(delta / db_per_index)))
+            gain = clamp_gain(gain + orx.indices(delta))
             record(rec, f"PA clip guard (top slope {slope:.3f}); TX atten +{delta:.2f} dB")
             continue
 
@@ -325,7 +319,7 @@ def search_tx_compression(
                     new = floor
                 delta = atten - new
                 atten = new
-                gain = clamp_gain(gain - int(round(delta / db_per_index)))
+                gain = clamp_gain(gain - orx.indices(delta))
                 action = f"TX atten -{delta:.2f} dB"
             else:
                 new = quantize_atten(min(atten_max_db, atten + step_for(error)))
@@ -341,7 +335,7 @@ def search_tx_compression(
                     )
                 delta = new - atten
                 atten = new
-                gain = clamp_gain(gain + int(round(delta / db_per_index)))
+                gain = clamp_gain(gain + orx.indices(delta))
                 action = f"TX atten +{delta:.2f} dB"
         elif (railed > 0 or peak > band_hi) and gain <= gain_min:
             new = quantize_atten(min(atten_max_db, atten + fine_step_db))
@@ -356,10 +350,12 @@ def search_tx_compression(
                 railed=railed,
                 extra=extra,
             )
+        elif closest is not None:  # back to the closest capture: it is taken next time
+            k = closest[0] - gain
+            gain = clamp_gain(closest[0])
+            action = f"ORx gain {k:+d} (1-index steps jump the window: the closest capture)"
         else:
-            k = relevel_index(
-                peak, railed, target_dbfs=target_dbfs, band_hi=band_hi, db_per_index=db_per_index
-            )
+            k = orx.step(peak, railed, target_dbfs=target_dbfs, band_hi=band_hi)
             gain = clamp_gain(gain + k)
             action = f"ORx gain {k:+d}"
 

@@ -145,8 +145,11 @@ from the captured signals to the next waveform) and
 `adrvtrx` imports no external model library; the GMP is the reference DPD.
 
 Several bands at once (dual band: TX1 and TX4 into one PA). Every band is locked to its own
-compression target together, then backed off together; `method="slopes"` learns how each band's
-attenuation moves every band's compression, `method="walk"` steps each band by the single-band rule:
+compression target together, then backed off together, with one capture of every ORx per step.
+With `probe=ProbeSettings()` (`adrvtrx.probe`: a window around every peak of every band, the same
+indices in every band) the lock runs on the probe and the 0 dB capture of the full signals
+confirms it; `method="joint"` (default) moves every band each step from
+a slope matrix it learns, `method="pingpong"` one band at a time:
 
 ```python
 from adrvtrx.multiband import BandSpec, CaseWriter, find_multiband_operating_point
