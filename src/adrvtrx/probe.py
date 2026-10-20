@@ -410,7 +410,10 @@ def fidelity_report(
     (:meth:`Probe.describe`) and, per backoff, per band, the full and probe compression and their
     offset (:func:`probe_fidelity`). It runs whether the lock used the probe or not.
     """
-    probe = (settings or ProbeSettings()).build(refs)
+    try:
+        probe = (settings or ProbeSettings()).build(refs)
+    except ValueError as exc:  # e.g. a signal shorter than one window: nothing to check
+        return {"probe": None, "error": str(exc), "backoffs": {}, "worst_offset_db": None}
     backoffs = {}
     for k, ys in sorted(outputs.items()):
         got = probe_fidelity(list(refs), list(ys), probe)["bands"]
