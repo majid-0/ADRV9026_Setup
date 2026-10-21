@@ -74,7 +74,14 @@ from .compression import fine_step, quantize_atten
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep
-from .metrics import PA_CLIP_SLOPE, gain_compression_db, period_metrics, window_compression_db
+from .metrics import (
+    PA_CLIP_SLOPE,
+    gain_compression_db,
+    joint_compression,
+    levels_from_attens,
+    period_metrics,
+    window_compression_db,
+)
 from .probe import ProbeSettings
 from .radio import MAX_TX_ATTEN_DB
 from .transmit import transmit_bands
@@ -96,6 +103,8 @@ __all__ = [
     "measure_bands",
     "lock_bands",
     "capture_case",
+    "add_joint_metrics",
+    "JOINT_KEYS",
     "find_multiband_operating_point",
     "case_name",
     "CaseWriter",
@@ -1354,6 +1363,7 @@ def capture_case(
     for i in range(len(bands)):
         out[i] = take(i, 1, relevel=True)
     if check is None:
+        add_joint_metrics(bands, out, fs)  # type: ignore[arg-type]
         return out  # type: ignore[return-value]
     for attempt in range(retakes + 1):
         results = check(out) or {}
@@ -1367,7 +1377,55 @@ def capture_case(
             break
         for i in failing:
             out[i] = take(i, out[i].tries + 1, relevel=out[i].railed > 0)
+    add_joint_metrics(bands, out, fs)  # type: ignore[arg-type]
     return out  # type: ignore[return-value]
+
+
+#: The joint figures :func:`add_joint_metrics` puts into every capture's metrics.
+JOINT_KEYS = (
+    "joint_gain_compression_db",
+    "joint_top_slope",
+    "joint_papr_in_db",
+    "joint_papr_compression_db",
+    "joint_levels_db",
+    "joint_band_compression_db",
+)
+
+
+def add_joint_metrics(
+    bands: Sequence[BandSpec], caps: Sequence[BandCapture], fs: float, path_gains_db=None
+) -> dict[str, Any]:
+    """The joint compression of one state (:func:`~adrvtrx.metrics.joint_compression` of every
+    band's reference and aligned output at its carrier) into each capture's ``metrics``.
+
+    The levels come from the captures' TX attenuations (:func:`~adrvtrx.metrics.levels_from_attens`,
+    equal DAC-to-PA path gains unless ``path_gains_db``). Each capture gets :data:`JOINT_KEYS`:
+    the state's ``joint_gain_compression_db``, ``joint_top_slope``, ``joint_papr_in_db``,
+    ``joint_papr_compression_db``, ``joint_levels_db`` (every band's level, ``0/-1.6``), and its
+    own ``joint_band_compression_db`` (its compression where the composite peaks). Report only:
+    the search steers on each band's own compression. A state the figure cannot be computed on
+    gets NaN (a capture is never lost to it). Returns the full result (empty on failure).
+    """
+    try:
+        levels = levels_from_attens([c.atten_db for c in caps], path_gains_db)
+        j = joint_compression(
+            [c.ref for c in caps],
+            [c.y_aligned for c in caps],
+            fs,
+            [b.freq_hz for b in bands],
+            levels_db=levels,
+        )
+    except Exception:  # noqa: BLE001 - a report figure: the captures are kept whatever happens
+        j = {}
+    nan = float("nan")
+    shared = {k: j.get(k, nan) for k in JOINT_KEYS[:4]}
+    shared["joint_levels_db"] = (
+        "/".join(f"{round(v, 2) + 0.0:g}" for v in j["levels_db"]) if j else ""
+    )
+    per_band = j.get("band_compression_at_joint_peaks_db", [nan] * len(caps))
+    for c, v in zip(caps, per_band):
+        c.metrics.update({**shared, "joint_band_compression_db": v})
+    return j
 
 
 @dataclass

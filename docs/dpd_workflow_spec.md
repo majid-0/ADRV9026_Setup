@@ -115,6 +115,7 @@ is computed on **one full aligned period**.
 | `papr_db(s)` | `10·log10(max|s|² / mean|s|²)`. NaN if `s` is empty or all zero | — |
 | `window_compression_db(x, s, fs, window_s)` | `papr_db(x[w]) − papr_db(s[w])`, where `w` is `round(window_s·fs)` samples centred on `argmax|x|` and clamped inside the period. Default `window_s = 0.1 ms` (49 152 samples at 491.52 MHz). Returns `(comp, papr_in, papr_out)` | x → s |
 | `gain_compression_db(x, s)` | `g0` = least-squares complex gain on the samples with `|x| < 0.2·max|x|` (small-signal gain). `a = |x|/max|x|`, `b = |s/g0|/max|x|`. **Gain compression** = `−10·log10( mean(b²) / mean(a²) )` over the samples with `a ≥ 0.975`: the power gain at the peaks relative to the small-signal gain, in dB, positive when compressed. **Top slope** = straight-line fit of the per-bin mean of `b` against the per-bin mean of `a` (40 bins of `a` on [0, 1]) over the bins centred in (0.8, 0.95): 1 for a linear PA, 0 for a flat top. Scale and phase invariant. Returns `(gain_compression_db, top_slope)`. A chain figure (TX → PA → ORx) measured on the signal, so it reads somewhat above a CW compression point; the peak region is relative to the signal's own maximum | x → s |
+| `joint_compression(xs, ys, fs, freqs_hz, levels_db=None)` | Several bands into one PA (§5.9). **Levels**: every input divided by one common number (the largest peak of all the bands), so TX codes keep their relative scale, then `× 10^(levels_db_k/20)`; with TX codes `levels_db_k = G_k − A_k` (path gain DAC → PA input minus TX attenuation), `levels_from_attens(attens, path_gains=None)` (equal path gains by default), only differences matter. **Composite input** `X` = every band at `f_k − mean(f)`, exact periodic up-sampling to `4×` the span, summed (`composite_signal`). **Composite output** `Y` = each band's output divided by **its own** small-signal gain `g0_k` (as `gain_compression_db`), placed the same way (`composite_pair`). **Joint gain compression / top slope** = `gain_compression_db(X, Y)` with `g0 = 1` (no refit: the per-band references put every output on its input's scale; a refit on the composite's small samples would mix in the beat troughs, where the bands cancel while each is compressed; `joint_refit_gain_db` reports it). Also joint PAPR in / out / compression, each band's compression over the samples where `|X| ≥ 0.975·max|X|`, and `pe_papr_in_db` = `max(Σ|x_k|)² / Σ mean|x_k|²` (spacing free). The outputs are band limited (one ORx per band), so `Y` carries the gain averaged over the beat: the figure is below the instantaneous composite compression. `joint_compression_sweep` re-places the inputs at other spacings (input figures only). `joint_envelope(xs, levels_db)` = `Σ_k |x_k(n)|` per sample at the bands' rate, the composite's peak over the beat phase (an upper bound of `|X|`, reached where the carriers align). `joint_amam_ampm` bins `X → Y` (AM/AM, AM/PM, their spread, the top dispersion) and each band's gain and phase against `|X|`, its own `|x_k|` and `joint_envelope` | x → s, per band |
 | `pa_clipped` | `top_slope < min_top_slope`, default `PA_CLIP_SLOPE = 0.08`. A post-inverse needs about `1/top_slope` of gain at the peaks; 0.08 sits between the clipped TX1 2.8 GHz / 100 MHz capture at 0 dB (0.03) and the lowest capture that still inverted well (0.10) | x → s |
 | `nmse_db(x, s)` | `g = Σ conj(x)·s / Σ|x|²` (least-squares complex gain over **all** samples). NMSE = `10·log10( Σ|s/g − x|² / Σ|x|² )`. Invariant to scale and phase | x → s |
 | `aclr_db(s, fs, bw_hz)` | One FFT of `s·hann(N)`, fftshifted, `P = |S|²`, bins `f ∈ [a, b)`. Main = `[−bw/2, bw/2)`, lower = `[−1.5bw, −0.5bw)`, upper = `[0.5bw, 1.5bw)`. Each result is `10·log10(P_adj / P_main)` in dBc. `bw_hz` is the nominal signal bandwidth (40, 100, … MHz) | s alone |
@@ -209,6 +210,22 @@ window_compression_db(x, s, fs, window_s=1e-4) -> tuple[float, float, float]
 gain_compression_db(x, s, *, peak_frac=0.975, small_frac=0.2,
     slope_band=(0.8, 0.95), n_bins=40) -> tuple[float, float]   # (compression, top slope)
 PA_CLIP_SLOPE = 0.08
+levels_from_attens(attens_db, path_gains_db=None) -> list[float]   # 0 dB = the strongest band
+joint_compression(xs, ys, fs, freqs_hz, *, levels_db=None, oversample=4.0,
+    peak_frac=0.975, small_frac=0.2) -> dict
+    # joint_gain_compression_db, joint_top_slope, joint_papr_in_db, joint_papr_out_db,
+    # joint_papr_compression_db, band_compression_at_joint_peaks_db (per band),
+    # pe_papr_in_db, joint_refit_gain_db, spacing_hz, offsets_hz, levels_db, upsample
+joint_compression_sweep(xs, ys, fs, spacings_hz, *, levels_db=None, oversample=4.0) -> dict
+    # spacing_hz, joint_papr_in_db (per spacing), pe_papr_in_db, levels_db: inputs only
+joint_amam_ampm(xs, ys, fs, freqs_hz, *, levels_db=None, bins=40, oversample=4.0) -> dict
+    # bin_centres, counts, amam_in, amam_out, amam_spread, ampm_deg, ampm_spread_deg,
+    # joint_top_slope, top_amam_spread_db, top_ampm_spread_deg, envelope_peak, and per band
+    # (bands x bins) band_{gain_db,gain_spread_db,phase_deg,phase_spread_deg,counts}_{vs_joint,
+    # vs_own,vs_envelope}
+joint_envelope(xs, levels_db=None) -> np.ndarray      # sum_k |x_k(n)|, the bands' own rate
+composite_signal(xs, fs, freqs_hz, *, levels_db=None, oversample=4.0) -> (x_c, fs_c)
+composite_pair(xs, ys, fs, freqs_hz, *, levels_db=None, oversample=4.0) -> (x_c, y_c, fs_c)
 nmse_db(x, s) -> float
 aclr_db(s, fs, bw_hz) -> tuple[float, float]
 inband_corr(a, b, energy_frac=0.05) -> float
@@ -586,7 +603,11 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
 - Per backoff `k` every band goes to `lock + k` dB together, the ORx AGC runs
   per band (starting from the lock gain + `k/2` dB) and one capture per band is
   aligned and scored (`period_metrics`). `check(captures)` sees every band of
-  the state at once; a failing band is captured again.
+  the state at once; a failing band is captured again. Then the state's joint
+  compression (`add_joint_metrics`: §3 `joint_compression` of every band's
+  reference and output, levels from the TX attenuations with equal path gains)
+  goes into every capture's metrics. It is reported only: the search steers on
+  each band's own compression.
 - A fatal search (an ORx that clips at its minimum gain) captures and writes
   nothing. TX is off when the call ends or fails.
 - The search stops early when no band moved for two steps and every band not
@@ -630,6 +651,10 @@ lock_converged, lock_reason, search_method, search_steps, search_captures,
 peak_dbfs, railed`, the `period_metrics` figures (`delay_samples, delay_ns,
 corr, nmse_db, papr_in_db, papr_out_db, papr_compression_db, aclr_lower_dbc,
 aclr_upper_dbc, rms_dbfs, gain_compression_db, amam_top_slope, pa_clipped`),
+the state's joint figures (`joint_gain_compression_db, joint_top_slope,
+joint_papr_in_db, joint_papr_compression_db, joint_levels_db` (every band's
+level, `0/-1.6`), and the band's own `joint_band_compression_db`, its
+compression where the composite peaks; NaN when they cannot be computed),
 then `fs_hz, tries, check_ok, check, out_file, in_file`.
 
 This is not the single-band capture CSV of §4.1: it has no `name`,
@@ -677,7 +702,8 @@ models:
 | `test_gmp.py` | Coefficient count (non-causal = dpd_kit `GMP.unified`, causal). Exact recovery of a synthetic GMP's coefficients on a block. Column scaling gives the plain least-squares answer; ridge shrinks. Chunked `predict` = one chunk. A causal model reads no future sample. Block rows = full rows. `peak_block` placement and clamping |
 | `test_dpd.py` | `peak_dbm` (10 dBm at full scale). `normalize_pair` removes gain and phase. `limit_peak`: smallest margin within `tol_db`, keeps the start margin when enough, flags an unreachable limit, finds the first good bracket of a non-monotonic peak. `IlaStep` fits the rotated `z` to `u` as is. It anchors every capture on the first one (`anchor="each"` uses each capture's own peak) and restarts at `it == 0`. The guard adds only what the limit needs and is reported apart from the target. It returns `None` over the limit, so the loop stops before sending. Loops on the sim bench through `linearize` (memoryless GMP 9,1,0, 5 iterations; targets 0, 0.1, 0.15, 0.2 dB; a tight 8.5 dBm limit) and on the real-signal fixture with a forward-model DUT (GMP 5,5,2, 5 iterations; also 8.5 dBm): NMSE improves by ≥ 20 dB. The worst ACLR of the last iteration is ≥ 20 dB better than iteration 0, and no iteration is more than 0.3 dB worse than the one before. Every DPD peak is ≤ the limit, with `tx_clipped` = 0. The output peak stays within 0.05 dB of `-(target + guard)` on every DPD iteration, and within a 0.05 dB band when the guard engages. GMP(5,5,2) on the sim: ≥ 20 dB ACLR gain and a flat output about 0.1 dB short of the target; its ACLR drift after pass 2 is documented, not asserted |
 | `test_operating_point.py` | `find_operating_point` on the sim bench: PAPR lock without backoff, backoff with the AGC (more ORx gain, less compression), gain lock with the clip guard, files written and rows appended, a CSV with other columns refused, TX disabled when the search raises |
-| `test_multiband.py` | §5.9 on a synthetic two-band PA, a linear coupled PA and the fake board's shared PA: both methods lock coupled bands; limits, clip guard, re-leveling; an ORx that never levels holds its attenuation; NaN readings are measured again; at max steps the radio is left where it was measured; the slope update (secant, bounds) and that it is what locks 0.6 dB/dB coupling in few steps; the ORx gain prediction; LO checks; a whole case (files, retakes, write-once, a fatal search, a failed write) |
+| `test_multiband.py` | §5.9 on a synthetic two-band PA, a linear coupled PA and the fake board's shared PA: both methods lock coupled bands; limits, clip guard, re-leveling; an ORx that never levels holds its attenuation; NaN readings are measured again; at max steps the radio is left where it was measured; the slope update (secant, bounds) and that it is what locks 0.6 dB/dB coupling in few steps; the ORx gain prediction; LO checks; a whole case (files, retakes, write-once, a fatal search, a failed write); the joint columns of `conditions.csv` (finite, one value per state, levels from the attenuations, lower when backed off) |
+| `test_joint_compression.py` | §3 joint figures on a memoryless Rapp PA driven by the true composite (1440 / 1860 MHz at 491.52 MSPS), each band's output taken from its own ±fs/2: joint compression > 0 and growing with drive; one band off = `gain_compression_db`; joint-CFR'd inputs need more drive for the same per-band compression and read alike at equal composite peak drive; the composite is `cfr_joint.composite` (a verbatim oracle, and the study itself when present); invariant to the input scale and to each output's gain and phase; levels add to the codes, only their difference matters, and move the figure the expected way; the sweep returns input figures only; joint AM/AM / AM/PM (linear: straight, no spread; top slope = `joint_compression`'s; memory raises the top spread; a weak band compressed by the strong one where the composite and the joint envelope peak); `joint_envelope` bounds the composite sample by sample |
 | `test_multiband_golden.py` | The search's full output on 30 noise-free benches, pinned (`tests/data/multiband_search_golden.json`) |
 | `test_notebook_linearize.py` | Runs `dpd_linearize_loop.ipynb` cell by cell on the sim bench (with `K, MEMORY, CROSS = 9, 1, 0` for the memoryless sim PA): PAPR lock, gain lock with `MIN_TOP_SLOPE = 0.08`, and a saved CSV row. Same ACLR, NMSE, peak and output-level checks, and the steps CSV columns. Skipped without matplotlib |
 
