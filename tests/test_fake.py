@@ -182,3 +182,19 @@ def test_delays_come_from_the_environment(monkeypatch):
     monkeypatch.setenv("ADRVTRX_FAKE_DELAYS", '{"Program": 0.25}')
     radio = _radio()
     assert radio.board_model.delays == {"Program": 0.25}
+
+
+def test_the_device_clock_and_the_ad9528_follow_the_programmed_profile():
+    """[clocks] device_clock_khz = 0 (the default): each profile's own deviceClock_kHz, AD9528 =
+    (device, 122.88 MHz VCXO, 122.88 MHz ref A, device); a profile without one keeps 245.76 MHz."""
+    radio = _radio()
+    radio.connect()
+    radio.program(profile=str(DATA / "stub_uc83c.profile"))
+    board = radio.board_model
+    assert board.clock_args == (184320, 122880, 122880, 184320)
+    assert (board.rate_hz, board.tx_bits) == (368.64e6, 16)
+    radio.program(profile=str(DATA / "stub_uc98.profile"))
+    assert board.clock_args == (245760, 122880, 122880, 245760)
+    radio.config.clocks.device_clock_khz = 200000  # a fixed clock overrides the profile's
+    radio.program(profile=str(DATA / "stub_uc83c.profile"))
+    assert board.clock_args == (200000, 122880, 122880, 200000)

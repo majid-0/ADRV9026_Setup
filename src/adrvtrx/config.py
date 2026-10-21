@@ -39,10 +39,18 @@ class BoardConfig:
     port: int = 55556
 
 
+#: Device clock when neither the config nor the profile gives one (UC98, 95C, 51C: 245.76 MHz).
+DEFAULT_DEVICE_CLOCK_KHZ = 245760
+
+
 @dataclass
 class ClocksConfig:
-    device_clock_khz: int = 245760
-    ad9528: list[int] = field(default_factory=lambda: [245760, 122880, 122880, 245760])
+    #: 0: the programmed profile's own ``clocks.deviceClock_kHz`` (a JESD204C profile may need
+    #: another device clock, e.g. 184.32 MHz for StdUseCase83C); a number fixes it.
+    device_clock_khz: int = 0
+    #: AD9528 ``ClockConfig(deviceClock_kHz, vcxoFreq_kHz, refAFreq_kHz, fpgaClock_kHz)``; a 0 is
+    #: the device clock.
+    ad9528: list[int] = field(default_factory=lambda: [0, 122880, 122880, 0])
     # Rx and Tx of a pair share an LO (the TX QEC init cal observes TX through the Rx path).
     rx12_lo: str = "LO1"
     rx34_lo: str = "LO2"
@@ -54,6 +62,17 @@ class ClocksConfig:
     pll2_lo_mode: str = "INTLO_NOOUTPUT"
     ext_lo1_khz: int = 0
     ext_lo2_khz: int = 0
+
+    def resolved(self, profile_device_clock_khz: int | None) -> tuple[int, list[int]]:
+        """``(device clock kHz, AD9528 ClockConfig arguments)`` for a profile whose own device clock
+        is ``profile_device_clock_khz`` (None: not readable, then :data:`DEFAULT_DEVICE_CLOCK_KHZ`).
+        """
+        dev = int(self.device_clock_khz or profile_device_clock_khz or DEFAULT_DEVICE_CLOCK_KHZ)
+        if len(self.ad9528) != 4:
+            raise ValueError(
+                f"[clocks] ad9528 needs 4 values (device, vcxo, refA, fpga), got {self.ad9528}"
+            )
+        return dev, [dev if int(v) == 0 else int(v) for v in self.ad9528]
 
 
 @dataclass
@@ -186,7 +205,7 @@ class Config:
     init_cals: InitCalsConfig = field(default_factory=InitCalsConfig)
     levels: LevelsConfig = field(default_factory=LevelsConfig)
     orx_agc: OrxAgcConfig = field(default_factory=OrxAgcConfig)
-    profile_name: str = "ADRV9025Init_StdUseCase98_LinkSharing.profile"
+    profile_name: str = "ADRV9025Init_StdUseCase95C_LinkSharing.profile"
     server: ServerConfig = field(default_factory=ServerConfig)
 
     @property

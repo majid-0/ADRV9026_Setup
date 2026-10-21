@@ -39,7 +39,9 @@ The PA model (:class:`PaModel`, on one period of the looping waveform, circular)
   ``drift_db_per_hour`` times the hours since the board object was created,
   plus ``drift_step_db`` once ``drift_step_after_s`` seconds have passed, plus
   the number in ``drift_file`` (read at every capture: drift on demand).
-* ``noise_codes`` (ORx noise per I and Q) and ``seed`` make it deterministic.
+* ``noise_codes`` (ORx noise per I and Q, in 12-bit codes: the analog noise is the same
+  fraction of full scale at any link width, so a 16-bit profile scales it by 16) and ``seed``
+  make it deterministic.
 
 Several TX into one PA (dual band): ``shared = [["TX1", "TX4"]]``. Each TX of a group
 gets its own ``w`` (its own attenuation, LO, drive and filters), and the other
@@ -195,7 +197,7 @@ class PaModel:
     delay_samples: int = 5
     orx_level: float = 0.73  # ORx output at saturation, gain index 210, x full scale
     orx_db_per_index: float = 0.5  # the ORx gain table's step (per TX in ``bands``: its ORx path)
-    noise_codes: float = 0.5
+    noise_codes: float = 0.5  # ORx noise per I and Q, 12-bit codes (scaled to the link's width)
     seed: int | None = None
     drift_db_per_hour: float = 0.0
     drift_step_db: float = 0.0
@@ -510,7 +512,8 @@ class FakeBoard:
         self.post_init = post
 
     def clock_config(self, *args: Any) -> None:
-        self._event("ClockConfig", args=[int(a) for a in args])
+        self.clock_args = tuple(int(a) for a in args)  # the last AD9528 ClockConfig
+        self._event("ClockConfig", args=list(self.clock_args))
 
     def program(self) -> None:
         self._require_connected()
@@ -640,7 +643,8 @@ class FakeBoard:
         return out
 
     def _noise(self, n: int) -> np.ndarray:
-        return self.pa.noise_codes * (self.rng.normal(size=n) + 1j * self.rng.normal(size=n))
+        scale = self.pa.noise_codes * _full_scale(self.rx_bits) / _full_scale(12)
+        return scale * (self.rng.normal(size=n) + 1j * self.rng.normal(size=n))
 
     def tx_lo_hz(self, tx: TxChannel) -> int:
         """The LO frequency ``tx`` uses (``[clocks]`` tx12_lo / tx34_lo)."""

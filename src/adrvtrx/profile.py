@@ -100,6 +100,17 @@ def read_profile(path: str | Path) -> ProfileInfo:
     )
 
 
+def profile_device_clock_khz(path: str | Path) -> int | None:
+    """The profile's own device clock (``clocks.deviceClock_kHz``), kHz; None when the file or the
+    field is missing."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    v = (data.get("clocks") or {}).get("deviceClock_kHz")
+    return int(v) if isinstance(v, (int, float)) and v > 0 else None
+
+
 def profile_rates_hz(path: str | Path) -> list[int]:
     """Every datapath rate of a profile (``txInputRate_kHz`` and every ``rxOutputRate_kHz``), Hz,
     ascending: a capture length must be whole samples at each of them."""
