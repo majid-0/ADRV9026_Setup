@@ -17,12 +17,15 @@ from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
 from adrvtrx.metrics import PA_CLIP_SLOPE
 from adrvtrx.multiband import (
+    JOINT_KEYS,
     METHODS,
     SLOPE_PRIOR,
+    BandCapture,
     BandLock,
     BandSpec,
     CaseWriter,
     MultibandSearch,
+    add_joint_metrics,
     capture_case,
     case_name,
     find_multiband_operating_point,
@@ -651,6 +654,43 @@ def test_a_whole_case_on_the_shared_pa(tmp_path):
 
     with pytest.raises(FileExistsError, match="written once"):
         writer.write_output(0, "TX1", res.captures[0][0].y_aligned)
+
+
+def test_every_conditions_row_carries_the_joint_compression_of_its_state(tmp_path):
+    radio = _case_radio()
+    fs = radio.board_model.rate_hz
+    bands = _case_bands()
+    writer = CaseWriter(tmp_path, bands, tx_bits=12, rx_bits=12, fs=fs)
+    res = find_multiband_operating_point(
+        radio, bands, tx_bits=12, rx_bits=12, fs=fs, backoffs=(0, 3), writer=writer
+    )
+    rows = list(csv.DictReader(open(res.case_dir / "conditions.csv", encoding="utf-8")))
+    assert len(rows) == 4 and all(k in rows[0] for k in JOINT_KEYS)
+    for r in rows:
+        for k in JOINT_KEYS:
+            if k != "joint_levels_db":
+                assert np.isfinite(float(r[k])), (k, r[k])
+        levels = [float(v) for v in r["joint_levels_db"].split("/")]
+        attens = [float(x["tx_atten_db"]) for x in rows if x["backoff_db"] == r["backoff_db"]]
+        assert levels == pytest.approx([min(attens) - a for a in attens], abs=0.01)
+    by_k = {}
+    for r in rows:  # one joint figure per state, the same on every band's row
+        by_k.setdefault(r["backoff_db"], set()).add(r["joint_gain_compression_db"])
+    assert all(len(v) == 1 for v in by_k.values())
+    j0, j3 = (float(next(iter(by_k[k]))) for k in ("0", "3"))
+    assert 0 < j3 < j0 - 0.5  # backing off lowers it
+    for c in res.captures[0]:
+        assert c.metrics["joint_gain_compression_db"] == pytest.approx(j0)
+
+
+def test_a_state_the_joint_figure_cannot_read_gets_nan_and_keeps_its_captures():
+    caps = [
+        BandCapture("TX1", 6.0, 0, None, np.ones(8, complex), 0.0, 0, {"x": 1.0}, ref=np.ones(8)),
+        BandCapture("TX4", 7.0, 0, None, np.ones(7, complex), 0.0, 0, {}, ref=np.ones(8)),
+    ]  # lengths differ
+    assert add_joint_metrics(_case_bands(), caps, 1e6) == {}
+    assert caps[0].metrics["x"] == 1.0 and np.isnan(caps[0].metrics["joint_gain_compression_db"])
+    assert caps[1].metrics["joint_levels_db"] == ""
 
 
 def test_a_fatal_search_captures_and_writes_nothing(tmp_path, monkeypatch):
