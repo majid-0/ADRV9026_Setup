@@ -31,3 +31,14 @@ def test_read_real_profile_if_present():
     info = read_profile(cfg.profile_path)
     assert info.rx_bits in (12, 16)
     assert info.tx_rate_khz > 0
+
+
+def test_the_device_clock_is_read_from_the_profile(tmp_path):
+    from pathlib import Path
+
+    from adrvtrx.profile import profile_device_clock_khz
+
+    data = Path(__file__).parent / "data"
+    assert profile_device_clock_khz(data / "stub_uc83c.profile") == 184320
+    assert profile_device_clock_khz(data / "stub_uc98.profile") is None
+    assert profile_device_clock_khz(tmp_path / "missing.profile") is None

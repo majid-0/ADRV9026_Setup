@@ -233,8 +233,11 @@ class Radio:
 
         dev.ConfigFileLoad(str(profile_path))
 
+        from .profile import profile_device_clock_khz
+
+        device_khz, ad9528 = cfg.clocks.resolved(profile_device_clock_khz(profile_path))
         init = dev.InitStructGet()
-        init.clocks.deviceClock_kHz = cfg.clocks.device_clock_khz
+        init.clocks.deviceClock_kHz = device_khz
         init.rx.rxInitChannelMask = cfg.channels.rx_init_mask
         init.tx.txInitChannelMask = cfg.channels.tx_init_mask
         init.clocks.rx12LoSelect = b.enum("adi_adrv9010_LoSel_e", _enums.LO_SEL[cfg.clocks.rx12_lo])
@@ -259,7 +262,7 @@ class Radio:
         post = self._build_post_mcs_init()
         dev.UtilityInitStructSet(post)
         dev.ConfigFileLoad()  # load default ARM/stream files (no-arg, order matters)
-        self.board.ClockConfig(*cfg.clocks.ad9528)
+        self.board.ClockConfig(*ad9528)
         self.board.Program()
 
         self._apply_levels()

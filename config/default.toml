@@ -15,13 +15,18 @@ port = 55556
 
 [profile]
 # Relative to <install_dir>\Resources\Adi.ADRV9025.Profiles\public\, or an absolute path.
-# UseCase98_LinkSharing: Tx 491.52 MSPS, jesd204Np = 12 (full scale 2047).
-name = "ADRV9025Init_StdUseCase98_LinkSharing.profile"
+# StdUseCase95C_LinkSharing: JESD204C, Tx / ORx 491.52 MSPS, jesd204Np = 16 (full scale 32767), device
+# clock 245.76 MHz. The bench's JESD204C mapping of the plan's profiles is in
+# multiband_setup/bench.toml [profiles] (95C 100 MHz, 51C 40 MHz, 83C 80 MHz; jesd204c_profiles.md).
+# The JESD204B profile was ADRV9025Init_StdUseCase98_LinkSharing.profile (jesd204Np = 12).
+name = "ADRV9025Init_StdUseCase95C_LinkSharing.profile"
 
 [clocks]
-device_clock_khz = 245760
-# AD9528 ClockConfig(deviceClock_kHz, vcxoFreq_kHz, refAFreq_kHz, fpgaClock_kHz)
-ad9528 = [245760, 122880, 122880, 245760]
+# 0: the programmed profile's own clocks.deviceClock_kHz (245.76 MHz for 95C / 51C, 184.32 MHz for 83C).
+device_clock_khz = 0
+# AD9528 ClockConfig(deviceClock_kHz, vcxoFreq_kHz, refAFreq_kHz, fpgaClock_kHz); 0 = the device clock
+# (TES for 83C: Ref A 122.88, VCXO 122.88, device 184.32 MHz).
+ad9528 = [0, 122880, 122880, 0]
 # Two independent bands. LO select is per pair (the hardware groups 1/2 and 3/4).
 # Band A: Rx1/2 + Tx1/2 + ORx1/2 -> LO1.   Band B: Rx3/4 + Tx3/4 + ORx3/4 -> LO2.
 # Rx and Tx of a pair MUST share an LO -- the TX QEC init cal observes TX through
