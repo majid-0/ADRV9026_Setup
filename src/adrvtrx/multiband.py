@@ -184,6 +184,10 @@ JOINT_SLOPE_PRIOR = 0.4
 #: guard's :data:`~adrvtrx.metrics.PA_CLIP_SLOPE`, for the joint top slope.
 JOINT_CLIP_GUARD_SLOPE = PA_CLIP_SLOPE
 
+#: Where every search starts, dB of TX attenuation (the owner's rule, 2026-10-21: always 30 dB; the
+#: bench has driver amplifiers in the TX paths). A band's own ``atten_start_db`` overrides it.
+ATTEN_START_DB = 30.0
+
 
 @dataclass
 class BandSpec:
@@ -200,7 +204,7 @@ class BandSpec:
     bw_mhz: float
     signal: Any
     target_db: float = 4.0
-    atten_start_db: float = 20.0
+    atten_start_db: float = ATTEN_START_DB
     atten_min_db: float = 10.0
     signal_name: str = ""
 

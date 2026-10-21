@@ -979,7 +979,7 @@ def test_a_band_describes_itself_for_case_json_and_conditions(tmp_path):
         "bw_mhz": 2.0,
         "signal": "Signal2.txt",
         "target_db": 4.0,
-        "atten_start_db": 20.0,
+        "atten_start_db": 30.0,  # ATTEN_START_DB
         "atten_min_db": 10.0,
     }
     writer = CaseWriter(tmp_path, _case_bands(), tx_bits=12, rx_bits=12, fs=10e6)
