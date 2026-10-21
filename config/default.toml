@@ -77,7 +77,9 @@ rx_gain_index = { default = 195 }   # applies to Rx1-4 and ORx1-4
 # Software ORx AGC: levels on the captured-IQ peak with a railed-sample clip veto
 # (ORx has no hardware AGC; RxDecPowerGet is range-compressed and RxGainGet reads 0,
 # so the gain index is tracked in software). See docs/development_debugging.md.
-target_dbfs    = -1.0   # desired ORx peak setpoint (dBFS)
+# The ORx clips below full scale with no railed code (about -0.4 dBFS on UC102), so a peak
+# above -1.5 dBFS counts as a clip too (gain.ORX_CLIP_DBFS): target + tol_up must stay below it.
+target_dbfs    = -2.0   # desired ORx peak setpoint (dBFS)
 tol_up_db      = 0.3    # accept up to target + this toward the rail
 tol_down_db    = 0.6    # accept down to target - this toward the floor
 coarse_ms      = 0.1    # short capture length for the coarse/fine stages (ms)

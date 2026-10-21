@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache, reduce
 from pathlib import Path
@@ -30,6 +31,7 @@ from .gain import (
     AgcError,
     ClipReport,
     autolevel_orx,
+    check_orx_window,
     clip_report,
     peak_window,
     verify_no_clip,
@@ -310,6 +312,49 @@ def capture(
     return result
 
 
+#: An ORx capture that comes back empty is taken again this many times, ``EMPTY_RETAKE_S`` apart,
+#: before :class:`~adrvtrx.gain.AgcError` (:func:`orx_capture`).
+EMPTY_RETAKES = 2
+EMPTY_RETAKE_S = 0.05
+
+
+def is_empty(cap: ChannelCapture) -> bool:
+    """No data: no samples, or every I and Q sample zero."""
+    return cap.i.size == 0 or not (np.any(cap.i) or np.any(cap.q))
+
+
+def orx_capture(
+    radio,
+    channel_mask: int,
+    capture_time_ms: float,
+    *,
+    bits: int,
+    retakes: int = EMPTY_RETAKES,
+    wait_s: float = EMPTY_RETAKE_S,
+) -> CaptureResult:
+    """:func:`capture` whose ORx channels must carry data: an empty ORx (:func:`is_empty`) is
+    captured again up to ``retakes`` times, ``wait_s`` apart; still empty raises
+    :class:`~adrvtrx.gain.AgcError`.
+
+    Bench, 2026-10-21 (UC102): ORX2 driven into clipping returned a capture of ORX2 with every
+    sample zero (peak -inf), and a plain retake returned data again. Every capture the ORx AGC
+    and the measurements level on goes through here, so no peak of -inf reaches them.
+    """
+    for _attempt in range(int(retakes) + 1):
+        res = capture(radio, channel_mask, capture_time_ms, bits=bits)
+        empty = [ch for ch, cap in res.channels.items() if is_orx(ch) and is_empty(cap)]
+        if not empty:
+            return res
+        if _attempt < retakes:
+            time.sleep(wait_s)
+    names = "/".join(ch.name for ch in empty)
+    raise AgcError(
+        f"{names} returned no data (all zeros) {int(retakes) + 1} times: the ORx was likely "
+        f"driven into clipping (it reads zeros after a clip on UC102); lower the ORx target / "
+        f"TX drive"
+    )
+
+
 def measure_delay(
     radio,
     channel: RxChannel,
@@ -367,7 +412,7 @@ def autolevel_capture(
     *,
     bits: int,
     orx_rate_hz: float,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     coarse_ms: float = 0.1,
@@ -397,15 +442,28 @@ def autolevel_capture(
     ``start_gain`` skips Stage A and trims from that gain (see :func:`autolevel_orx`).
     ``gain_min`` / ``gain_max`` bound the gain index (the floor is where Stage A starts and the
     lowest gain Stage C backs off to).
+
+    Every capture is an :func:`orx_capture`: an empty one is retaken, and still empty it leaves
+    the bench safe and raises :class:`~adrvtrx.gain.AgcError`. A window whose top reaches
+    :data:`~adrvtrx.gain.ORX_CLIP_DBFS` is a ``ValueError`` before the radio is touched.
     """
+    check_orx_window(target_dbfs, tol_up_db)
 
     def set_gain(g: int) -> None:
         radio.set_rx_gain(channel, g)
 
-    def coarse_measure() -> tuple[float, int]:
-        cap = capture(radio, int(channel), coarse_ms, bits=bits).channels[channel]
+    def measure(capture_ms: float) -> tuple[float, int]:
+        try:
+            cap = orx_capture(radio, int(channel), capture_ms, bits=bits).channels[channel]
+        except AgcError:  # empty after the retakes: leave the bench safe
+            radio.safe_state()
+            radio.disconnect()
+            raise
         rep = clip_report(cap.i, cap.q, bits)
         return rep.peak_dbfs, rep.railed_samples
+
+    def coarse_measure() -> tuple[float, int]:
+        return measure(coarse_ms)
 
     lr = autolevel_orx(
         set_gain,
@@ -438,9 +496,7 @@ def autolevel_capture(
     if verify_capture_ms is not None:
 
         def full_measure() -> tuple[float, int]:
-            cap = capture(radio, int(channel), verify_capture_ms, bits=bits).channels[channel]
-            rep = clip_report(cap.i, cap.q, bits)
-            return rep.peak_dbfs, rep.railed_samples
+            return measure(verify_capture_ms)
 
         vr = verify_no_clip(
             set_gain,
@@ -504,9 +560,10 @@ def aligned_capture(
     :func:`~adrvtrx.align.estimate_and_align`, or :func:`~adrvtrx.align.align_with_fraction`
     with ``fraction`` (the path's ``delay % 1``, known from an earlier full alignment). The
     capture-and-align step of the compression searches and of ``conditions.capture_point``.
+    An empty ORx capture is retaken (:func:`orx_capture`; still empty: ``AgcError``).
     """
     ref = np.asarray(ref)
-    out = capture(radio, int(channel), reference_capture_ms(ref, fs, oversample), bits=bits)
+    out = orx_capture(radio, int(channel), reference_capture_ms(ref, fs, oversample), bits=bits)
     raw = out.channels[channel]
     rep = clip_report(raw.i, raw.q, bits)
     iq = raw.iq
@@ -532,6 +589,7 @@ def aligned_captures(
     ``refs`` (one per channel, equal lengths: one ``PerformTx`` plays them) and ``fractions``
     (one per channel, ``None`` for a full alignment) as in :func:`aligned_capture`. The channels
     must sit on different readback slots (two ORx inputs on one ORx ADC cannot be read together).
+    An empty ORx capture is retaken (:func:`orx_capture`; still empty: ``AgcError``).
     """
     refs = [np.asarray(r) for r in refs]
     if len({len(r) for r in refs}) != 1:
@@ -542,7 +600,7 @@ def aligned_captures(
     mask = 0
     for ch in channels:
         mask |= int(ch)
-    out = capture(radio, mask, reference_capture_ms(refs[0], fs, oversample), bits=bits)
+    out = orx_capture(radio, mask, reference_capture_ms(refs[0], fs, oversample), bits=bits)
     result = []
     for ch, ref, frac in zip(channels, refs, fractions):
         raw = out.channels[ch]
@@ -571,7 +629,7 @@ def autolevel_for(
     bits: int,
     fs: float,
     oversample: int = 2,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     start_gain: int | None = None,

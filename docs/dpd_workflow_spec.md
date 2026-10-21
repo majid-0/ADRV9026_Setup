@@ -271,7 +271,7 @@ class CompressionResult:
 search_tx_compression(set_tx_atten, set_orx_gain, measure, *,
     target_compression_db, start_atten_db, atten_min_db, orx_gain,
     coarse_step_db=10.0, fine_step_db=0.25, comp_tol_db=0.3,
-    target_dbfs=-1.0, tol_up_db=0.3, tol_down_db=0.6,
+    target_dbfs=-2.0, tol_up_db=0.3, tol_down_db=0.6,
     gain_min=185, gain_max=255, db_per_index=0.5,
     atten_max_db=41.95, max_iterations=24, min_top_slope=None,
     on_step=None) -> CompressionResult

@@ -8,7 +8,8 @@ reference, optionally followed by a dict of extra readings that is recorded in
 the history (``papr_compression_db``, ``gain_compression_db``, ``top_slope``).
 
 A compression reading only counts once the ORx peak is inside the AGC band with
-no railed sample (or the signal is below the band at maximum gain). Lowering TX
+no clip (:func:`adrvtrx.gain.orx_clipped`: no railed sample, peak at most
+``ORX_CLIP_DBFS``), or the signal is below the band at maximum gain. Lowering TX
 attenuation lowers the ORx gain by the same number of dB in that step so the ADC
 does not clip on the next capture. Attenuation never goes below ``atten_min_db``.
 
@@ -33,7 +34,15 @@ import numpy as np
 
 from ._enums import RxChannel, TxChannel
 from .capture import aligned_capture, autolevel_for
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep, relevel_index
+from .gain import (
+    ORX_DB_PER_INDEX,
+    ORX_GAIN_MAX,
+    ORX_GAIN_MIN,
+    OrxStep,
+    check_orx_window,
+    orx_clipped,
+    relevel_index,
+)
 from .metrics import gain_compression_db, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
 
@@ -106,7 +115,7 @@ def search_tx_compression(
     coarse_step_db: float = 10.0,
     fine_step_db: float = 0.25,
     comp_tol_db: float = 0.3,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     gain_min: int = ORX_GAIN_MIN,
@@ -141,7 +150,13 @@ def search_tx_compression(
     The multi-band search (:func:`adrvtrx.multiband.search_multiband_compression`) uses the
     same rules with other defaults (coarse 2.5 dB, fine 0.2 dB, tolerance 0.1 dB, clip guard on);
     its docstring says why.
+
+    A clipped ORx capture (:func:`~adrvtrx.gain.orx_clipped`) never counts and lowers the ORx
+    gain; at the minimum gain it stops the search (``fatal``). A reading with no data (peak not
+    finite) stops it too (``fatal``). The window's top must be below
+    :data:`~adrvtrx.gain.ORX_CLIP_DBFS` (``ValueError``).
     """
+    check_orx_window(target_dbfs, tol_up_db)
     if atten_min_db > start_atten_db:
         raise ValueError(
             f"atten_min_db ({atten_min_db}) must be <= start_atten_db ({start_atten_db})"
@@ -158,7 +173,7 @@ def search_tx_compression(
         return int(min(max(int(g), gain_min), gain_max))
 
     def in_band(peak: float, railed: int) -> bool:
-        return railed == 0 and band_lo <= peak <= band_hi
+        return not orx_clipped(peak, railed) and band_lo <= peak <= band_hi
 
     def step_for(error_db: float) -> float:
         return fine_step(error_db, fine_step_db, coarse_step_db)
@@ -218,12 +233,25 @@ def search_tx_compression(
         reading = measure()
         peak, railed, comp = float(reading[0]), int(reading[1]), float(reading[2])
         extra = dict(reading[3]) if len(reading) > 3 and reading[3] is not None else {}
+        if not math.isfinite(peak):  # no data (an empty capture): nothing to level on
+            rec = {"atten_db": atten, "orx_gain": gain, "peak_dbfs": peak, "railed": railed,
+                   "compression_db": comp, **extra, "orx_ok": False}  # fmt: skip
+            record(rec, "ORx returned no data, stop")
+            return finish(
+                False,
+                "ORx returned no data (peak not finite): the ORx was likely driven into clipping",
+                fatal=True,
+                comp=comp,
+                peak=peak,
+                railed=railed,
+                extra=extra,
+            )
         leveled = in_band(peak, railed)
         cold_at_max = (not leveled) and railed == 0 and peak < band_lo and gain >= gain_max
         trusted = leveled or cold_at_max
         orx.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi, drive=atten)
         closest = orx.closest(target_dbfs) if orx.jumped and not trusted else None
-        if closest is not None and closest[0] == gain and railed == 0:
+        if closest is not None and closest[0] == gain and not orx_clipped(peak, railed):
             trusted = True  # 1-index steps jump the window: the capture closest to the target
         rec = {
             "atten_db": atten,
@@ -337,7 +365,7 @@ def search_tx_compression(
                 atten = new
                 gain = clamp_gain(gain + orx.indices(delta))
                 action = f"TX atten +{delta:.2f} dB"
-        elif (railed > 0 or peak > band_hi) and gain <= gain_min:
+        elif (orx_clipped(peak, railed) or peak > band_hi) and gain <= gain_min:
             new = quantize_atten(min(atten_max_db, atten + fine_step_db))
             record(rec, f"ORx railed at gain floor; TX atten +{new - atten:.2f} dB, stop")
             atten = new
@@ -394,7 +422,7 @@ def find_compression_point(
     coarse_step_db: float = 10.0,
     fine_step_db: float = 0.25,
     comp_tol_db: float = 0.3,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     max_iterations: int = 24,

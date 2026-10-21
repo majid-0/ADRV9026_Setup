@@ -121,7 +121,7 @@ class LevelsConfig:
 
 @dataclass
 class OrxAgcConfig:
-    target_dbfs: float = -1.0
+    target_dbfs: float = -2.0
     tol_up_db: float = 0.3
     tol_down_db: float = 0.6
     coarse_ms: float = 0.1

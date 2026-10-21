@@ -122,7 +122,7 @@ def test_ceiling_reached():
     calls = []
 
     def measure():
-        return -1.0, 0, 5.0  # always too much compression, always leveled
+        return -2.0, 0, 5.0  # always too much compression, always leveled
 
     res = search_tx_compression(
         lambda db: calls.append(db),
@@ -158,7 +158,7 @@ def test_rails_at_gain_floor_is_fatal():
 
 
 def test_untrusted_reading_only_moves_orx_gain():
-    readings = iter([(-10.0, 0, 9.9), (-1.0, 0, 3.0)])
+    readings = iter([(-10.0, 0, 9.9), (-2.0, 0, 3.0)])
 
     res = search_tx_compression(
         lambda db: None,
@@ -170,13 +170,13 @@ def test_untrusted_reading_only_moves_orx_gain():
         orx_gain=200,
     )
     assert res.converged
-    assert res.history[0]["action"] == "ORx gain +18"
+    assert res.history[0]["action"] == "ORx gain +16"
     assert res.history[1]["atten_db"] == 20.0
 
 
 def test_max_iterations_returns_closest():
     def measure():
-        return -1.0, 0, 2.0 if state["atten"] > 15.0 else 4.0
+        return -2.0, 0, 2.0 if state["atten"] > 15.0 else 4.0
 
     state = {"atten": 20.0}
 

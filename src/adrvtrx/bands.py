@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from ._enums import RxChannel, RxTrigSource, TxChannel, is_orx
-from .capture import CaptureResult, capture
+from .capture import CaptureResult, capture, orx_capture
 from .gain import autolevel_orx, clip_report
 from .transmit import transmit_bands
 
@@ -56,7 +56,7 @@ def run_bands(
     out_dir: str | Path,
     trig: RxTrigSource | None = None,
     level_orx_channels: bool = True,
-    orx_target_dbfs: float = -1.0,
+    orx_target_dbfs: float = -2.0,
     orx_tol_up_db: float = 0.3,
     orx_tol_down_db: float = 0.6,
     orx_coarse_ms: float = 0.1,
@@ -79,7 +79,7 @@ def run_bands(
                 ch = b.capture_channel
 
                 def _measure(c: RxChannel = ch) -> tuple[float, int]:
-                    one = capture(radio, int(c), orx_coarse_ms, bits=rx_bits).channels[c]
+                    one = orx_capture(radio, int(c), orx_coarse_ms, bits=rx_bits).channels[c]
                     rep = clip_report(one.i, one.q, rx_bits)
                     return rep.peak_dbfs, rep.railed_samples
 

@@ -8,12 +8,13 @@ backs them off together and saves one case folder.
 ``measure(bands)``, one snapshot reading those bands). One step sets every band's attenuation and
 ORx gain and takes ONE snapshot: a capture that reads every band's ORx (``PerformRx`` returns them
 all), so a step costs one capture, not one per band (``snapshot=False``: one capture per band,
-for a pair the ``two_orx_snapshot`` bench check failed). A reading counts when it has no railed
-sample, a peak between ``target_dbfs - 3`` and 0 dBFS and a finite compression, even outside the
+for a pair the ``two_orx_snapshot`` bench check failed). A reading counts when it has no clip
+(:func:`~adrvtrx.gain.orx_clipped`: no railed sample, peak at most ``ORX_CLIP_DBFS``), a peak
+from ``target_dbfs - 3`` up and a finite compression, even outside the
 ORx AGC window (its gain is still corrected for the next step), or below the window at the
 maximum gain. A reading that does not count moves only its ORx gain and the band is captured
 again (up to ``max_relevel`` times; still not counting, it keeps its attenuation that step). The
-re-level learns each ORx's dB per index (:class:`~adrvtrx.gain.OrxStep`). A railed capture, or
+re-level learns each ORx's dB per index (:class:`~adrvtrx.gain.OrxStep`). A clipped capture, or
 one hotter than the window, at the minimum ORx gain stops the search (``fatal``), that band one
 clip step (0.2 dB) up. When no band moved for two steps in a row and every band not within
 tolerance was at its limit or held at an unchanged ORx gain, the search stops. Every band's
@@ -94,7 +95,14 @@ from .capture import aligned_capture, aligned_captures, autolevel_for, shares_or
 from .compression import fine_step, quantize_atten
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep
+from .gain import (
+    ORX_DB_PER_INDEX,
+    ORX_GAIN_MAX,
+    ORX_GAIN_MIN,
+    OrxStep,
+    check_orx_window,
+    orx_clipped,
+)
 from .metrics import (
     PA_CLIP_SLOPE,
     SHARE_LEVELS,
@@ -168,7 +176,7 @@ SLOPE_PRIOR = (0.31, 0.06)
 OWN_SLOPE_BOUNDS = (0.1, 1.5)
 #: The clip guard's step up, and the fatal stop's (the single-band fine step).
 CLIP_STEP_DB = 0.2
-#: A reading counts with its peak this far below ``target_dbfs`` (and up to 0 dBFS, not railed).
+#: A reading counts with its peak this far below ``target_dbfs`` (and up, not clipped).
 USABLE_BELOW_DB = 3.0
 #: The worst error "grew" (trust region) when it rose by more than this (reading noise).
 GROW_MARGIN_DB = 0.05
@@ -411,14 +419,15 @@ def _evaluate(i: int, m, step: int, dt: float, rules: _Rules, state: _State) -> 
     extra = dict(rest[0]) if rest and rest[0] is not None else {}
     peak, railed, comp = float(peak), int(railed), float(comp)
     g = int(state.g[i])
-    in_window = railed == 0 and rules.band_lo <= peak <= rules.band_hi
-    usable = railed == 0 and rules.target_dbfs - USABLE_BELOW_DB <= peak <= 0.0
+    clipped = orx_clipped(peak, railed)  # a railed sample, or a peak above ORX_CLIP_DBFS
+    in_window = not clipped and rules.band_lo <= peak <= rules.band_hi
+    usable = not clipped and rules.target_dbfs - USABLE_BELOW_DB <= peak
     cold_at_max = railed == 0 and peak < rules.band_lo and g >= rules.gain_max
-    fatal = (railed > 0 or peak > rules.band_hi) and g <= rules.gain_min
+    fatal = (clipped or peak > rules.band_hi) and g <= rules.gain_min
     orx = state.orx[i]
     orx.observe(g, peak, railed, band_lo=rules.band_lo, band_hi=rules.band_hi, drive=tuple(state.a))
     closest = orx.closest(rules.target_dbfs) if orx.jumped else None
-    taken = closest is not None and closest[0] == g and railed == 0  # 1-index steps jump it
+    taken = closest is not None and closest[0] == g and not clipped  # 1-index steps jump it
     counts = not fatal and math.isfinite(comp) and (usable or cold_at_max or taken)
     row = {
         "step": step,
@@ -482,8 +491,8 @@ def _read_step(step: int, rules: _Rules, state: _State, measure, set_gain):
                 continue
             orx = state.orx[i]
             closest = orx.closest(rules.target_dbfs) if orx.jumped else None
-            usable_level = r.railed == 0 and (
-                rules.target_dbfs - USABLE_BELOW_DB <= r.peak <= 0.0
+            usable_level = not orx_clipped(r.peak, r.railed) and (
+                rules.target_dbfs - USABLE_BELOW_DB <= r.peak
                 or (r.peak < rules.band_lo and state.g[i] >= rules.gain_max)
             )
             if usable_level:  # level fine, compression not finite: measure again
@@ -911,7 +920,7 @@ def search_multiband_compression(
     slope_prior: Sequence[float] = SLOPE_PRIOR,
     slopes: Sequence[Sequence[float]] | None = None,
     comp_tol_db: float = 0.1,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     gain_min: int = ORX_GAIN_MIN,
@@ -965,6 +974,7 @@ def search_multiband_compression(
         if k in REMOVED_ARGS:
             raise ValueError(f"{k} was removed: {REMOVED_ARGS[k]}")
         raise TypeError(f"search_multiband_compression() got an unexpected keyword argument {k!r}")
+    check_orx_window(target_dbfs, tol_up_db)
     _check_method(method)
     prior = _check_prior(slope_prior)
     guard = resolve_joint_clip(lock_on, joint_clip_slope)
@@ -1508,7 +1518,8 @@ def _band_reader(radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fract
         if learn is not None:
             target, up, down = learn
             for i, (peak, railed, _c, extra) in zip(idx, got):
-                if i not in fractions and railed == 0 and -down <= peak - target <= up:
+                leveled = not orx_clipped(peak, railed) and -down <= peak - target <= up
+                if i not in fractions and leveled:
                     fractions[i] = float(extra["delay_samples"]) % 1.0
         return got
 
@@ -1547,7 +1558,7 @@ def lock_bands(
     retune: bool = True,
     method: str = "joint",
     oversample: int = 2,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     probe: ProbeSettings | None = None,
@@ -1704,7 +1715,7 @@ def capture_case(
     fs: float,
     oversample: int = 2,
     agc: bool = True,
-    target_dbfs: float = -1.0,
+    target_dbfs: float = -2.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     check: Callable[[list[BandCapture]], dict[str, dict]] | None = None,
@@ -1720,7 +1731,8 @@ def capture_case(
     ``-tol_down_db``) within the gain indices ``gain_min`` .. ``gain_max``.
 
     ``check(captures)`` -> ``{band name: {"ok": bool, ...}}`` sees every band of the state at once
-    (pairing needs both). A failing band is captured again (re-leveled first when it railed), up to
+    (pairing needs both). A failing band is captured again (re-leveled first when it clipped:
+    :func:`~adrvtrx.gain.orx_clipped`), up to
     ``retakes`` times;
     its last check result stays in :attr:`BandCapture.check`.
 
@@ -1728,7 +1740,7 @@ def capture_case(
     The ORx gain cannot be read back (``RxGainGet`` returns 0 on the chip; the gain is tracked in
     software), so ``agc=False`` needs ``gains``: each :class:`BandCapture` records the gain set.
     With ``agc=True``, ``gains`` (optional) is where each band's AGC starts its fine trim instead
-    of the gain floor (a gain predicted from the lock); a railed retake levels from the floor.
+    of the gain floor (a gain predicted from the lock); a clipped retake levels from the floor.
     """
     if gains is not None and len(gains) != len(bands):
         raise ValueError(f"gains needs one ORx gain index per band, got {list(gains)}")
@@ -1804,7 +1816,8 @@ def capture_case(
         if not failing or attempt == retakes:
             break
         for i in failing:
-            out[i] = take(i, out[i].tries + 1, relevel=out[i].railed > 0)
+            clipped = orx_clipped(out[i].peak_dbfs, out[i].railed)
+            out[i] = take(i, out[i].tries + 1, relevel=clipped)
     add_joint_metrics(bands, out, fs)  # type: ignore[arg-type]
     return out  # type: ignore[return-value]
 
