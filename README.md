@@ -166,6 +166,14 @@ res = find_multiband_operating_point(radio, bands, tx_bits=12, rx_bits=12, fs=36
 writer.write_case_json()   # after the run: the case folder must be empty when it starts
 ```
 
+To lock the joint gain compression of the composite instead of each band's own, pass
+`lock_on="joint", joint_target_db=4.2` (both bands move together, keeping the level difference
+of their start attenuations or `joint_levels_db`; each `atten_min_db` stays a hard floor). The
+joint clip guard (`joint_clip_slope`: on at 0.08 in joint mode, off in per-band mode by
+default) backs every band off together when the joint AM/AM top slope falls below it. Every
+capture also logs the share of samples at the top of the joint envelope and a joint clip
+indicator, and `case.json` the inputs' composite PAPR (`inputs`).
+
 The case folder's files are described in [docs/dpd_workflow_spec.md](docs/dpd_workflow_spec.md)
 §5.9; `load_conditions` and replay do not read them.
 

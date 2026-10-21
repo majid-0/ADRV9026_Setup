@@ -50,11 +50,15 @@ gain stays (the gain-compression lock sees it). ``coupling`` sets the strength (
 a 4 dB lock, about 0.1 dB of compression per dB of the other band at 1, 0.3 at 4,
 0.45 at 8). Only TX that are enabled feed the PA. Each ORx sees its own band; with
 ``other_in_window`` it also sees the other members' outputs, shifted by their LO
-offset, when that offset is inside the ORx window (closely spaced bands). ``tx_skew_samples``
-delays a TX before the PA (``{"TX4": 2}``), and ``tx_image_db`` adds the TX IQ
-image ``10**(tx_image_db/20) * conj(x)`` before the drive. ``bands`` holds
-per-TX overrides of any other parameter (``{"TX4": {"smoothness": 1.2}}``), as a
-fitted preset needs.
+offset, when that offset is inside the ORx window (closely spaced bands). With
+``joint_envelope`` every member of a group compresses on the group's joint envelope instead,
+``sum_k |w_k|`` (the composite's peak over the beat between the carriers):
+``g_b = w_b / (1 + (sum_k |w_k| / sat_b)**(2p))**(1/(2p))``, so a band is compressed where the
+composite peaks, not at its own peaks (a large ``smoothness`` clips the composite hard;
+``coupling`` is not used). ``tx_skew_samples`` delays a TX before the PA (``{"TX4": 2}``),
+and ``tx_image_db`` adds the TX IQ image ``10**(tx_image_db/20) * conj(x)`` before the drive.
+``bands`` holds per-TX overrides of any other parameter (``{"TX4": {"smoothness": 1.2}}``), as
+a fitted preset needs.
 
 The default ``PaModel()`` is the simple memoryless Rapp (``drive = 6``, ``p = 2``,
 no memory, no frequency dependence, no drift). ``PaModel.rich()`` is a PA with
@@ -201,6 +205,7 @@ class PaModel:
     shared: list[list[str]] = field(default_factory=list)  # TX groups that drive one PA
     coupling: float = 1.0  # how much the other members' mean power cuts a band's headroom
     other_in_window: bool = False  # ORx also sees the other members when inside its window
+    joint_envelope: bool = False  # a shared group compresses on sum_k |w_k| (the composite's peak)
     tx_skew_samples: dict[str, int] = field(default_factory=dict)  # TX name -> delay before the PA
     tx_image_db: float = -300.0  # TX IQ image (conj(x)) relative to x; -300 = none
     bands: dict[str, dict[str, Any]] = field(default_factory=dict)  # TX name -> overrides
@@ -333,6 +338,11 @@ class PaModel:
         for tx, (x_norm, atten_db, lo_hz) in inputs.items():
             model = self.for_tx(tx)
             fronts[tx] = (model, *model._front(x_norm, atten_db, lo_hz, drift_db, tx))
+        if self.joint_envelope:  # every member compressed on the group's joint envelope
+            env = sum(np.abs(w) for _m, w, _s, _k in fronts.values())
+            return {
+                tx: model._back(w, env**2, sat, mem) for tx, (model, w, sat, mem) in fronts.items()
+            }
         mean_power = {tx: float(np.mean(np.abs(w) ** 2)) for tx, (_m, w, _s, _k) in fronts.items()}
         out = {}
         for tx, (model, w, sat, mem) in fronts.items():

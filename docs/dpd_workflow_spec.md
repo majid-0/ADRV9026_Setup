@@ -212,10 +212,18 @@ gain_compression_db(x, s, *, peak_frac=0.975, small_frac=0.2,
 PA_CLIP_SLOPE = 0.08
 levels_from_attens(attens_db, path_gains_db=None) -> list[float]   # 0 dB = the strongest band
 joint_compression(xs, ys, fs, freqs_hz, *, levels_db=None, oversample=4.0,
-    peak_frac=0.975, small_frac=0.2) -> dict
+    peak_frac=0.975, small_frac=0.2, clip_slope=JOINT_CLIP_SLOPE) -> dict
     # joint_gain_compression_db, joint_top_slope, joint_papr_in_db, joint_papr_out_db,
     # joint_papr_compression_db, band_compression_at_joint_peaks_db (per band),
-    # pe_papr_in_db, joint_refit_gain_db, spacing_hz, offsets_hz, levels_db, upsample
+    # pe_papr_in_db, joint_refit_gain_db, spacing_hz, offsets_hz, levels_db, upsample,
+    # joint_clipping (joint_top_slope < clip_slope, 0.08), band_top_gain_drop_db and
+    # band_top_phase_drop_deg (per band, joint_top_drop), joint_env_above_0p8 / _0p9
+joint_top_drop(xs, ys, levels_db=None, *, top_frac=0.98, ref_band=(0.5, 0.8)) -> dict
+    # per band: gain_drop_db (gain in ref_band minus gain at the top of joint_envelope),
+    # phase_drop_deg (phase at the top minus in ref_band); understates a real clip
+envelope_shares(xs, levels_db=None, fracs=(0.8, 0.9)) -> dict   # joint_env_above_0p8, ...
+input_metrics(xs, fs, freqs_hz, *, levels_db=None) -> dict
+    # composite_papr_db, pe_papr_db, joint_env_above_0p8 / _0p9, spacing_hz, levels_db
 joint_compression_sweep(xs, ys, fs, spacings_hz, *, levels_db=None, oversample=4.0) -> dict
     # spacing_hz, joint_papr_in_db (per spacing), pe_papr_in_db, levels_db: inputs only
 joint_amam_ampm(xs, ys, fs, freqs_hz, *, levels_db=None, bins=40, oversample=4.0) -> dict
@@ -583,7 +591,9 @@ BandSpec(tx, orx, lo, freq_hz, bw_mhz, signal, target_db=4.0,
 search_multiband_compression(set_atten, set_gain, measure, *, targets_db,
     start_attens_db, atten_mins_db, orx_gains, names=None, method="joint",
     max_move_db=4.0, slope_prior=(0.31, 0.06), comp_tol_db=0.1, ..., max_steps=20,
-    max_relevel=6, min_top_slope=PA_CLIP_SLOPE, snapshot=True, on_step=None)
+    max_relevel=6, min_top_slope=PA_CLIP_SLOPE, snapshot=True, on_step=None,
+    lock_on="per_band", joint_target_db=None, joint_levels_db=None,
+    joint_slope_prior=0.4, joint_clip_slope="default", joint=None)
     -> MultibandSearch
 lock_bands(radio, bands, *, tx_bits, rx_bits, fs, probe=None, snapshot=None, ...)
     -> (MultibandSearch, refs)
@@ -606,8 +616,16 @@ find_multiband_operating_point(radio, bands, *, tx_bits, rx_bits, fs,
   the state at once; a failing band is captured again. Then the state's joint
   compression (`add_joint_metrics`: §3 `joint_compression` of every band's
   reference and output, levels from the TX attenuations with equal path gains)
-  goes into every capture's metrics. It is reported only: the search steers on
-  each band's own compression.
+  goes into every capture's metrics, with the share of samples at or above 0.8
+  and 0.9 of the joint envelope's maximum (`joint_env_above_0p8`, `_0p9`) and
+  the joint clip indicator (`joint_clipping`: `joint_top_slope < 0.08`; per band
+  `joint_top_gain_drop_db` / `joint_top_phase_drop_deg`, its gain and phase at
+  the top 2 % of the joint envelope against the 0.5..0.8 range). The indicator
+  is an early warning that **understates** a real clip: each ORx averages the
+  gain over the beat between the carriers, and a clip's intermodulation falls
+  outside the observed bands (on a fake PA that clips the composite hard the
+  joint top slope bottoms out near 0.07..0.1 while each band's top gain drop
+  saturates near 4.8 dB).
 - A fatal search (an ORx that clips at its minimum gain) captures and writes
   nothing. TX is off when the call ends or fails.
 - The search stops early when no band moved for two steps and every band not
@@ -628,6 +646,35 @@ band goes into `case.json` and `conditions.csv`, the timing of every capture and
 the probe; without it (the default) the lock runs on the full signals. `probe_fidelity` /
 `fidelity_report` check a probe design on any saved full-signal capture.
 
+**The joint lock** (`lock_on="joint"`, with `joint_target_db`). The lock targets the joint gain
+compression of the composite (§3 `joint_compression` of each step's readings, levels from the
+attenuations) instead of each band's own. Every band keeps a fixed level difference,
+`joint_levels_db` (per band, relative; `None` / `"start"`: the difference of the start
+attenuations; quantized to 0.05 dB), so the search is 1-D on a common offset `c` (the strongest
+band's attenuation): a secant step from `joint_slope_prior` (0.4 dB of joint GC per dB; the bench
+backoffs read 0.31..0.56), learnt each step and held to 0.1..1.5, with the trust region of the
+per-band search. The bands start at the common offset that keeps none below its start. Each band's
+`atten_min_db` stays a hard floor: a band that reaches it below the target stops the lock (`at
+limit`, the reason names the band and the joint compression there). With the probe the joint
+figure is read on the probe (it cuts every band at the same indices; on the fake board the probe
+reads the full signal's joint GC within 0.01..0.03 dB), then confirmed on the 0 dB capture of the
+full signals (`confirm`: `joint_gc_full_db`, `joint_offset_db`), with at most `confirm_steps`
+joint steps on full captures from the prior when it is off. The result (`MultibandSearch.joint`:
+`target_db, achieved_db, top_slope, levels_db, common_atten_db, steps, slope_db_per_db`) goes into
+`case.json` (`lock_on`, `lock_joint`, and per band in `lock`) and `conditions.csv` (`lock_on`,
+`joint_target_db, joint_lock_db, joint_lock_levels_db, joint_lock_steps`). Each `lock.csv` row
+of a step that read it also has `joint_gain_compression_db, joint_top_slope` (joint mode:
+`common_atten_db`, and `error_db` is the joint error). A joint lock costs one composite per step
+(about 1.2 s at 491.52 MSPS on the full signal, little on the probe).
+
+**The joint clip guard** (`joint_clip_slope`, both modes; `"default"`: off in `per_band`, 0.08 in
+`joint`): a step where every reading counts and the joint top slope is below it backs every band
+off together by the clip step (0.2 dB, more when the composite is over the target) and raises every
+band's floor there; a target that then needs more drive stops `clip-limited` with the reason
+(`MultibandSearch.joint["clip_guard"]`). It reads one composite per step. Like the indicator it
+understates a real clip; on the probe the joint top slope reads a little lower than on the full
+signal (0.25 against 0.28 on the fake joint-envelope PA).
+
 **Case folder** (`CaseWriter(run_dir, bands, ...)`): `<run_dir>/<case>/`, with
 `<case>` = `TX1-TX4_1440-1860MHz_80-80BW_4-4GC` (paths, carriers in MHz,
 bandwidths, compression targets). Write-once: a file that exists is an error,
@@ -641,7 +688,7 @@ touches the radio (if writing still fails, the error carries the result as
 | `<case>_<k>dB_<TX>_out.txt` | The aligned ORx period of each band at each backoff, ORx codes / full scale |
 | `conditions.csv` | One row per backoff per band (below) |
 | `lock.csv` | The search's history, one row per capture: `step, band, atten_db, orx_gain, peak_dbfs, railed, gain_compression_db, papr_compression_db, top_slope, leveled, error_db, move_db, action, slopes` (`slopes`: J as JSON, slopes method) |
-| `case.json` | Written by the caller after the run (`write_case_json(extra)`): `case_name, written_at, bands` (each `BandSpec.describe()`: `name, tx, orx, lo, freq_hz, bw_mhz, signal, target_db, atten_start_db, atten_min_db`), `fs_hz`, `lock` (per band: `band, atten_db, orx_gain, gain_compression_db, top_slope, status`), then `meta` and `extra` |
+| `case.json` | Written by the caller after the run (`write_case_json(extra)`): `case_name, written_at, bands` (each `BandSpec.describe()`: `name, tx, orx, lo, freq_hz, bw_mhz, signal, target_db, atten_start_db, atten_min_db`), `fs_hz`, `lock` (per band: `band, atten_db, orx_gain, gain_compression_db, top_slope, status`; a joint lock adds `lock_on, joint_target_db, joint_lock_db, joint_lock_levels_db, joint_lock_steps`), `lock_details` (`lock_on`, `lock_joint`, ...), `inputs` (`case_inputs` at the lock's attenuations: `composite_papr_db` at the real carriers, `pe_papr_db` (spacing free, `sum_k |x_k|`), `joint_env_above_0p8`, `joint_env_above_0p9`, `spacing_hz`, `levels_db`, `attens_db`), then `meta` and `extra` |
 
 `conditions.csv` columns, in order: the `row_meta` keys (default `case,
 version, profile, program_id`, from `meta`), `band, tx, orx, lo, freq_hz,
@@ -655,7 +702,11 @@ the state's joint figures (`joint_gain_compression_db, joint_top_slope,
 joint_papr_in_db, joint_papr_compression_db, joint_levels_db` (every band's
 level, `0/-1.6`), and the band's own `joint_band_compression_db`, its
 compression where the composite peaks; NaN when they cannot be computed),
-then `fs_hz, tries, check_ok, check, out_file, in_file`.
+`joint_env_above_0p8, joint_env_above_0p9, joint_clipping` and the band's own
+`joint_top_gain_drop_db, joint_top_phase_drop_deg`, then `fs_hz, tries,
+check_ok, check, out_file, in_file`. The lock columns also have `lock_on` and,
+for a joint lock, `joint_target_db, joint_lock_db, joint_lock_levels_db,
+joint_lock_steps`.
 
 This is not the single-band capture CSV of §4.1: it has no `name`,
 `compression_db` or `converged` column, so `load_conditions`,
@@ -704,6 +755,7 @@ models:
 | `test_operating_point.py` | `find_operating_point` on the sim bench: PAPR lock without backoff, backoff with the AGC (more ORx gain, less compression), gain lock with the clip guard, files written and rows appended, a CSV with other columns refused, TX disabled when the search raises |
 | `test_multiband.py` | §5.9 on a synthetic two-band PA, a linear coupled PA and the fake board's shared PA: both methods lock coupled bands; limits, clip guard, re-leveling; an ORx that never levels holds its attenuation; NaN readings are measured again; at max steps the radio is left where it was measured; the slope update (secant, bounds) and that it is what locks 0.6 dB/dB coupling in few steps; the ORx gain prediction; LO checks; a whole case (files, retakes, write-once, a fatal search, a failed write); the joint columns of `conditions.csv` (finite, one value per state, levels from the attenuations, lower when backed off) |
 | `test_joint_compression.py` | §3 joint figures on a memoryless Rapp PA driven by the true composite (1440 / 1860 MHz at 491.52 MSPS), each band's output taken from its own ±fs/2: joint compression > 0 and growing with drive; one band off = `gain_compression_db`; joint-CFR'd inputs need more drive for the same per-band compression and read alike at equal composite peak drive; the composite is `cfr_joint.composite` (a verbatim oracle, and the study itself when present); invariant to the input scale and to each output's gain and phase; levels add to the codes, only their difference matters, and move the figure the expected way; the sweep returns input figures only; joint AM/AM / AM/PM (linear: straight, no spread; top slope = `joint_compression`'s; memory raises the top spread; a weak band compressed by the strong one where the composite and the joint envelope peak); `joint_envelope` bounds the composite sample by sample |
+| `test_joint_lock.py` | §5.9 the joint lock on the fake board's shared PA and on a PA that compresses on the joint envelope (`joint_envelope`): it reaches 4.2 dB joint GC from 10 dB away in at most 7 snapshots, keeps the level difference on every step (default and given levels), starts at the offset that keeps every band at or above its start, stops at a band's floor naming it, refuses bad settings; the probe's joint GC is the full signal's within 0.1 dB and the 0 dB capture confirms it; a full signal off its target takes joint steps from the prior; the joint clip guard backs every band off together and stops clip-limited on a PA that clips the composite, in both modes, does not fire on the bench PA at the usual targets, and per-band mode reads nothing joint with it off; every capture carries the envelope shares and the joint clip indicator, and `case.json` the inputs' composite figures; `joint_top_drop` is 0 on a linear PA and grows into a clip |
 | `test_multiband_golden.py` | The search's full output on 30 noise-free benches, pinned (`tests/data/multiband_search_golden.json`) |
 | `test_notebook_linearize.py` | Runs `dpd_linearize_loop.ipynb` cell by cell on the sim bench (with `K, MEMORY, CROSS = 9, 1, 0` for the memoryless sim PA): PAPR lock, gain lock with `MIN_TOP_SLOPE = 0.08`, and a saved CSV row. Same ACLR, NMSE, peak and output-level checks, and the steps CSV columns. Skipped without matplotlib |
 
