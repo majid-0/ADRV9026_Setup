@@ -34,9 +34,17 @@ __all__ = [
     "joint_compression_sweep",
     "joint_amam_ampm",
     "joint_envelope",
+    "envelope_shares",
+    "share_key",
+    "joint_top_drop",
+    "input_metrics",
     "composite_signal",
     "composite_pair",
     "levels_from_attens",
+    "JOINT_CLIP_SLOPE",
+    "JOINT_TOP_FRAC",
+    "JOINT_REF_BAND",
+    "SHARE_LEVELS",
     "nmse_db",
     "aclr_db",
     "inband_corr",
@@ -162,6 +170,17 @@ def gain_compression_db(
     if np.count_nonzero(sel) >= 2:
         slope = float(np.polyfit(sum_a[sel] / counts[sel], sum_b[sel] / counts[sel], 1)[0])
     return comp, slope
+
+
+#: ``joint_clipping`` (:func:`joint_compression`) is ``joint_top_slope`` below this: the per-band
+#: clip guard's :data:`PA_CLIP_SLOPE`, for the composite.
+JOINT_CLIP_SLOPE = PA_CLIP_SLOPE
+#: :func:`joint_top_drop`: the top of the joint envelope (this fraction of its maximum and up) ...
+JOINT_TOP_FRAC = 0.98
+#: ... against each band's gain and phase where the joint envelope is in this range of its maximum.
+JOINT_REF_BAND = (0.5, 0.8)
+#: :func:`envelope_shares`: the fractions of the joint envelope's maximum whose share is logged.
+SHARE_LEVELS = (0.8, 0.9)
 
 
 def levels_from_attens(attens_db, path_gains_db=None) -> list[float]:
@@ -312,6 +331,107 @@ def joint_envelope(xs, levels_db=None) -> np.ndarray:
     return sum(np.abs(x) * s for x, s in zip(xs, scale))
 
 
+def share_key(frac: float) -> str:
+    """The column of :func:`envelope_shares`' share above ``frac``: ``joint_env_above_0p8``."""
+    return f"joint_env_above_{float(frac):g}".replace(".", "p")
+
+
+def envelope_shares(xs, levels_db=None, fracs=SHARE_LEVELS) -> dict[str, float]:
+    """The share of samples (0 .. 1) where :func:`joint_envelope` is at or above each of
+    ``fracs`` of its maximum, keyed by :func:`share_key` (``joint_env_above_0p8``,
+    ``joint_env_above_0p9``).
+
+    How dense the top of the joint envelope is: the samples a selection by the joint envelope can
+    pick there (the original S20-100 signals hold 0.07 % above 0.8, their joint-CFR versions 1.7 %).
+    NaN when every input is zero."""
+    env = joint_envelope(xs, levels_db)
+    peak = float(env.max())
+    if not peak > 0.0:
+        return {share_key(f): float("nan") for f in fracs}
+    return {share_key(f): float(np.mean(env >= float(f) * peak)) for f in fracs}
+
+
+def joint_top_drop(
+    xs,
+    ys,
+    levels_db=None,
+    *,
+    top_frac: float = JOINT_TOP_FRAC,
+    ref_band: tuple[float, float] = JOINT_REF_BAND,
+    small_frac: float = 0.2,
+) -> dict[str, list[float]]:
+    """Each band's gain and phase at the top of the joint envelope against lower down: a clip
+    indicator per band.
+
+    With ``a = joint_envelope(xs, levels_db) / max`` (the bands' own rate and index) and each band's
+    output divided by its own small-signal gain ``g0_k`` (as :func:`joint_compression`), a band's
+    gain over a set of samples is ``10*log10(sum|y_k/g0_k|^2 / sum|x_k|^2)`` and its phase the angle
+    of ``sum (y_k/g0_k) * conj(x_k)`` (only its samples at or above :data:`BAND_FLOOR` of its own
+    peak). Returns per band:
+
+    * ``gain_drop_db``: its gain where ``ref_band[0] <= a < ref_band[1]`` minus its gain where
+      ``a >= top_frac`` (positive: the gain falls at the top);
+    * ``phase_drop_deg``: its phase at the top minus its phase in ``ref_band``, degrees (signed).
+
+    The reference is the middle of the envelope, not the small-signal region, so the figure is the
+    extra compression at the very top: a clip shows as a drop that grows fast with drive. NaN for a
+    band that is off or has no small-signal gain, or a region without samples. Like the joint
+    compression it understates a real clip: each ORx averages the gain over the beat between the
+    carriers, and the intermodulation of a clip falls outside the observed bands.
+    """
+    xs, ys, lv = _bands_in(xs, ys, levels_db)
+    nan = float("nan")
+    out: dict[str, list[float]] = {
+        "gain_drop_db": [nan] * len(xs),
+        "phase_drop_deg": [nan] * len(xs),
+    }
+    env = joint_envelope(xs, lv)
+    peak = float(env.max())
+    if ys is None or not peak > 0.0:
+        return out
+    a = env / peak
+    top = a >= float(top_frac)
+    ref = (a >= float(ref_band[0])) & (a < float(ref_band[1]))
+    for k, (x, y) in enumerate(zip(xs, ys)):
+        ax = np.abs(x)
+        pk = float(ax.max())
+        g0 = _small_signal_gain(x, y, ax < small_frac * pk) if pk > 0.0 else None
+        if not g0:
+            continue
+        z = y / g0
+        on = ax >= BAND_FLOOR * pk
+        g_top, p_top = _gain_phase(x, z, top & on)
+        g_ref, p_ref = _gain_phase(x, z, ref & on)
+        out["gain_drop_db"][k] = float(g_ref - g_top)
+        out["phase_drop_deg"][k] = float(np.rad2deg(np.angle(np.exp(1j * (p_top - p_ref)))))
+    return out
+
+
+def _gain_phase(x: np.ndarray, z: np.ndarray, m: np.ndarray) -> tuple[float, float]:
+    """``x -> z``'s power-ratio gain (dB) and mean phase (radians) over the samples ``m``."""
+    den = float(np.sum(np.abs(x[m]) ** 2))
+    num = float(np.sum(np.abs(z[m]) ** 2))
+    if not (den > 0.0 and num > 0.0):
+        return float("nan"), float("nan")
+    return 10.0 * np.log10(num / den), float(np.angle(np.sum(z[m] * np.conj(x[m]))))
+
+
+def input_metrics(xs, fs: float, freqs_hz, *, levels_db=None, oversample: float = 4.0) -> dict:
+    """The joint figures of the inputs alone (a case's inputs at its levels):
+    ``composite_papr_db``, the PAPR of :func:`composite_signal` at the bands' real carriers;
+    ``pe_papr_db``, the spacing-free ``max(sum_k |x_k|)^2 / sum_k mean|x_k|^2``; the
+    :func:`envelope_shares` (``joint_env_above_0p8``, ``joint_env_above_0p9``); ``spacing_hz``
+    and ``levels_db``."""
+    c = _composite_pair(xs, None, fs, freqs_hz, levels_db, oversample, 0.2, None)
+    return {
+        "composite_papr_db": papr_db(c["X"]) if c["X"] is not None else float("nan"),
+        "pe_papr_db": c["pe_papr_in_db"],
+        **envelope_shares(xs, c["levels_db"]),
+        "spacing_hz": c["spacing_hz"],
+        "levels_db": c["levels_db"],
+    }
+
+
 def composite_signal(
     xs, fs: float, freqs_hz, *, levels_db=None, oversample: float = 4.0
 ) -> tuple[np.ndarray, float]:
@@ -359,6 +479,7 @@ def joint_compression(
     oversample: float = 4.0,
     peak_frac: float = PEAK_REGION,
     small_frac: float = 0.2,
+    clip_slope: float = JOINT_CLIP_SLOPE,
 ) -> dict[str, Any]:
     """Gain compression of the composite signal several bands make at one PA.
 
@@ -408,7 +529,16 @@ def joint_compression(
       mean|x_k|^2`` at the bands' own rate (above ``joint_papr_in_db`` but for the
       inter-sample peaks it misses);
     * ``joint_refit_gain_db``; ``spacing_hz`` (highest minus lowest carrier); ``offsets_hz``;
-      ``levels_db``; ``upsample`` (the factor used).
+      ``levels_db``; ``upsample`` (the factor used);
+    * the joint clip indicator: ``joint_clipping``, ``joint_top_slope < clip_slope``
+      (:data:`JOINT_CLIP_SLOPE`, the per-band clip guard's 0.08; False when the slope is NaN), and
+      per band ``band_top_gain_drop_db`` / ``band_top_phase_drop_deg`` (:func:`joint_top_drop`: its
+      gain and phase at the top 2 % of the joint envelope against the 0.5 .. 0.8 range). An early
+      warning that **understates** a real clip: each ORx averages the gain over the beat between
+      the carriers, and the intermodulation of a clip falls outside the observed bands. For scale,
+      on the S20-100 bench captures ``joint_top_slope`` was 0.15 (original signals, 3 dB per band),
+      0.28 .. 0.30 (joint-CFR signals, 3 dB per band) and 0.61 (1 dB per band);
+    * :func:`envelope_shares` of the inputs (``joint_env_above_0p8``, ``joint_env_above_0p9``).
 
     A band whose input is all zero is off: it is left out (its band figure is NaN). Output
     figures are NaN when a band that is on has no small-signal gain.
@@ -426,6 +556,10 @@ def joint_compression(
         "band_compression_at_joint_peaks_db": [nan] * len(c["levels_db"]),
         "pe_papr_in_db": c["pe_papr_in_db"],
         "joint_refit_gain_db": nan,
+        "joint_clipping": False,
+        "band_top_gain_drop_db": [nan] * len(c["levels_db"]),
+        "band_top_phase_drop_deg": [nan] * len(c["levels_db"]),
+        **envelope_shares(xs, c["levels_db"]),
         **_layout(c),
     }
     X, Y = c["X"], c["Y"]
@@ -448,8 +582,12 @@ def joint_compression(
         if den > 0.0 and num > 0.0:
             bands[k] = float(-10.0 * np.log10(num / den))
     papr_out = papr_db(Y)
+    drop = joint_top_drop(xs, ys, c["levels_db"], small_frac=small_frac)
     out.update(
         {
+            "joint_clipping": bool(np.isfinite(slope) and slope < clip_slope),
+            "band_top_gain_drop_db": drop["gain_drop_db"],
+            "band_top_phase_drop_deg": drop["phase_drop_deg"],
             "joint_gain_compression_db": comp,
             "joint_top_slope": slope,
             "joint_papr_out_db": papr_out,

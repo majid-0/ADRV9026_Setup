@@ -46,6 +46,27 @@ with the smallest worst-band error among the steps where every reading counted i
 the last step: the radio is left where it was measured. The walk and the old ``slopes`` method
 were removed (``joint`` replaces both).
 
+What the lock targets (``lock_on``):
+
+* ``"per_band"`` (default): each band's own gain compression, as above.
+* ``"joint"``: ``joint_target_db``, the joint gain compression of the composite of every band
+  (:func:`~adrvtrx.metrics.joint_compression` of the step's readings, levels from the
+  attenuations). Every band keeps a fixed level difference, ``joint_levels_db`` (per band,
+  relative; default the difference of the start attenuations; quantized to the 0.05 dB attenuator
+  step), so the search is one-dimensional, on a common offset ``c`` (the strongest band's
+  attenuation, every band at ``c - level``): a secant step from a slope prior
+  (:data:`JOINT_SLOPE_PRIOR`, dB of joint compression per dB of ``c``, learnt from each step,
+  held to 0.1 .. 1.5) with the same trust region (moves capped at ``max_move_db``, a step that
+  makes the error grow undone halfway, the cap halved). Each band's ``atten_min_db`` stays a hard
+  floor: when one band reaches it below the target the search stops and says which band and at
+  what joint compression. The per-band clip guard still applies (it backs every band off together).
+
+The joint clip guard (``joint_clip_slope``, both modes): a step where every reading counts and
+the joint top slope is below it backs every band off together by the clip step and raises every
+band's floor there; a target that then needs more drive stops ``clip-limited`` with the reason.
+Off (None) by default in ``per_band`` mode, :data:`JOINT_CLIP_GUARD_SLOPE` in ``joint`` mode.
+Like the joint figure it understates a real clip (each ORx averages the gain over the beat).
+
 :func:`find_multiband_operating_point` runs it on hardware (a :class:`~adrvtrx.radio.Radio` or
 the hardware server's ``RemoteRadio``): retune, play every TX in one ``PerformTx``, ORx AGC per
 band, the search, then per backoff every band ``+k`` dB, ORx AGC per band, one capture per band
@@ -76,10 +97,13 @@ from .config import ClocksConfig, lo_for_tx
 from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep
 from .metrics import (
     PA_CLIP_SLOPE,
+    SHARE_LEVELS,
     gain_compression_db,
+    input_metrics,
     joint_compression,
     levels_from_attens,
     period_metrics,
+    share_key,
     window_compression_db,
 )
 from .probe import ProbeSettings
@@ -89,7 +113,10 @@ from .waveform import prepare_tx
 
 __all__ = [
     "METHODS",
+    "LOCK_ON",
     "SLOPE_PRIOR",
+    "JOINT_SLOPE_PRIOR",
+    "JOINT_CLIP_GUARD_SLOPE",
     "BandSpec",
     "BandLock",
     "MultibandSearch",
@@ -105,6 +132,12 @@ __all__ = [
     "capture_case",
     "add_joint_metrics",
     "JOINT_KEYS",
+    "JOINT_SHARE_KEYS",
+    "JOINT_CLIP_KEYS",
+    "case_inputs",
+    "joint_reader",
+    "joint_levels",
+    "resolve_joint_clip",
     "find_multiband_operating_point",
     "case_name",
     "CaseWriter",
@@ -141,6 +174,15 @@ USABLE_BELOW_DB = 3.0
 GROW_MARGIN_DB = 0.05
 #: Pingpong: a band's turn ends within tolerance or after this many steps.
 TURN_STEPS = 3
+#: What the lock targets: each band's own gain compression, or the joint one of the composite.
+LOCK_ON = ("per_band", "joint")
+#: ``lock_on="joint"``: dB of joint gain compression per dB of the common attenuation offset, as a
+#: magnitude. The S20-100 bench captures backed off 1 dB at a time read 0.31 (joint-CFR signals)
+#: to 0.56 (original signals); the own + cross per-band prior is 0.37.
+JOINT_SLOPE_PRIOR = 0.4
+#: The joint clip guard's default in ``joint`` mode (``per_band``: off): the per-band clip
+#: guard's :data:`~adrvtrx.metrics.PA_CLIP_SLOPE`, for the joint top slope.
+JOINT_CLIP_GUARD_SLOPE = PA_CLIP_SLOPE
 
 
 @dataclass
@@ -212,7 +254,10 @@ class MultibandSearch:
     ``timing`` holds ``captures_s`` (each snapshot's time, capture and reading) and, from
     :func:`lock_bands`, ``agc_s``, ``swaps_s`` and ``total_s``. ``probe`` (a lock on the probe
     signal, :func:`lock_bands` ``probe``) and ``confirm`` (the full-signal confirmation,
-    :func:`confirm_lock`) describe them.
+    :func:`confirm_lock`) describe them. ``lock_on`` is what the lock targeted; ``joint`` the
+    joint result (``lock_on="joint"``: ``target_db``, ``achieved_db``, ``top_slope``,
+    ``levels_db``, ``common_atten_db``, ``steps``, ``slope_db_per_db``; with the joint clip guard
+    on, ``clip_slope`` and ``clip_guard`` once it fired; empty when neither).
     """
 
     converged: bool
@@ -229,6 +274,8 @@ class MultibandSearch:
     timing: dict = field(default_factory=dict)
     probe: dict = field(default_factory=dict)
     confirm: dict = field(default_factory=dict)
+    lock_on: str = "per_band"
+    joint: dict = field(default_factory=dict)
 
 
 def prior_slopes(n: int, prior: Sequence[float] = SLOPE_PRIOR) -> np.ndarray:
@@ -301,6 +348,7 @@ class _Rules:
     min_top_slope: float | None
     snapshot: bool
     turn_steps: int
+    joint_clip: float | None = None  # the joint clip guard (None: off)
 
     def clamp_gain(self, g: float) -> int:
         return int(min(max(int(round(g)), self.gain_min), self.gain_max))
@@ -333,6 +381,7 @@ class _State:
     snapshots: int = 0
     capture_s: list[float] = field(default_factory=list)
     idle_steps: int = 0  # steps in a row where nothing moved and no band could (see _idle)
+    joint_clip_hit: dict | None = None  # the joint clip guard's last firing (step, slope, attens)
 
 
 @dataclass
@@ -348,6 +397,7 @@ class _Reading:
     row: dict | None = None  # None: a band never read
     fatal: bool = False  # the ORx clips (or is hot) at its minimum gain
     in_window: bool = False  # inside the ORx AGC window
+    extra: dict | None = None  # the measure's extra (the aligned output: the joint figure needs it)
 
 
 def _evaluate(i: int, m, step: int, dt: float, rules: _Rules, state: _State) -> _Reading:
@@ -394,6 +444,7 @@ def _evaluate(i: int, m, step: int, dt: float, rules: _Rules, state: _State) -> 
         row,
         fatal,
         in_window,
+        extra,
     )
 
 
@@ -482,6 +533,10 @@ class _Classes:
     within: list[bool]  # within tolerance
     stuck: list[bool]  # below target at its limit
     worst: float  # largest |err|
+    joint: dict | None = (
+        None  # the step's joint reading (the joint clip guard on, every reading counts)
+    )
+    joint_clipped: bool = False  # the joint clip guard fires: joint top slope below it
 
 
 def _classify(readings: list[_Reading], rules: _Rules, state: _State) -> _Classes:
@@ -509,6 +564,7 @@ def _remember(readings: list[_Reading], cls: _Classes, state: _State) -> None:
     if (
         cls.trusted
         and not any(cls.clipped)
+        and not cls.joint_clipped
         and (state.best is None or cls.worst < state.best["worst"])
     ):
         state.best = {
@@ -529,10 +585,24 @@ def _remember(readings: list[_Reading], cls: _Classes, state: _State) -> None:
 def _fixed_moves(readings: list[_Reading], cls: _Classes, rules: _Rules, state: _State):
     """The moves set by a rule rather than solved for: clip guard, at limit, not counted.
 
-    Returns ``(moves, fixed, actions)``. The clip guard raises the band's floor.
+    Returns ``(moves, fixed, actions)``. The clip guard raises the band's floor; the joint clip
+    guard backs every band off together (at least the clip step) and raises every floor there.
     """
     n = len(readings)
     mv, fixed, actions = np.zeros(n), [False] * n, [""] * n
+    if cls.joint_clipped:
+        slope = cls.joint["joint_top_slope"]
+        for i in range(n):
+            up = CLIP_STEP_DB
+            if cls.clipped[i] and -cls.err[i] > 0:
+                up = max(up, fine_step(-cls.err[i], CLIP_STEP_DB, rules.max_move_db))
+            new = quantize_atten(min(rules.atten_max_db, state.a[i] + up))
+            state.floor[i] = max(state.floor[i], new)
+            state.clip_floor[i] = True
+            mv[i], fixed[i] = new - state.a[i], True
+            actions[i] = f"joint clip guard (joint top slope {slope:.3f} < {rules.joint_clip:g})"
+        state.joint_clip_hit = {"joint_top_slope": float(slope), "attens_db": state.a.tolist()}
+        return mv, fixed, actions
     for i in range(n):
         if cls.clipped[i]:
             over = -cls.err[i]
@@ -578,6 +648,11 @@ def _trust(cls: _Classes, fixed: list[bool], rules: _Rules, state: _State, only=
         worst = _worst_free(cls, fixed)
     else:
         worst = abs(cls.err[only]) if cls.ok[only] and not fixed[only] else None
+    return _trust_step(worst, rules, state)
+
+
+def _trust_step(worst: float | None, rules: _Rules, state: _State) -> bool:
+    """:func:`_trust` given the step's worst error (None: nothing a move can help)."""
     prev, state.prev_worst = state.prev_worst, worst
     if worst is None or prev is None:
         state.undone = False
@@ -758,6 +833,65 @@ def _check_prior(prior) -> tuple[float, float]:
     return own, cross
 
 
+def _check_lock_on(lock_on: str) -> None:
+    if lock_on not in LOCK_ON:
+        raise ValueError(f"lock_on must be one of {LOCK_ON}, got {lock_on!r}")
+
+
+def resolve_joint_clip(lock_on: str, joint_clip_slope: Any = "default") -> float | None:
+    """The joint clip guard's slope: ``"default"`` is off (None) in ``per_band`` mode and
+    :data:`JOINT_CLIP_GUARD_SLOPE` in ``joint`` mode; None is off; a number is checked (0 .. 1)."""
+    _check_lock_on(lock_on)
+    if isinstance(joint_clip_slope, str):
+        if joint_clip_slope != "default":
+            raise ValueError(
+                f"joint_clip_slope is 'default', None or 0 .. 1, got {joint_clip_slope!r}"
+            )
+        return JOINT_CLIP_GUARD_SLOPE if lock_on == "joint" else None
+    if joint_clip_slope is None:
+        return None
+    v = float(joint_clip_slope)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"joint_clip_slope {joint_clip_slope!r} outside 0 .. 1 (None: off)")
+    return v
+
+
+def joint_levels(levels_db, starts_db: Sequence[float]) -> np.ndarray:
+    """The joint lock's level per band, dB relative to the strongest band (0), on the 0.05 dB
+    attenuator grid: ``levels_db`` (None or ``"start"``: the difference of ``starts_db``, the start
+    attenuations, as :func:`~adrvtrx.metrics.levels_from_attens`)."""
+    n = len(starts_db)
+    if levels_db is None or (isinstance(levels_db, str) and levels_db == "start"):
+        lv = np.asarray(levels_from_attens(list(starts_db)), dtype=float)
+    elif isinstance(levels_db, str):
+        raise ValueError(
+            f"joint_levels_db is 'start', None or one level per band, got {levels_db!r}"
+        )
+    else:
+        lv = np.asarray([float(v) for v in levels_db], dtype=float)
+    if lv.shape != (n,) or not np.all(np.isfinite(lv)):
+        raise ValueError(
+            f"joint_levels_db needs one finite level per band ({n}), got {levels_db!r}"
+        )
+    lv = np.round(lv * 20.0) / 20.0
+    return lv - lv.max()
+
+
+def _joint_fields(j: dict | None) -> dict:
+    """A step's joint reading as history-row columns."""
+    nan = float("nan")
+    j = j or {}
+    return {
+        "joint_gain_compression_db": float(j.get("joint_gain_compression_db", nan)),
+        "joint_top_slope": float(j.get("joint_top_slope", nan)),
+    }
+
+
+def _read_joint(joint, readings: list[_Reading], state: _State) -> dict:
+    """The step's joint reading: ``joint(extras, attens)`` on every band's reading."""
+    return dict(joint([r.extra or {} for r in readings], [float(a) for a in state.a]))
+
+
 def search_multiband_compression(
     set_atten: Callable[[int, float], None],
     set_gain: Callable[[int, int], None],
@@ -786,6 +920,12 @@ def search_multiband_compression(
     turn_steps: int = TURN_STEPS,
     snapshot: bool = True,
     on_step: Callable[[list[dict]], None] | None = None,
+    lock_on: str = "per_band",
+    joint_target_db: float | None = None,
+    joint_levels_db: Sequence[float] | str | None = None,
+    joint_slope_prior: float = JOINT_SLOPE_PRIOR,
+    joint_clip_slope: float | str | None = "default",
+    joint: Callable[[list[dict], list[float]], dict] | None = None,
     **removed: Any,
 ) -> MultibandSearch:
     """Lock every band within ``±comp_tol_db`` of its target together (see the module docstring).
@@ -796,6 +936,16 @@ def search_multiband_compression(
     captures each band alone). ``slopes`` starts ``J`` from a matrix (a search continued) instead
     of ``slope_prior``. ``on_step(rows)`` gets each step's rows (one per band). The radio is left
     at the returned attenuations and gains.
+
+    ``lock_on="joint"`` locks the joint gain compression on ``joint_target_db`` instead (the
+    module docstring): ``joint(extras, attens)`` -> the step's joint reading (at least
+    ``joint_gain_compression_db`` and ``joint_top_slope``) from every band's ``extra`` and the
+    attenuations (:func:`joint_reader`, e.g. :func:`~adrvtrx.metrics.joint_compression`);
+    ``joint_levels_db`` the level per band (:func:`joint_levels`), ``joint_slope_prior`` the
+    secant's start. ``joint_clip_slope`` is the joint clip guard (:func:`resolve_joint_clip`:
+    ``"default"`` off in ``per_band`` mode, 0.08 in ``joint`` mode); it needs ``joint`` too.
+    Each history row then also has ``joint_gain_compression_db`` and ``joint_top_slope`` (and in
+    joint mode ``common_atten_db``; its ``error_db`` is the joint error).
 
     The defaults differ from the single-band :func:`~adrvtrx.compression.search_tx_compression`
     (tolerance 0.3 dB, clip guard off), and stay so:
@@ -813,6 +963,7 @@ def search_multiband_compression(
         raise TypeError(f"search_multiband_compression() got an unexpected keyword argument {k!r}")
     _check_method(method)
     prior = _check_prior(slope_prior)
+    guard = resolve_joint_clip(lock_on, joint_clip_slope)
     n = len(targets_db)
     if not (len(start_attens_db) == len(atten_mins_db) == len(orx_gains) == n):
         raise ValueError(
@@ -824,6 +975,14 @@ def search_multiband_compression(
         raise ValueError(f"comp_tol_db must be positive, got {comp_tol_db}")
     if not max_move_db > 0:
         raise ValueError(f"max_move_db must be positive, got {max_move_db}")
+    if (lock_on == "joint" or guard is not None) and joint is None:
+        raise ValueError("lock_on='joint' and the joint clip guard need joint= (the joint reading)")
+    if lock_on == "joint":
+        if joint_target_db is None or not float(joint_target_db) > 0:
+            raise ValueError(f"lock_on='joint' needs joint_target_db > 0, got {joint_target_db!r}")
+        lo, hi = OWN_SLOPE_BOUNDS
+        if not lo <= float(joint_slope_prior) <= hi:
+            raise ValueError(f"joint_slope_prior {joint_slope_prior!r} outside {lo} .. {hi} dB/dB")
     rules = _Rules(
         targets=np.asarray(targets_db, dtype=float),
         names=list(names) if names is not None else [f"band{i + 1}" for i in range(n)],
@@ -840,6 +999,7 @@ def search_multiband_compression(
         min_top_slope=min_top_slope,
         snapshot=bool(snapshot),
         turn_steps=int(turn_steps),
+        joint_clip=guard,
     )
     floor = np.array([quantize_atten(m) for m in atten_mins_db])
     for i, s in enumerate(start_attens_db):
@@ -867,7 +1027,7 @@ def search_multiband_compression(
 
     def finish(converged: bool, reason: str, readings, err, *, fatal=False) -> MultibandSearch:
         apply()
-        return MultibandSearch(
+        out = MultibandSearch(
             converged,
             reason,
             method,
@@ -880,11 +1040,24 @@ def search_multiband_compression(
             snapshot=rules.snapshot,
             slopes=np.round(state.jac, 4).tolist(),
             timing={"captures_s": list(state.capture_s)},
+            lock_on=lock_on,
         )
+        if guard is not None:
+            out.joint = {"clip_slope": guard}
+            if state.joint_clip_hit is not None:
+                out.joint["clip_guard"] = dict(state.joint_clip_hit)
+        return out
 
     def report(rows: list[dict]) -> None:
         if on_step:
             on_step(rows)
+
+    if lock_on == "joint":
+        lv = joint_levels(joint_levels_db, list(start_attens_db))
+        return _search_joint(
+            rules, state, lv, float(joint_target_db), float(joint_slope_prior), joint,
+            measure, set_gain, apply, finish, report, max_steps,
+        )  # fmt: skip
 
     stop = "max steps"
     for step in range(max_steps):
@@ -901,9 +1074,19 @@ def search_multiband_compression(
                 fatal=True,
             )
         cls = _classify(readings, rules, state)
+        if guard is not None and cls.trusted:  # the joint clip guard reads the composite
+            cls.joint = _read_joint(joint, readings, state)
+            js = float(cls.joint.get("joint_top_slope", float("nan")))
+            cls.joint_clipped = math.isfinite(js) and js < guard
+            for r in readings:
+                r.row.update(_joint_fields(cls.joint))
         _remember(readings, cls, state)
 
-        if not any(cls.clipped) and all(w or s for w, s in zip(cls.within, cls.stuck)):
+        if (
+            not any(cls.clipped)
+            and not cls.joint_clipped
+            and all(w or s for w, s in zip(cls.within, cls.stuck))
+        ):
             rows = [r.row for r in readings]
             for row in rows:
                 row["action"] = "converged" if all(cls.within) else row["action"] or "done"
@@ -912,6 +1095,19 @@ def search_multiband_compression(
             if all(cls.within):
                 return finish(True, "every band within tolerance", readings, cls.err)
             held = ", ".join(rules.names[i] for i, s in enumerate(cls.stuck) if s)
+            hit = state.joint_clip_hit
+            if hit is not None and any(
+                s and state.clip_floor[i] for i, s in enumerate(cls.stuck)
+            ):  # the floor is the joint clip guard's
+                return finish(
+                    False,
+                    f"{held} held by the joint clip guard (joint top slope "
+                    f"{hit['joint_top_slope']:.3f} < {guard:g} with less attenuation): the "
+                    "targets need more drive than the PA takes without joint clipping; the others "
+                    "within tolerance",
+                    readings,
+                    cls.err,
+                )
             return finish(
                 False,
                 f"{held} at the attenuation limit below target; the others within tolerance",
@@ -980,6 +1176,195 @@ def search_multiband_compression(
         state.last["readings"],
         state.last["err"],
     )
+
+
+def _search_joint(
+    rules: _Rules,
+    state: _State,
+    lv: np.ndarray,
+    target: float,
+    slope: float,
+    joint,
+    measure,
+    set_gain,
+    apply,
+    finish,
+    report,
+    max_steps: int,
+) -> MultibandSearch:
+    """``lock_on="joint"`` (the module docstring): one common offset ``c``, every band at
+    ``c - lv``, steered on the joint gain compression of each step's readings."""
+    n, tol, guard = len(lv), rules.comp_tol_db, rules.joint_clip
+    names = rules.names
+    # c's range: every band at or above its floor and at most the attenuator's maximum
+    c_floor = float(np.max(state.floor + lv))
+    binding = int(np.argmax(state.floor + lv))  # the band whose floor c reaches first
+    c_max = quantize_atten(rules.atten_max_db + float(np.min(lv)))
+    if c_floor > c_max + 1e-9:
+        raise ValueError(
+            f"joint levels {lv.tolist()} dB: no common offset keeps every band between its limit "
+            f"and {rules.atten_max_db} dB"
+        )
+    c = quantize_atten(min(max(float(np.max(state.a + lv)), c_floor), c_max))
+    clip_by: dict | None = None  # the clip guard that raised c's floor (per-band or joint)
+    prev: tuple[float, float] | None = None  # (c, joint GC) of the last counted step
+    last_move = 0.0
+    best: dict | None = None
+    last: dict | None = None
+
+    def attens(cv: float) -> np.ndarray:
+        return np.array([quantize_atten(cv - v) for v in lv])
+
+    def done(converged: bool, reason: str, readings, jerr: float, j: dict | None, steps_c, **kw):
+        out = finish(converged, reason, readings, np.full(n, jerr), **kw)
+        j = j or {}
+        out.joint = {
+            **out.joint,
+            "target_db": target,
+            "tol_db": tol,
+            "achieved_db": float(j.get("joint_gain_compression_db", float("nan"))),
+            "top_slope": float(j.get("joint_top_slope", float("nan"))),
+            "levels_db": [float(v) + 0.0 for v in lv],
+            "common_atten_db": float(steps_c),
+            "steps": out.steps,
+            "slope_db_per_db": round(float(slope), 4),
+        }
+        return out
+
+    stop = "max steps"
+    for step in range(max_steps):
+        state.a = attens(c)
+        apply()
+        gains_before = list(state.g)
+        readings, fatal_band = _read_step(step, rules, state, measure, set_gain)
+        if fatal_band is not None:  # every band one clip step up: the level difference is kept
+            readings, _err = _stop_fatal(fatal_band, readings, rules, state)
+            state.a = attens(quantize_atten(min(c_max, c + CLIP_STEP_DB)))
+            return done(
+                False,
+                f"{names[fatal_band]}: ORx still clips at minimum gain",
+                readings,
+                float("nan"),
+                None,
+                c,
+                fatal=True,
+            )
+        trusted = all(r.counts for r in readings)
+        j = _read_joint(joint, readings, state) if trusted else None
+        jgc = float((j or {}).get("joint_gain_compression_db", float("nan")))
+        jslope = float((j or {}).get("joint_top_slope", float("nan")))
+        counted = trusted and math.isfinite(jgc)
+        err = target - jgc
+        own_clip = [
+            rules.min_top_slope is not None
+            and r.counts
+            and math.isfinite(r.slope)
+            and r.slope < rules.min_top_slope
+            for r in readings
+        ]
+        joint_clip = counted and guard is not None and math.isfinite(jslope) and jslope < guard
+        clipped = counted and (any(own_clip) or joint_clip)
+        rows = [r.row for r in readings]
+        for r in readings:
+            r.row.update(_joint_fields(j), common_atten_db=float(c))
+            if r.counts:
+                r.row["error_db"] = float(err)
+        snap = {"readings": readings, "j": j, "err": err, "c": c, "g": list(state.g)}
+        last = snap
+        if counted and not clipped and (best is None or abs(err) < abs(best["err"])):
+            best = snap
+
+        if counted and not clipped and abs(err) <= tol:
+            for row in rows:
+                row["action"] = "converged"
+            state.history.extend(rows)
+            report(rows)
+            return done(True, "joint gain compression within tolerance", readings, err, j, c)
+        if step == max_steps - 1:
+            for r in readings:
+                if r.counts:
+                    r.row["action"] = "max steps"
+                    state.history.append(r.row)
+            report(rows)
+            break
+
+        action, new_c = "", c
+        if counted and prev is not None and abs(c - prev[0]) >= 0.1:  # the secant
+            meas = -(jgc - prev[1]) / (c - prev[0])
+            if math.isfinite(meas):
+                slope = float(np.clip(meas, *OWN_SLOPE_BOUNDS))
+        if clipped:  # every band back together, the floor of c raised there
+            over = -err
+            up = fine_step(over, CLIP_STEP_DB, rules.max_move_db) if over > 0 else CLIP_STEP_DB
+            new_c = quantize_atten(min(c_max, c + up))
+            c_floor = max(c_floor, new_c)
+            if joint_clip:
+                why = f"joint clip guard (joint top slope {jslope:.3f} < {guard:g})"
+                state.joint_clip_hit = {"step": step, "joint_top_slope": jslope,
+                                        "attens_db": attens(c).tolist()}  # fmt: skip
+            else:
+                band = next(i for i, f in enumerate(own_clip) if f)
+                why = f"clip guard ({names[band]} top slope {readings[band].slope:.3f})"
+            clip_by = {"why": why, "joint_gc_db": jgc}
+            state.floor = np.maximum(state.floor, attens(new_c))
+            state.clip_floor = [True] * n
+            action = why
+            state.prev_worst, state.undone = None, False
+        elif counted:
+            if err > tol and c <= c_floor + 1e-9:  # more drive needed, and c is at its floor
+                for row in rows:
+                    row["action"] = "clip-limited" if clip_by else "at limit"
+                state.history.extend(r.row for r in readings if r.counts)
+                report(rows)
+                if clip_by is not None:
+                    at = ", ".join(f"{nm} {a:g}" for nm, a in zip(names, state.a))
+                    reason = (
+                        f"clip-limited: {clip_by['why']} raised every band's floor; the "
+                        f"{target:g} dB joint target needs more drive (joint gain compression "
+                        f"{jgc:.2f} dB at {at} dB)"
+                    )
+                else:
+                    reason = (
+                        f"{names[binding]} at its attenuation limit "
+                        f"{state.floor[binding]:g} dB with joint gain compression {jgc:.2f} dB, "
+                        f"below the {target:g} dB joint target"
+                    )
+                return done(False, reason, readings, err, j, c)
+            if _trust_step(abs(err), rules, state):
+                mv = -0.5 * last_move
+                action = f"undo half (error grew; cap {state.cap:g} dB)"
+            else:
+                mv = float(np.clip(-err / slope, -state.cap, state.cap))
+                if abs(err) > tol and abs(mv) < 0.05:
+                    mv = -0.05 if err > 0 else 0.05
+                action = f"joint lock (slope {slope:.3f} dB/dB)"
+            new_c = quantize_atten(min(max(c + mv, c_floor), c_max))
+        moved = float(new_c - c)
+        for r in readings:
+            if r.counts:  # a band not counted has its row already (its own action, no move)
+                r.row.update(move_db=moved, action=action or "held (joint not read)",
+                             slopes=f"{slope:.4f}")  # fmt: skip
+                state.history.append(r.row)
+        report(rows)
+        if counted and abs(moved) < 1e-9:
+            return done(False, "no move possible (attenuation limits)", readings, err, j, c)
+        idle = abs(moved) < 1e-9 and list(state.g) == gains_before
+        state.idle_steps = state.idle_steps + 1 if idle else 0
+        if state.idle_steps >= IDLE_STEPS:
+            stop = f"the joint compression could not be read for {IDLE_STEPS} steps"
+            break
+        if counted:
+            prev = (c, jgc)
+        last_move = moved
+        state.last_move = np.full(n, moved)
+        state.g = _next_gains(readings, np.full(n, moved), rules, state)
+        c = new_c
+
+    keep = best if best is not None else last
+    state.a, state.g = attens(keep["c"]), list(keep["g"])
+    where = "the step closest to the target" if best is not None else "the last step measured"
+    return done(False, f"{stop}; left at {where}", keep["readings"], keep["err"], keep["j"],
+                keep["c"])  # fmt: skip
 
 
 # -- hardware ---------------------------------------------------------------------------------
@@ -1126,6 +1511,28 @@ def _band_reader(radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fract
     return measure
 
 
+def joint_reader(codes: Sequence[np.ndarray], freqs_hz: Sequence[float], fs: float,
+                 path_gains_db=None) -> Callable[[list[dict], list[float]], dict]:  # fmt: skip
+    """``joint(extras, attens)`` for :func:`search_multiband_compression`: the
+    :func:`~adrvtrx.metrics.joint_compression` of ``codes`` (each band's played reference, TX
+    codes) against every reading's aligned output (``extra["y_aligned"]``), the levels from the
+    attenuations (:func:`~adrvtrx.metrics.levels_from_attens`, equal path gains unless
+    ``path_gains_db``). Readings whose ``extra`` all carry ``joint`` (a figure already computed,
+    e.g. a capture's) return it instead."""
+    codes, freqs = list(codes), [float(f) for f in freqs_hz]
+
+    def read(extras: list[dict], attens: list[float]) -> dict:
+        given = [e.get("joint") for e in extras]
+        if given and all(isinstance(g, dict) for g in given):
+            return dict(given[0])
+        return joint_compression(
+            codes, [e["y_aligned"] for e in extras], fs, freqs,
+            levels_db=levels_from_attens(attens, path_gains_db),
+        )  # fmt: skip
+
+    return read
+
+
 def lock_bands(
     radio,
     bands: Sequence[BandSpec],
@@ -1159,6 +1566,12 @@ def lock_bands(
     aligned in full, its fractional delay kept, and its later readings only search the integer
     lag (:func:`measure_band` ``fraction``).
 
+    ``lock_on="joint"`` (``search_kw``, with ``joint_target_db`` and ``joint_levels_db``): the
+    bands start at the common offset that keeps their level difference (none below its start
+    attenuation), and each step's joint compression is read on what plays (:func:`joint_reader`
+    of the probe codes, or of the full signals): the probe cuts every band at the same indices,
+    so the composite's statistics survive it. The joint clip guard reads it the same way.
+
     One snapshot per step reads every band (``snapshot=None``: unless two bands' ORx share an
     ORx ADC; ``False``: one capture per band, for a pair whose ``two_orx_snapshot`` bench check
     failed; the search records which). Returns the search and each band's FULL reference (TX
@@ -1171,6 +1584,15 @@ def lock_bands(
     t_start = time.perf_counter()
     _check_method(method)
     _check_los(bands, getattr(getattr(radio, "config", None), "clocks", None))
+    lock_on = search_kw.get("lock_on", "per_band")
+    guard = resolve_joint_clip(lock_on, search_kw.get("joint_clip_slope", "default"))
+    starts = [float(b.atten_start_db) for b in bands]
+    if lock_on == "joint":  # every band at the common start offset, the level difference kept
+        lv = joint_levels(search_kw.get("joint_levels_db"), starts)
+        search_kw["joint_levels_db"] = [float(v) for v in lv]
+        c0 = max(quantize_atten(max(s + v for s, v in zip(starts, lv))),
+                 max(quantize_atten(b.atten_min_db) + v for b, v in zip(bands, lv)))  # fmt: skip
+        starts = [quantize_atten(c0 - v) for v in lv]
     refs = tx_codes(bands, tx_bits=tx_bits)
     probes, probe_info = None, {}
     if probe is not None:
@@ -1184,8 +1606,8 @@ def lock_bands(
     if snapshot is None:
         snapshot = not shares_orx_adc([b.orx for b in bands])
     radio.disable_tx()
-    for b in bands:
-        radio.set_tx_atten(b.tx, quantize_atten(b.atten_start_db))
+    for b, a in zip(bands, starts):
+        radio.set_tx_atten(b.tx, quantize_atten(a))
     if retune:
         for lo, hz in {b.lo: int(b.freq_hz) for b in bands}.items():
             radio.retune_lo(lo, hz)
@@ -1215,12 +1637,14 @@ def lock_bands(
         radio, bands, played, rx_bits=rx_bits, fs=fs, oversample=oversample, snapshot=snapshot,
         fractions={}, learn=None if probes is not None else (target_dbfs, tol_up_db, tol_down_db),
     )  # fmt: skip
+    if lock_on == "joint" or guard is not None:  # the joint figure of what plays (probe or full)
+        search_kw["joint"] = joint_reader(played, [b.freq_hz for b in bands], fs)
     search = search_multiband_compression(
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
         measure,
         targets_db=[b.target_db for b in bands],
-        start_attens_db=[b.atten_start_db for b in bands],
+        start_attens_db=starts,
         atten_mins_db=[b.atten_min_db for b in bands],
         orx_gains=gains,
         names=[b.name for b in bands],
@@ -1390,6 +1814,12 @@ JOINT_KEYS = (
     "joint_levels_db",
     "joint_band_compression_db",
 )
+#: The share of samples at or above 0.8 and 0.9 of the joint envelope's maximum (every capture).
+JOINT_SHARE_KEYS = tuple(share_key(f) for f in SHARE_LEVELS)
+#: The joint clip indicator (every capture): ``joint_clipping`` (the state's ``joint_top_slope``
+#: below :data:`~adrvtrx.metrics.JOINT_CLIP_SLOPE`) and the band's gain and phase drop at the top
+#: of the joint envelope (:func:`~adrvtrx.metrics.joint_top_drop`). It understates a real clip.
+JOINT_CLIP_KEYS = ("joint_clipping", "joint_top_gain_drop_db", "joint_top_phase_drop_deg")
 
 
 def add_joint_metrics(
@@ -1402,9 +1832,14 @@ def add_joint_metrics(
     equal DAC-to-PA path gains unless ``path_gains_db``). Each capture gets :data:`JOINT_KEYS`:
     the state's ``joint_gain_compression_db``, ``joint_top_slope``, ``joint_papr_in_db``,
     ``joint_papr_compression_db``, ``joint_levels_db`` (every band's level, ``0/-1.6``), and its
-    own ``joint_band_compression_db`` (its compression where the composite peaks). Report only:
-    the search steers on each band's own compression. A state the figure cannot be computed on
-    gets NaN (a capture is never lost to it). Returns the full result (empty on failure).
+    own ``joint_band_compression_db`` (its compression where the composite peaks); the state's
+    :data:`JOINT_SHARE_KEYS` (``joint_env_above_0p8`` / ``0p9``: the share of samples at or above
+    0.8 / 0.9 of the joint envelope's maximum) and the clip indicator :data:`JOINT_CLIP_KEYS`
+    (the state's ``joint_clipping``, the band's own ``joint_top_gain_drop_db`` and
+    ``joint_top_phase_drop_deg``; an early warning that understates a real clip). Report only
+    unless the lock targets it (``lock_on="joint"``) or the joint clip guard is on. A state the
+    figure cannot be computed on gets NaN (a capture is never lost to it). Returns the full result
+    (empty on failure).
     """
     try:
         levels = levels_from_attens([c.atten_db for c in caps], path_gains_db)
@@ -1422,10 +1857,45 @@ def add_joint_metrics(
     shared["joint_levels_db"] = (
         "/".join(f"{round(v, 2) + 0.0:g}" for v in j["levels_db"]) if j else ""
     )
-    per_band = j.get("band_compression_at_joint_peaks_db", [nan] * len(caps))
-    for c, v in zip(caps, per_band):
-        c.metrics.update({**shared, "joint_band_compression_db": v})
+    shared.update({k: j.get(k, nan) for k in JOINT_SHARE_KEYS})
+    shared["joint_clipping"] = bool(j.get("joint_clipping", False))
+    per_band = zip(
+        j.get("band_compression_at_joint_peaks_db", [nan] * len(caps)),
+        j.get("band_top_gain_drop_db", [nan] * len(caps)),
+        j.get("band_top_phase_drop_deg", [nan] * len(caps)),
+    )
+    for c, (v, drop, ph) in zip(caps, per_band):
+        c.metrics.update(
+            {
+                **shared,
+                "joint_band_compression_db": v,
+                "joint_top_gain_drop_db": drop,
+                "joint_top_phase_drop_deg": ph,
+            }
+        )
     return j
+
+
+def case_inputs(
+    bands: Sequence[BandSpec], refs: Sequence[np.ndarray], attens_db: Sequence[float], fs: float,
+    path_gains_db=None,
+) -> dict:  # fmt: skip
+    """The joint figures of a case's inputs at the levels of ``attens_db`` (the lock's): the
+    composite PAPR at the bands' real carriers, the spacing-free PAPR (``sum_k |x_k|``) and the
+    share of samples at or above 0.8 / 0.9 of the joint envelope's maximum
+    (:func:`~adrvtrx.metrics.input_metrics`), with ``attens_db``. ``case.json`` ``inputs``.
+    Empty (with ``error``) when it cannot be computed (a report figure, never in the way)."""
+    try:
+        attens = [float(a) for a in attens_db]
+        if not all(math.isfinite(a) for a in attens):
+            raise ValueError(f"attenuations {attens}")
+        out = input_metrics(
+            list(refs), fs, [b.freq_hz for b in bands],
+            levels_db=levels_from_attens(attens, path_gains_db),
+        )  # fmt: skip
+    except Exception as exc:  # noqa: BLE001 - a report figure: never in the way of the case
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {**out, "attens_db": attens}
 
 
 @dataclass
@@ -1467,10 +1937,18 @@ def confirm_lock(
     (``signal`` "full") in ``history``, and ``confirm``: ``offset_db`` per band (the full GC
     minus the probe GC at the same attenuation), ``gc_full_db``, ``fallback_steps``, and
     ``converged_on`` ("probe", "fallback" or "").
+
+    A joint lock (``search.lock_on == "joint"``) is confirmed on the joint gain compression of
+    the 0 dB capture against ``joint_target_db`` instead (``confirm`` also gets
+    ``joint_gc_full_db`` and ``joint_offset_db``, full minus probe), and its correction steps are
+    joint steps from ``joint_slope_prior``, the level difference kept. With the joint clip guard
+    on, a 0 dB capture whose joint top slope is below it is off too (``joint_clipping_full``).
     """
     tol = float(search_kw.get("comp_tol_db", 0.1))
     targets = np.array([b.target_db for b in bands])
     orx = _orx_settings(search_kw)
+    lock_on = search.lock_on
+    guard = resolve_joint_clip(lock_on, search_kw.get("joint_clip_slope", "default"))
 
     def zero_db(attens, gains):
         return capture_case(
@@ -1483,6 +1961,9 @@ def confirm_lock(
     confirm_s = search.timing.setdefault("confirm_s", [])
     confirm_s.append(round(time.perf_counter() - t0, 3))
     gc = np.array([c.metrics["gain_compression_db"] for c in caps])
+    nan = float("nan")
+    jfull = float(caps[0].metrics.get("joint_gain_compression_db", nan))
+    jslope = float(caps[0].metrics.get("joint_top_slope", nan))
     confirm = {
         "gc_full_db": {c.name: round(float(v), 4) for c, v in zip(caps, gc)},
         "offset_db": {
@@ -1492,11 +1973,24 @@ def confirm_lock(
         "converged_on": "",
     }
     search.confirm = confirm
-    off = ~(np.abs(targets - gc) <= tol)
-    if not off.any():
+    if lock_on == "joint":
+        jtarget = float(search.joint["target_db"])
+        confirm["joint_gc_full_db"] = round(jfull, 4)
+        confirm["joint_offset_db"] = round(jfull - float(search.joint.get("achieved_db", nan)), 4)
+        off_any = not abs(jtarget - jfull) <= tol
+    else:
+        off_any = bool((~(np.abs(targets - gc) <= tol)).any())
+    if guard is not None and math.isfinite(jslope) and jslope < guard:
+        confirm["joint_clipping_full"] = True  # the full signal clips jointly: back off
+        off_any = True
+    if not off_any:
         confirm["converged_on"] = "probe"
         if not search.converged:
-            search.reason += "; every band within tolerance on the full signal"
+            search.reason += (
+                "; the joint compression within tolerance on the full signal"
+                if lock_on == "joint"
+                else "; every band within tolerance on the full signal"
+            )
         search.converged = True
         for bl in search.bands:
             bl.status = "converged"
@@ -1508,7 +2002,8 @@ def confirm_lock(
     first = [
         (c.peak_dbfs, c.railed, c.metrics["gain_compression_db"],
          {"papr_compression_db": c.metrics["papr_compression_db"],
-          "top_slope": c.metrics["amam_top_slope"]})
+          "top_slope": c.metrics["amam_top_slope"],
+          "joint": {"joint_gain_compression_db": jfull, "joint_top_slope": jslope}})
         for c in caps
     ]  # fmt: skip
     fractions = {i: float(c.metrics["delay_samples"]) % 1.0 for i, c in enumerate(caps)}
@@ -1523,8 +2018,12 @@ def confirm_lock(
             return [first[i] for i in idx]  # the confirmation capture is the first reading
         return reader(idx)
 
-    skip = ("max_steps", "slopes", "method", "probe", "snapshot", "confirm_steps")
+    skip = ("max_steps", "slopes", "method", "probe", "snapshot", "confirm_steps", "joint")
     kw = {k: v for k, v in search_kw.items() if k not in skip}
+    if lock_on == "joint" or guard is not None:  # the full signals' joint figure
+        kw["joint"] = joint_reader(refs, [b.freq_hz for b in bands], fs)
+    if lock_on == "joint":  # the probe lock's level difference, kept
+        kw["joint_levels_db"] = list(search.joint["levels_db"])
     fb = search_multiband_compression(
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
@@ -1553,6 +2052,11 @@ def confirm_lock(
     search.bands, search.slopes = fb.bands, fb.slopes
     search.converged = fb.converged
     search.reason = f"{fb.reason} (full-signal fallback after the probe lock: {search.reason})"
+    if fb.joint:
+        probe_joint = search.joint.get("achieved_db")
+        search.joint = {**search.joint, **fb.joint, "steps": search.steps}
+        if lock_on == "joint":
+            search.joint["probe_achieved_db"] = probe_joint
     confirm["fallback_steps"] = fb.steps - 1
     confirm["converged_on"] = "fallback" if fb.converged else ""
     attens = [bl.atten_db for bl in fb.bands]
@@ -1746,6 +2250,7 @@ class CaseWriter:
         self.meta = dict(meta or {})
         self.row_meta = list(row_meta)
         self.search: MultibandSearch | None = None  # the lock, once written (for case.json)
+        self.refs: list[np.ndarray] | None = None  # the inputs, once written (case.json inputs)
 
     def path(self, suffix: str) -> Path:
         """``<dir>/<case>_<suffix>``, a case file about to be written: the folder is created."""
@@ -1771,6 +2276,7 @@ class CaseWriter:
         return path
 
     def write_inputs(self, refs: Sequence[np.ndarray]) -> list[Path]:
+        self.refs = [np.asarray(r) for r in refs]
         out = []
         for b, ref in zip(self.bands, refs):
             p = self._new(self.path(f"{b.name}_in.txt"))
@@ -1815,6 +2321,8 @@ class CaseWriter:
                         "lock_signal": "probe" if search.probe.get("used") else "full",
                         "lock_converged_on": search.confirm.get("converged_on", ""),
                         "probe_offset_db": search.confirm.get("offset_db", {}).get(b.name, ""),
+                        "lock_on": search.lock_on,
+                        **_joint_lock_columns(search),
                         "peak_dbfs": c.peak_dbfs,
                         "railed": c.railed,
                         **c.metrics,
@@ -1853,10 +2361,16 @@ class CaseWriter:
         self, extra: dict | None = None, *, search: MultibandSearch | None = None
     ) -> Path:
         """``case.json``: the bands, ``fs_hz``, the lock (:func:`lock_summary` of ``search``, or of
-        the search this writer wrote), then ``meta`` and ``extra`` (which win on a shared key).
+        the search this writer wrote), ``inputs`` (:func:`case_inputs` at the lock's attenuations,
+        once the inputs and the lock are written), then ``meta`` and ``extra`` (which win on a
+        shared key).
         """
         p = self._new(self.dir / "case.json")
         search = search if search is not None else self.search
+        inputs = {}
+        if search is not None and self.refs is not None:
+            attens = [bl.atten_db for bl in search.bands]
+            inputs = {"inputs": case_inputs(self.bands, self.refs, attens, self.fs)}
         doc = {
             "case_name": self.name,
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1865,6 +2379,7 @@ class CaseWriter:
             **(
                 {"lock": lock_summary(search), **lock_details(search)} if search is not None else {}
             ),
+            **inputs,
             **self.meta,
             **(extra or {}),
         }
@@ -1878,11 +2393,33 @@ class CaseWriter:
         return p
 
 
+def _joint_lock_columns(search: MultibandSearch) -> dict:
+    """A joint lock's result as columns (``lock_on="joint"``; none otherwise): the target, the
+    joint compression the lock read where it ended (``joint_lock_db``; after a probe lock, the full
+    signal's 0 dB capture when it confirmed it), the levels and the steps."""
+    j = search.joint
+    if search.lock_on != "joint" or not j:
+        return {}
+    reached = j.get("achieved_db")
+    if search.confirm.get("converged_on") == "probe":
+        reached = search.confirm.get("joint_gc_full_db", reached)
+    return {
+        "joint_target_db": j.get("target_db"),
+        "joint_lock_db": reached,
+        "joint_lock_levels_db": "/".join(f"{v:g}" for v in j.get("levels_db", [])),
+        "joint_lock_steps": j.get("steps"),
+    }
+
+
 def lock_summary(search: MultibandSearch) -> list[dict]:
     """The lock per band as plain dicts (for ``case.json``): with a probe lock, also the band's
-    probe-to-full GC offset (``probe_offset_db``, full GC minus probe GC at the same attenuation).
-    :func:`lock_details` has the rest (timing, probe, confirmation)."""
+    probe-to-full GC offset (``probe_offset_db``, full GC minus probe GC at the same attenuation);
+    with a joint lock (``lock_on="joint"``) also ``lock_on``, ``joint_target_db``,
+    ``joint_lock_db`` (the joint compression reached), ``joint_lock_levels_db`` and
+    ``joint_lock_steps``. :func:`lock_details` has the rest (timing, probe, confirmation, the joint
+    result)."""
     offsets = search.confirm.get("offset_db", {})
+    joint = _joint_lock_columns(search)
     return [
         {
             "band": bl.name,
@@ -1892,6 +2429,7 @@ def lock_summary(search: MultibandSearch) -> list[dict]:
             "top_slope": bl.top_slope,
             "status": bl.status,
             **({"probe_offset_db": offsets[bl.name]} if bl.name in offsets else {}),
+            **({"lock_on": search.lock_on, **joint} if joint else {}),
         }
         for bl in search.bands
     ]
@@ -1901,7 +2439,8 @@ def lock_details(search: MultibandSearch) -> dict:
     """What ``case.json`` keeps of the lock besides :func:`lock_summary`: ``lock_method``,
     ``lock_steps``, ``lock_snapshots``, ``lock_captures``, ``lock_snapshot`` (one snapshot per
     step, or one capture per band), ``lock_timing`` (each capture, each waveform swap, the AGC,
-    the confirmation and the total, s), ``lock_probe`` and ``lock_confirm``."""
+    the confirmation and the total, s), ``lock_probe``, ``lock_confirm``, ``lock_on`` and
+    ``lock_joint`` (:attr:`MultibandSearch.joint`)."""
     return {
         "lock_method": search.method,
         "lock_steps": search.steps,
@@ -1911,6 +2450,8 @@ def lock_details(search: MultibandSearch) -> dict:
         "lock_timing": search.timing,
         "lock_probe": search.probe,
         "lock_confirm": search.confirm,
+        "lock_on": search.lock_on,
+        "lock_joint": search.joint,
     }
 
 
@@ -1938,5 +2479,23 @@ def timing_text(search: MultibandSearch) -> str:
         lines.append(
             f"  probe -> full GC offset: {offs} dB; converged on: {c.get('converged_on') or 'no'}"
             f" ({c.get('fallback_steps', 0)} full-signal steps)"
+        )
+        if "joint_offset_db" in c:
+            lines.append(
+                f"  joint GC: full {c['joint_gc_full_db']:.3f} dB, probe -> full offset "
+                f"{c['joint_offset_db']:+.3f} dB"
+            )
+    j = search.joint
+    if search.lock_on == "joint" and j:
+        lv = "/".join(f"{v:g}" for v in j.get("levels_db", []))
+        lines.append(
+            f"  joint lock: target {j.get('target_db'):g} dB, read "
+            f"{j.get('achieved_db', float('nan')):.3f} dB, levels {lv} dB, slope "
+            f"{j.get('slope_db_per_db', float('nan')):.3f} dB/dB"
+        )
+    if j.get("clip_guard"):
+        lines.append(
+            f"  joint clip guard fired: joint top slope {j['clip_guard']['joint_top_slope']:.3f}"
+            f" < {j.get('clip_slope'):g}"
         )
     return "\n".join(lines)
