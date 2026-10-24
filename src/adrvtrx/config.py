@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .gain import ORX_CEILING_DEFAULT_DBFS, ORX_CLIP_MARGIN_DB, orx_clip_dbfs
@@ -303,7 +303,8 @@ def orx_ceiling_for(
     a profile not listed gets ``default`` (:data:`~adrvtrx.gain.ORX_CEILING_DEFAULT_DBFS`)."""
     table = DEFAULT_ORX_CEILINGS_DBFS if table is None else table
     by_name = {str(k).lower(): float(v) for k, v in table.items()}
-    name = Path(os.path.expandvars(str(profile))).name.lower()
+    # PureWindowsPath: a Windows path names its file by either separator on any OS (a CI runner too)
+    name = PureWindowsPath(os.path.expandvars(str(profile))).name.lower()
     return by_name.get(name, by_name.get("default", ORX_CEILING_DEFAULT_DBFS))
 
 
