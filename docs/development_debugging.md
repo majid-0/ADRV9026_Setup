@@ -177,26 +177,34 @@ They override anything the docs imply.
      in software and never reads it back.
 
    So the AGC levels on the **captured-IQ peak** with a **clip veto**: a capture is clipped
-   when it has a `railed` sample **or** its peak is above **−1.5 dBFS**
-   (`gain.ORX_CLIP_DBFS`, `gain.orx_clipped`). The ORx clips *below* digital full scale with
-   no railed code: on UC102 (2026-10-21) ORX2/ORX3 overdriven pinned at −0.35/−0.41/−0.40 dBFS,
-   the 12-bit profiles near −0.95 dBFS. It targets an **asymmetric band** (default −2.0 dBFS,
-   +0.3 toward the rail / −0.6 toward the floor; `target + tol_up` must stay below −1.5 dBFS,
-   else `ValueError`), in three stages:
+   when it has a `railed` sample **or** its peak is at or above the profile's **clip
+   threshold**, its measured ORx ceiling minus 0.2 dB (`[orx_ceiling]` in the config,
+   `Config.orx_clip_dbfs`, `gain.orx_clipped`). The ORx saturates *below* digital full scale
+   with no railed code: on UC102 (2026-10-21) ORX2/ORX3 overdriven pinned at
+   −0.35/−0.41/−0.40 dBFS (ceiling −0.35, a placeholder until `orx_ceiling.py` confirms it); a
+   profile not measured yet gets −0.45 (threshold −0.65). It targets an **asymmetric band**
+   (default −1.0 dBFS, +0.3 toward the rail / −0.6 toward the floor; `target + tol_up` must stay
+   below the clip threshold, else `ValueError`), in three stages:
    - **A (coarse):** set gain 185, capture, FATAL-check the floor, then one computed jump
      toward target.
    - **B (fine):** short-capture trim into band; the clip veto steps down on any `railed>0`
-     (a pinned peak above −1.5 dBFS is hot: down by its distance from the target);
+     (a pinned peak at the clip threshold is hot: down by its distance from the target);
      if the signal is below band even at 255 it **accepts 255** (`at_max_gain`, best
-     achievable — not an error).
+     achievable — not an error). From a **predicted gain** (`start_gain`, e.g. the confirm
+     capture's gain predicted from the lock) the trim starts **4 indices below** it
+     (`start_margin_idx`) and trims up, so it approaches the window from below: a predicted
+     gain ~2 dB hot started the bench's overdriven captures.
    - **C (verify):** re-check at the FULL waveform duration and back the gain off on any
      clip; bottoming out at 185 still clipping is FATAL.
 
    Overdriven, the ORx can also return a capture of **all zeros** (UC102: ORX2 alone, 24 576
-   samples, peak −inf; a plain retake returned data). Every AGC / measurement capture goes
-   through `capture.orx_capture`: an empty ORx capture is retaken twice, 50 ms apart, then
-   `AgcError` ("ORX2 returned no data (all zeros) 3 times ..."). A peak that is not finite never
-   reaches a gain step (FATAL in the stages, one index down in `relevel_index`).
+   samples, peak −inf; the next capture returned data). The AGC stages and the compression
+   searches treat it as too hot: the gain goes 2 indices down (`gain.EMPTY_STEP_IDX`; at the
+   floor it stays) and it captures again, up to 2 retakes, then FATAL / `AgcError` ("ORX2: ORx
+   returned no data (all zeros) after 2 retakes at gain G ..."). Where the caller fixes the gain
+   (`capture_case(agc=False)`, the capture after the AGC, `run_bands`), `capture.orx_capture`
+   retakes at the same gain, then `EmptyCaptureError` (an `AgcError`). A peak of −inf never
+   reaches the gain arithmetic.
 
    `gain.autolevel_orx` (A+B) and `gain.verify_no_clip` (C) are pure/callback-driven;
    `capture.autolevel_capture` orchestrates them against live hardware. On any **FATAL**

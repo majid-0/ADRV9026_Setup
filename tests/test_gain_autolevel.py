@@ -1,8 +1,7 @@
 """Unit tests for the software ORx AGC (hardware-free, callback-driven).
 
-The AGC levels on the captured-IQ peak with a clip veto (a railed sample, or a peak above
-``ORX_CLIP_DBFS``) and an asymmetric accept band; see the frozen spec in
-``src/adrvtrx/gain.py``. ``FakeOrx``
+The AGC levels on the captured-IQ peak with a ``railed``-sample clip veto and an
+asymmetric accept band; see the frozen spec in ``src/adrvtrx/gain.py``. ``FakeOrx``
 maps a gain index -> ``(peak_dbfs, railed)`` like the bench gain table: clean and
 monotonic at ~0.5 dB/index, with a hard ADC rail near the top.
 """
@@ -12,15 +11,16 @@ from __future__ import annotations
 from adrvtrx.gain import (
     ORX_GAIN_MAX,
     ORX_GAIN_MIN,
+    ORX_START_MARGIN_IDX,
     autolevel_orx,
     verify_no_clip,
 )
 
-TARGET = -2.0  # the default
+TARGET = -1.0
 TOL_UP = 0.3
 TOL_DOWN = 0.6
-BAND_LO = TARGET - TOL_DOWN  # -2.6
-BAND_HI = TARGET + TOL_UP  # -1.7
+BAND_LO = TARGET - TOL_DOWN  # -1.6
+BAND_HI = TARGET + TOL_UP  # -0.7
 
 
 class FakeOrx:
@@ -36,7 +36,7 @@ class FakeOrx:
         self,
         *,
         ref_gain: int = 250,
-        ref_dbfs: float = -1.86,
+        ref_dbfs: float = -0.86,
         db_per_index: float = 0.5,
         rail_gain: int = 251,
         gain_min: int = ORX_GAIN_MIN,
@@ -87,7 +87,7 @@ def test_fatal_when_clipping_at_minimum_gain():
 
 def test_fatal_when_already_in_band_at_minimum_gain():
     # At the floor the signal is already inside the band -> can only get hotter.
-    orx = FakeOrx(ref_gain=ORX_GAIN_MIN, ref_dbfs=-2.0, rail_gain=ORX_GAIN_MAX + 1)
+    orx = FakeOrx(ref_gain=ORX_GAIN_MIN, ref_dbfs=-1.0, rail_gain=ORX_GAIN_MAX + 1)
     res = _level(orx)
     assert res.fatal
     assert not res.converged
@@ -99,8 +99,8 @@ def test_fatal_when_already_in_band_at_minimum_gain():
 
 
 def test_coarse_jump_then_converges_in_band():
-    # gain 250 -> -1.86 dBFS (in band), 251+ rails. One jump should land at 250.
-    orx = FakeOrx(ref_gain=250, ref_dbfs=-1.86, rail_gain=251)
+    # gain 250 -> -0.86 dBFS (in band), 251+ rails. One jump should land at 250.
+    orx = FakeOrx(ref_gain=250, ref_dbfs=-0.86, rail_gain=251)
     res = _level(orx)
     assert res.converged
     assert not res.fatal
@@ -111,8 +111,8 @@ def test_coarse_jump_then_converges_in_band():
 
 def test_railed_overshoot_forces_step_down():
     # The coarse jump lands on a railing gain (250 rails); the clip veto must back
-    # off one index to the clean in-band gain 249 (peak -2.36 dBFS).
-    orx = FakeOrx(ref_gain=250, ref_dbfs=-1.86, rail_gain=250)
+    # off one index to the clean in-band gain 249 (peak -1.36 dBFS).
+    orx = FakeOrx(ref_gain=250, ref_dbfs=-0.86, rail_gain=250)
     res = _level(orx)
     assert res.converged
     assert res.railed == 0
@@ -122,9 +122,9 @@ def test_railed_overshoot_forces_step_down():
 
 
 def test_accept_at_max_gain_when_signal_below_target():
-    # Even at gain 255 the signal is only -6 dBFS (below band) and never rails ->
+    # Even at gain 255 the signal is only -5 dBFS (below band) and never rails ->
     # accept 255 as the best achievable, NOT an error.
-    orx = FakeOrx(ref_gain=ORX_GAIN_MAX, ref_dbfs=-6.0, rail_gain=ORX_GAIN_MAX + 1)
+    orx = FakeOrx(ref_gain=ORX_GAIN_MAX, ref_dbfs=-5.0, rail_gain=ORX_GAIN_MAX + 1)
     res = _level(orx)
     assert not res.fatal
     assert res.at_max_gain
@@ -134,15 +134,15 @@ def test_accept_at_max_gain_when_signal_below_target():
 
 
 def test_never_commands_outside_the_gain_window():
-    orx = FakeOrx(ref_gain=250, ref_dbfs=-1.86, rail_gain=251)
+    orx = FakeOrx(ref_gain=250, ref_dbfs=-0.86, rail_gain=251)
     _level(orx)
     assert all(ORX_GAIN_MIN <= g <= ORX_GAIN_MAX for g in orx.history)
 
 
 def test_asymmetric_band_rejects_hot_accepts_cold_edge():
-    # Above +tol_up is too hot (step down); within [-2.6, -1.7] is accepted.
-    # ref so gain 250 -> -1.4 dBFS (hot), 249 -> -1.9 dBFS (in band, cold side).
-    orx = FakeOrx(ref_gain=250, ref_dbfs=-1.4, rail_gain=256)
+    # Above +tol_up is too hot (step down); within [-1.6, -0.7] is accepted.
+    # ref so gain 250 -> -0.4 dBFS (hot), 249 -> -0.9 dBFS (in band, cold side).
+    orx = FakeOrx(ref_gain=250, ref_dbfs=-0.4, rail_gain=256)
     res = _level(orx)
     assert res.converged
     assert res.final_dbfs <= BAND_HI  # not left above the rail-side tolerance
@@ -155,7 +155,7 @@ def test_asymmetric_band_rejects_hot_accepts_cold_edge():
 class FakeFull:
     """Full-signal model for verify_no_clip: rails at/above ``rail_gain``."""
 
-    def __init__(self, *, ref_gain=250, ref_dbfs=-1.86, db_per_index=0.5, rail_gain=251):
+    def __init__(self, *, ref_gain=250, ref_dbfs=-0.86, db_per_index=0.5, rail_gain=251):
         self.ref_gain = ref_gain
         self.ref_dbfs = ref_dbfs
         self.db_per_index = db_per_index
@@ -174,7 +174,7 @@ class FakeFull:
 
 def test_verify_backs_off_on_full_signal_clip():
     # Settled at 250 on short captures, but the full signal rails there; back off to 249.
-    full = FakeFull(ref_gain=250, ref_dbfs=-1.86, rail_gain=250)
+    full = FakeFull(ref_gain=250, ref_dbfs=-0.86, rail_gain=250)
     vr = verify_no_clip(full.set_gain, full.measure, 250, target_dbfs=TARGET, tol_up_db=TOL_UP)
     assert not vr.fatal
     assert vr.converged
@@ -185,7 +185,7 @@ def test_verify_backs_off_on_full_signal_clip():
 
 def test_verify_backs_off_when_hot_above_tolerance():
     # No rail, but peak above target+tol_up -> still step down into band.
-    full = FakeFull(ref_gain=250, ref_dbfs=-1.3, rail_gain=256)
+    full = FakeFull(ref_gain=250, ref_dbfs=-0.3, rail_gain=256)
     vr = verify_no_clip(full.set_gain, full.measure, 250, target_dbfs=TARGET, tol_up_db=TOL_UP)
     assert vr.converged
     assert vr.railed == 0
@@ -194,7 +194,7 @@ def test_verify_backs_off_when_hot_above_tolerance():
 
 
 def test_verify_no_action_when_clean_and_in_band():
-    full = FakeFull(ref_gain=250, ref_dbfs=-1.86, rail_gain=251)
+    full = FakeFull(ref_gain=250, ref_dbfs=-0.86, rail_gain=251)
     vr = verify_no_clip(full.set_gain, full.measure, 250, target_dbfs=TARGET, tol_up_db=TOL_UP)
     assert vr.converged
     assert vr.iterations == 0
@@ -213,24 +213,33 @@ def test_verify_fatal_when_rails_down_to_minimum():
 # -- start gain (a gain predicted from an earlier level) ----------------------------------------
 
 
-def test_a_start_gain_in_band_levels_in_one_capture():
-    orx = FakeOrx()  # 250 reads -1.86 dBFS
+def test_a_start_gain_starts_4_indices_below_and_trims_up_into_the_window():
+    orx = FakeOrx()  # 250 reads -0.86 dBFS
     res = autolevel_orx(orx.set_gain, orx.measure, start_gain=250)
+    assert ORX_START_MARGIN_IDX == 4
+    assert res.converged and res.final_gain_index == 250 and res.iterations == 2
+    assert orx.history == [246, 250]  # from below (-2.86 dBFS), never the floor
+
+
+def test_a_start_gain_with_no_margin_levels_in_one_capture():
+    orx = FakeOrx()  # 250 reads -0.86 dBFS
+    res = autolevel_orx(orx.set_gain, orx.measure, start_gain=250, start_margin_idx=0)
     assert res.converged and res.final_gain_index == 250 and res.iterations == 1
-    assert orx.history == [250]  # never the floor
+    assert orx.history == [250]
 
 
 def test_a_start_gain_trims_from_where_it_starts():
-    hot = FakeOrx(ref_gain=230, ref_dbfs=-2.0, rail_gain=260)
-    res = autolevel_orx(hot.set_gain, hot.measure, start_gain=236)  # 3 dB hot
-    assert res.converged and res.final_gain_index == 230 and hot.history[0] == 236
-    cold = FakeOrx(ref_gain=230, ref_dbfs=-2.0, rail_gain=260)
+    hot = FakeOrx(ref_gain=230, ref_dbfs=-1.0, rail_gain=260)
+    res = autolevel_orx(hot.set_gain, hot.measure, start_gain=238)  # 4 dB hot
+    assert res.converged and res.final_gain_index == 230 and hot.history[0] == 234
+    cold = FakeOrx(ref_gain=230, ref_dbfs=-1.0, rail_gain=260)
     res = autolevel_orx(cold.set_gain, cold.measure, start_gain=222)
-    assert res.converged and res.final_gain_index == 230 and ORX_GAIN_MIN not in cold.history
+    assert res.converged and res.final_gain_index == 230 and cold.history[0] == 218
+    assert ORX_GAIN_MIN not in cold.history
 
 
 def test_a_start_gain_that_clips_at_the_floor_is_fatal_at_once():
     orx = FakeOrx(rail_gain=ORX_GAIN_MIN)  # rails even at the minimum gain
     res = autolevel_orx(orx.set_gain, orx.measure, start_gain=ORX_GAIN_MIN + 1)
     assert res.fatal and "clips at minimum gain" in res.reason
-    assert res.iterations == 2  # one step down to the floor, then the floor check
+    assert res.iterations == 1  # 4 below the start is the floor: the floor check at once

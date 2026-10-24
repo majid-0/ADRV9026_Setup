@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from ._enums import RxChannel, RxTrigSource, TxChannel, is_orx
-from .capture import CaptureResult, capture, orx_capture
+from .capture import CaptureResult, capture, orx_capture, orx_clip_for
 from .gain import autolevel_orx, clip_report
 from .transmit import transmit_bands
 
@@ -56,7 +56,7 @@ def run_bands(
     out_dir: str | Path,
     trig: RxTrigSource | None = None,
     level_orx_channels: bool = True,
-    orx_target_dbfs: float = -2.0,
+    orx_target_dbfs: float = -1.0,
     orx_tol_up_db: float = 0.3,
     orx_tol_down_db: float = 0.6,
     orx_coarse_ms: float = 0.1,
@@ -65,7 +65,9 @@ def run_bands(
 
     ``trig`` defaults to IMMEDIATE (TX runs continuously, so the signal is always
     there). The TXn_SOF trigger times out on this bench (no TX start-of-frame); align
-    the captures in software (:mod:`adrvtrx.align`).
+    the captures in software (:mod:`adrvtrx.align`). The AGC treats an empty ORx capture as too
+    hot (it lowers the gain and captures again); an empty ORx capture of a band (step 3, the gain
+    set) is retaken at that gain (:func:`~adrvtrx.capture.orx_capture`).
     """
     # 1. Multi-band transmit (all TX channels start together).
     channel_to_iq = {b.tx_channel: b.waveform for b in bands}
@@ -79,7 +81,7 @@ def run_bands(
                 ch = b.capture_channel
 
                 def _measure(c: RxChannel = ch) -> tuple[float, int]:
-                    one = orx_capture(radio, int(c), orx_coarse_ms, bits=rx_bits).channels[c]
+                    one = capture(radio, int(c), orx_coarse_ms, bits=rx_bits).channels[c]
                     rep = clip_report(one.i, one.q, rx_bits)
                     return rep.peak_dbfs, rep.railed_samples
 
@@ -89,6 +91,7 @@ def run_bands(
                     target_dbfs=orx_target_dbfs,
                     tol_up_db=orx_tol_up_db,
                     tol_down_db=orx_tol_down_db,
+                    clip_dbfs=orx_clip_for(radio),
                 )
 
     # 3. Capture each band's channel in its OWN snapshot. Enabling two ORx inputs
@@ -101,7 +104,8 @@ def run_bands(
     longest = max(b.capture_time_ms for b in bands)
     result = CaptureResult(capture_time_ms=longest, trig=trig)
     for b in bands:
-        one = capture(radio, int(b.capture_channel), b.capture_time_ms, trig=trig, bits=rx_bits)
+        take = orx_capture if is_orx(b.capture_channel) else capture
+        one = take(radio, int(b.capture_channel), b.capture_time_ms, trig=trig, bits=rx_bits)
         cap = one.channels.get(b.capture_channel)
         if cap is not None:
             result.channels[b.capture_channel] = cap

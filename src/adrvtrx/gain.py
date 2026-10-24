@@ -19,12 +19,14 @@ Bench facts that shape this design (see docs/development_debugging.md):
 * ``RxDecPowerGet`` is range-compressed and must NOT be used for leveling.
 * The gain table is clean & MONOTONIC from index 185 up to 250 (~0.5 dB/index)
   with ``railed == 0`` the whole way; index 255 rails hard.
-* The ORx clips BELOW digital full scale with no railed code (UC102, 2026-10-21): an
-  overdriven ORx pins its peak near -0.4 dBFS, so a capture is clipped when it railed OR
-  its peak is above :data:`ORX_CLIP_DBFS` (:func:`orx_clipped`), and the AGC window must
-  stay below that (:func:`check_orx_window`). Overdriven, it can also return a capture of
-  all zeros (peak -inf): the capture side retakes it (``capture.orx_capture``), and the
-  stages here never step on a peak that is not finite (FATAL).
+* The ORx saturates BELOW digital full scale with no railed code (UC102, 2026-10-21: an
+  overdriven ORx pins its peak near -0.35 dBFS), so a capture is clipped when it railed OR
+  its peak is at or above the profile's clip threshold, its measured ceiling minus
+  :data:`ORX_CLIP_MARGIN_DB` (:func:`orx_clipped`, :func:`orx_clip_dbfs`); the AGC window
+  must stay below that (:func:`check_orx_window`). Overdriven, it can also return a capture
+  of all zeros (peak -inf): the stages here treat it as too hot, lower the gain
+  :data:`EMPTY_STEP_IDX` indices and measure again, up to :data:`EMPTY_RETAKES` times, then
+  FATAL; a peak that is not finite never reaches the gain arithmetic.
 """
 
 from __future__ import annotations
@@ -50,7 +52,13 @@ __all__ = [
     "ORX_STEP_BOUNDS",
     "OrxStep",
     "relevel_index",
+    "ORX_CEILING_DEFAULT_DBFS",
+    "ORX_CLIP_MARGIN_DB",
     "ORX_CLIP_DBFS",
+    "ORX_START_MARGIN_IDX",
+    "EMPTY_RETAKES",
+    "EMPTY_STEP_IDX",
+    "orx_clip_dbfs",
     "orx_clipped",
     "check_orx_window",
 ]
@@ -62,12 +70,26 @@ ORX_GAIN_MIN = 185
 ORX_GAIN_MAX = 255
 ORX_DB_PER_INDEX = 0.50
 
-#: The ORx clips below digital full scale, and without railed codes. Bench, 2026-10-21 (UC102
+#: The ORx saturates below digital full scale, and without railed codes. Bench, 2026-10-21 (UC102
 #: link sharing, 40 MHz, 245.76 MSPS, 16-bit): ORX2 and ORX3 overdriven both read peaks of
-#: -0.35 / -0.41 / -0.40 dBFS and never a code at the rail; the 12-bit profiles pinned near
-#: -0.95 dBFS. A peak above this is a clip (:func:`orx_clipped`), exactly like a railed
-#: capture; the AGC window must stay below it (:func:`check_orx_window`).
-ORX_CLIP_DBFS = -1.5
+#: -0.35 / -0.41 / -0.40 dBFS and never a code at the rail. Each profile's ceiling (dBFS) is in
+#: the config's ``[orx_ceiling]`` table (``Config.orx_ceiling_dbfs``); a profile not measured
+#: yet gets this one.
+ORX_CEILING_DEFAULT_DBFS = -0.45
+#: A peak at or above the ceiling minus this is a clip (:func:`orx_clip_dbfs`).
+ORX_CLIP_MARGIN_DB = 0.2
+#: The clip threshold of a profile with the default ceiling: a peak at or above it is a clip
+#: (:func:`orx_clipped`), exactly like a railed capture; the AGC window must stay below it
+#: (:func:`check_orx_window`). The stages take the profile's own as ``clip_dbfs``.
+ORX_CLIP_DBFS = round(ORX_CEILING_DEFAULT_DBFS - ORX_CLIP_MARGIN_DB, 4)
+#: A fine trim from a predicted gain (``start_gain``) starts this many indices below it and
+#: trims up to the window: it approaches from below, never from the clip.
+ORX_START_MARGIN_IDX = 4
+#: A capture with no data (all zeros / no samples: the ORx was overdriven) is taken again this
+#: many times, the gain :data:`EMPTY_STEP_IDX` indices lower each time (the same gain at the
+#: floor, or where the caller fixes the gain); still empty it is FATAL / ``AgcError``.
+EMPTY_RETAKES = 2
+EMPTY_STEP_IDX = 2
 
 
 @dataclass
@@ -131,23 +153,44 @@ def peak_window(
     return i[sl], q[sl]
 
 
-def orx_clipped(peak_dbfs: float, railed: int) -> bool:
-    """An ORx capture clipped: a sample at the rail, or a peak above :data:`ORX_CLIP_DBFS`
-    (the ORx clips below full scale with no railed code). Never in band: the AGC lowers the
-    gain, and at the gain floor it is FATAL ("clips at minimum gain")."""
-    return railed > 0 or peak_dbfs > ORX_CLIP_DBFS
+def orx_clip_dbfs(
+    ceiling_dbfs: float = ORX_CEILING_DEFAULT_DBFS, margin_db: float = ORX_CLIP_MARGIN_DB
+) -> float:
+    """The clip threshold of a profile whose ORx saturates at ``ceiling_dbfs``: the ceiling minus
+    ``margin_db`` (a peak at or above it is a clip, :func:`orx_clipped`)."""
+    return round(float(ceiling_dbfs) - float(margin_db), 4)
 
 
-def check_orx_window(target_dbfs: float, tol_up_db: float) -> None:
+def orx_clipped(peak_dbfs: float, railed: int, clip_dbfs: float = ORX_CLIP_DBFS) -> bool:
+    """An ORx capture clipped: a sample at the rail, or a peak at or above ``clip_dbfs`` (the
+    profile's clip threshold, :func:`orx_clip_dbfs`: the ORx saturates below full scale with no
+    railed code). Never in band: the AGC lowers the gain, and at the gain floor it is FATAL
+    ("clips at minimum gain")."""
+    return railed > 0 or peak_dbfs >= clip_dbfs
+
+
+def check_orx_window(
+    target_dbfs: float, tol_up_db: float, clip_dbfs: float = ORX_CLIP_DBFS
+) -> None:
     """``ValueError`` unless the AGC window's top, ``target_dbfs + tol_up_db``, is below
-    :data:`ORX_CLIP_DBFS` (a window reaching it would accept a clipped capture)."""
+    ``clip_dbfs`` (a window reaching it would accept a clipped capture)."""
     top = float(target_dbfs) + float(tol_up_db)
-    if not top < ORX_CLIP_DBFS:
+    if not top < clip_dbfs:
         raise ValueError(
             f"ORx AGC window reaches the ORx clip: target_dbfs {target_dbfs} + tol_up_db "
-            f"{tol_up_db} = {top:.2f} dBFS, must be below {ORX_CLIP_DBFS} dBFS (the ORx clips "
-            f"there with no railed code); lower target_dbfs (default -2.0)"
+            f"{tol_up_db} = {top:.2f} dBFS, must be below {clip_dbfs} dBFS (the profile's ORx "
+            f"ceiling minus {ORX_CLIP_MARGIN_DB} dB: it saturates there with no railed code)"
         )
+
+
+def no_data_reason(gain: int, retakes: int = EMPTY_RETAKES) -> str:
+    """The FATAL / ``AgcError`` reason of an ORx that returned no data (all zeros) ``retakes`` + 1
+    times in a row, the last at ``gain``."""
+    return (
+        f"returned no data (all zeros) after {retakes} retakes at gain {gain} (each retake "
+        f"{EMPTY_STEP_IDX} indices lower, down to the floor): the ORx was likely overdriven -- "
+        "reduce TX power / add a pad."
+    )
 
 
 def relevel_index(
@@ -157,13 +200,15 @@ def relevel_index(
 
     One index down when it railed with its peak still in band (the peak dBFS compresses near
     full scale, the railed count does not); otherwise the peak's distance from ``target_dbfs`` in
-    indices, at least one (a clipped peak, :func:`orx_clipped`, is hot: down). The re-level rule
-    of the single-band and the multi-band searches (:class:`OrxStep` learns its ``db_per_index``).
-    A peak that is not finite (an empty capture: -inf) is one index down, the safe side.
+    indices, at least one (a peak clipped below full scale, :func:`orx_clipped`, is above the
+    window, :func:`check_orx_window`: hot, down). The re-level rule of the single-band and the
+    multi-band searches (:class:`OrxStep` learns its ``db_per_index``). The searches never pass a
+    peak that is not finite (an empty capture is retaken first); if one comes, it is
+    :data:`EMPTY_STEP_IDX` down, with no arithmetic on it.
     """
-    if not math.isfinite(peak_dbfs):  # no data (the ORx reads zeros after a clip): down
-        return -1
-    if orx_clipped(peak_dbfs, railed) or peak_dbfs > band_hi:
+    if not math.isfinite(peak_dbfs):  # no data (an overdriven ORx reads zeros): down
+        return -EMPTY_STEP_IDX
+    if railed > 0 or peak_dbfs > band_hi:
         if railed > 0 and not peak_dbfs > band_hi:
             return -1
         return -max(1, int(round((peak_dbfs - target_dbfs) / db_per_index)))
@@ -184,7 +229,8 @@ class OrxStep:
     * dB per index is the secant of the last two captures at different gains and the same TX
       drive (``drive``: anything that names it, e.g. the attenuations), neither railed, held in
       :data:`ORX_STEP_BOUNDS`; until there are two, ``db_per_index`` (0.5) is assumed. It is kept
-      across drives (it belongs to the gain table).
+      across drives (it belongs to the gain table). A clipped capture (:func:`orx_clipped` with
+      ``clip_dbfs``, the profile's threshold) teaches no step and is never the closest.
     * Once a re-level overshoots (the peak crosses the window), the steps are 1 index, until the
       drive changes.
     * If a 1-index step still jumps the window, :attr:`jumped` is set and :meth:`closest` names
@@ -194,15 +240,21 @@ class OrxStep:
     :meth:`indices` converts a level change in dB with the learnt step.
     """
 
-    def __init__(self, db_per_index: float = ORX_DB_PER_INDEX, bounds=ORX_STEP_BOUNDS):
+    def __init__(
+        self,
+        db_per_index: float = ORX_DB_PER_INDEX,
+        bounds=ORX_STEP_BOUNDS,
+        clip_dbfs: float = ORX_CLIP_DBFS,
+    ):
         self.db_per_index = float(db_per_index)
+        self.clip_dbfs = float(clip_dbfs)
         self.bounds = (float(bounds[0]), float(bounds[1]))
         self.single = False  # 1-index steps (a re-level overshot at this drive)
         self.jumped = False  # a 1-index step jumped the window at this drive
         self._caps: list[tuple] = []  # (drive, gain, peak, railed, side) at the current drive
 
     def _side(self, peak: float, railed: int, band_lo: float, band_hi: float) -> int:
-        if orx_clipped(peak, railed) or peak > band_hi:
+        if orx_clipped(peak, railed, self.clip_dbfs) or peak > band_hi:
             return 1
         return -1 if peak < band_lo else 0
 
@@ -214,7 +266,8 @@ class OrxStep:
             self._caps, self.single, self.jumped = [], False, False
         if self._caps:
             _d, g0, p0, r0, s0 = self._caps[-1]
-            clipped = orx_clipped(p0, r0) or orx_clipped(peak, railed)  # a pinned peak
+            clip = self.clip_dbfs
+            clipped = orx_clipped(p0, r0, clip) or orx_clipped(peak, railed, clip)  # pinned
             if g0 != gain and not clipped and math.isfinite(p0 + peak):
                 slope = (peak - p0) / (gain - g0)
                 if slope > 0:  # noise or a wrong reading cannot teach a falling table
@@ -241,8 +294,12 @@ class OrxStep:
 
     def closest(self, target_dbfs: float) -> tuple[int, float] | None:
         """``(gain, peak)`` of the capture at this drive closest to the target, not clipped."""
-        caps = self._caps
-        ok = [(g, p) for _d, g, p, r, _s in caps if math.isfinite(p) and not orx_clipped(p, r)]
+        clip = self.clip_dbfs
+        ok = [
+            (g, p)
+            for _d, g, p, r, _s in self._caps
+            if math.isfinite(p) and not orx_clipped(p, r, clip)
+        ]
         return min(ok, key=lambda gp: abs(gp[1] - target_dbfs)) if ok else None
 
     def indices(self, db: float) -> int:
@@ -275,7 +332,7 @@ def autolevel_orx(
     set_gain,
     measure,
     *,
-    target_dbfs: float = -2.0,
+    target_dbfs: float = -1.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     gain_min: int = ORX_GAIN_MIN,
@@ -283,6 +340,8 @@ def autolevel_orx(
     db_per_index: float = ORX_DB_PER_INDEX,
     max_iterations: int = 16,
     start_gain: int | None = None,
+    clip_dbfs: float = ORX_CLIP_DBFS,
+    start_margin_idx: int = ORX_START_MARGIN_IDX,
 ) -> LevelResult:
     """Software ORx AGC -- Stage A (coarse) + Stage B (fine trim).
 
@@ -290,12 +349,14 @@ def autolevel_orx(
     ``(peak_dbfs, railed)`` from a short capture (``clip_report``). ``set_gain(idx)``
     applies an ORx gain-table index. The loop stays pure/hardware-free.
 
-    INVARIANT: no clip (:func:`orx_clipped`: no railed sample, peak at most
-    :data:`ORX_CLIP_DBFS`) at every accepted gain. The accepted band is the
-    ASYMMETRIC window ``[target - tol_down, target + tol_up]`` (tighter toward the
-    rail), its top below :data:`ORX_CLIP_DBFS` (else ``ValueError``). A reading with
-    no data (peak not finite: an empty capture) is FATAL. On a FATAL floor
-    condition (clipping or already-in-band at ``gain_min``)
+    INVARIANT: no clip (:func:`orx_clipped`: no railed sample, peak below
+    ``clip_dbfs``, the profile's clip threshold) at every accepted gain. The accepted band
+    is the ASYMMETRIC window ``[target - tol_down, target + tol_up]`` (tighter toward the
+    rail), its top below ``clip_dbfs`` (else ``ValueError``). A reading with no data (peak
+    not finite: an all-zero or empty capture, the ORx was overdriven) is too hot: the gain
+    goes :data:`EMPTY_STEP_IDX` indices down (Stage A: it is at the floor already) and it
+    measures again, up to :data:`EMPTY_RETAKES` times; still no data is FATAL. On a FATAL
+    floor condition (clipping or already-in-band at ``gain_min``)
     it returns ``fatal=True`` with a message in ``reason`` instead of raising -- the
     orchestrator disables TX, disconnects, and raises :class:`AgcError`.
 
@@ -303,13 +364,15 @@ def autolevel_orx(
     best achievable (``at_max_gain=True``, not fatal).
 
     ``start_gain`` (a gain already known to be close, e.g. predicted from an earlier
-    level) skips Stage A: Stage B trims from there, and a clip at ``gain_min`` is FATAL
+    level) skips Stage A: Stage B trims from ``start_margin_idx`` indices below it
+    (:data:`ORX_START_MARGIN_IDX`), so it approaches the window from below and never starts
+    in the clip (a predicted gain can be a few dB hot), and a clip at ``gain_min`` is FATAL
     at once (Stage A's floor check). Stage A's other FATAL check does NOT run: a signal
     already in (or above) the band at ``gain_min`` ("TX too strong for target") is not an
     error from a start gain; a reading in band at ``gain_min`` is accepted, with no
     headroom left below it. ``None`` (the default) runs Stage A as always.
     """
-    check_orx_window(target_dbfs, tol_up_db)
+    check_orx_window(target_dbfs, tol_up_db, clip_dbfs)
     band_lo = target_dbfs - tol_down_db
     band_hi = target_dbfs + tol_up_db
 
@@ -317,7 +380,7 @@ def autolevel_orx(
         return int(min(max(g, gain_min), gain_max))
 
     if start_gain is not None:
-        gain = _clamp(int(start_gain))
+        gain = _clamp(int(start_gain) - max(0, int(start_margin_idx)))
         set_gain(gain)
         return _fine_trim(
             set_gain,
@@ -332,15 +395,20 @@ def autolevel_orx(
             db_per_index,
             max_iterations,
             floor_is_fatal=True,
+            clip_dbfs=clip_dbfs,
         )
 
     # -- Stage A: start at the floor, one computed jump --------------------------
     gain = gain_min
     set_gain(gain)
     peak, railed = measure()
+    empties = 0
+    while not math.isfinite(peak) and empties < EMPTY_RETAKES:  # no data: at the floor, retake
+        empties += 1
+        peak, railed = measure()
     if not math.isfinite(peak):
-        return _no_data(gain, peak, 0, railed)
-    if orx_clipped(peak, railed):
+        return _no_data(gain, empties, railed)
+    if orx_clipped(peak, railed, clip_dbfs):
         return LevelResult(
             False,
             gain,
@@ -376,18 +444,19 @@ def autolevel_orx(
         gain_max,
         db_per_index,
         max_iterations,
+        clip_dbfs=clip_dbfs,
     )
 
 
-def _no_data(gain: int, peak: float, iterations: int, railed: int) -> LevelResult:
-    """FATAL: a reading with no data (peak not finite), nothing to step on."""
+def _no_data(gain: int, iterations: int, railed: int) -> LevelResult:
+    """FATAL: no data (peak not finite) after :data:`EMPTY_RETAKES` retakes, the last at
+    ``gain``: nothing to step on."""
     return LevelResult(
         False,
         gain,
-        peak,
+        float("-inf"),
         iterations,
-        f"ORx returned no data (peak {peak} dBFS) at gain {gain}: the ORx was likely driven "
-        "into clipping (it reads zeros after a clip on UC102) -- lower the ORx target / TX drive.",
+        f"ORx {no_data_reason(gain)}",
         railed=railed,
         fatal=True,
     )
@@ -407,23 +476,34 @@ def _fine_trim(
     max_iterations: int,
     *,
     floor_is_fatal: bool = False,
+    clip_dbfs: float = ORX_CLIP_DBFS,
 ) -> LevelResult:
     """Stage B of :func:`autolevel_orx` from ``gain`` (already set); ``last`` = the reading
-    before it ``(peak_dbfs, railed)``, reported if no iteration runs."""
+    before it ``(peak_dbfs, railed)``, reported if no iteration runs. A reading with no data
+    (peak not finite) lowers the gain :data:`EMPTY_STEP_IDX` indices and measures again, up to
+    :data:`EMPTY_RETAKES` times in a row; then FATAL."""
 
     def _clamp(g: int) -> int:
         return int(min(max(g, gain_min), gain_max))
 
     peak, railed = last
     fine_iters = 0
-    level = OrxStep(db_per_index)  # learns the table's step; 1 index after an overshoot
+    level = OrxStep(db_per_index, clip_dbfs=clip_dbfs)  # learns the step; 1 index on overshoot
+    empties = 0  # readings with no data in a row
     for _ in range(max_iterations):
         fine_iters += 1
         peak, railed = measure()
-        if not math.isfinite(peak):
-            return _no_data(gain, peak, fine_iters, railed)
+        if not math.isfinite(peak):  # no data: overdriven -- lower the gain and measure again
+            if empties >= EMPTY_RETAKES:
+                return _no_data(gain, fine_iters, railed)
+            empties += 1
+            gain = _clamp(gain - EMPTY_STEP_IDX)
+            set_gain(gain)
+            continue
+        empties = 0
         level.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi)
-        if orx_clipped(peak, railed) and floor_is_fatal and gain <= gain_min:  # Stage A's check
+        clipped = orx_clipped(peak, railed, clip_dbfs)
+        if clipped and floor_is_fatal and gain <= gain_min:  # Stage A's check
             return LevelResult(
                 False,
                 gain,
@@ -438,7 +518,7 @@ def _fine_trim(
             gain = _clamp(gain - 1)
             set_gain(gain)
             continue
-        # A peak above ORX_CLIP_DBFS (pinned, no railed code) is above band_hi: "too hot" backs
+        # A peak at or above clip_dbfs (pinned, no railed code) is above band_hi: "too hot" backs
         # off by its distance from the target, a lower bound of how far over the clip it is.
         outside = not band_lo <= peak <= band_hi
         closest = level.closest(target_dbfs) if level.jumped and outside else None
@@ -481,6 +561,8 @@ def _fine_trim(
         # not clipped and in band -> converged
         return LevelResult(True, gain, peak, fine_iters, "converged in band", railed=railed)
 
+    if empties:  # the last reading had no data: no level to report
+        return _no_data(gain, fine_iters, railed)
     return LevelResult(False, gain, peak, fine_iters, "max iterations reached", railed=railed)
 
 
@@ -489,31 +571,45 @@ def verify_no_clip(
     measure_full,
     start_gain: int,
     *,
-    target_dbfs: float = -2.0,
+    target_dbfs: float = -1.0,
     tol_up_db: float = 0.3,
     gain_min: int = ORX_GAIN_MIN,
     db_per_index: float = ORX_DB_PER_INDEX,
+    clip_dbfs: float = ORX_CLIP_DBFS,
 ) -> LevelResult:
     """Stage C -- verify the settled gain on the FULL signal, backing off on clip.
 
     A short coarse capture can miss the waveform's true peak, so re-check at the
-    full waveform duration: while it clips (:func:`orx_clipped`) OR exceeds
-    ``target + tol_up``, drop the gain one index and recapture. Colder than band is fine
-    (no action). If it backs all the way to ``gain_min`` and STILL clips, that is FATAL
-    (``fatal=True``); so is a reading with no data (peak not finite).
+    full waveform duration: while it clips (:func:`orx_clipped` with ``clip_dbfs``) OR
+    exceeds ``target + tol_up``, drop the gain one index and recapture. Colder than band is
+    fine (no action). If it backs all the way to ``gain_min`` and STILL clips, that is FATAL
+    (``fatal=True``). A reading with no data (peak not finite) drops the gain
+    :data:`EMPTY_STEP_IDX` indices and recaptures, up to :data:`EMPTY_RETAKES` times in a row;
+    then FATAL.
 
     ``measure_full()`` returns ``(peak_dbfs, railed)`` from a full-duration capture.
     ``db_per_index`` is accepted for API symmetry (Stage C steps one index at a time).
     """
-    check_orx_window(target_dbfs, tol_up_db)
+    check_orx_window(target_dbfs, tol_up_db, clip_dbfs)
     band_hi = target_dbfs + tol_up_db
     gain = int(start_gain)
     set_gain(gain)
     peak, railed = measure_full()
     steps = 0
-    while math.isfinite(peak) and (orx_clipped(peak, railed) or peak > band_hi):
+    empties = 0  # readings with no data in a row
+    while not math.isfinite(peak) or orx_clipped(peak, railed, clip_dbfs) or peak > band_hi:
+        if not math.isfinite(peak):  # no data: overdriven -- lower the gain and recapture
+            if empties >= EMPTY_RETAKES:
+                return _no_data(gain, steps, railed)
+            empties += 1
+            gain = max(int(gain_min), gain - EMPTY_STEP_IDX)
+            steps += 1
+            set_gain(gain)
+            peak, railed = measure_full()
+            continue
+        empties = 0
         if gain <= gain_min:
-            if orx_clipped(peak, railed):
+            if orx_clipped(peak, railed, clip_dbfs):
                 return LevelResult(
                     False,
                     gain,
@@ -529,8 +625,6 @@ def verify_no_clip(
         steps += 1
         set_gain(gain)
         peak, railed = measure_full()
-    if not math.isfinite(peak):
-        return _no_data(gain, peak, steps, railed)
-    converged = not orx_clipped(peak, railed) and peak <= band_hi
+    converged = not orx_clipped(peak, railed, clip_dbfs) and peak <= band_hi
     reason = "verified: no clip on full signal" if converged else "full signal hot but not railing"
     return LevelResult(converged, gain, peak, steps, reason, railed=railed)

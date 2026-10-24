@@ -163,7 +163,7 @@ flowchart TD
 | `TX_ATTEN_MIN_DB` | `9.0` | The lowest attenuation the search may set |
 | `COARSE_STEP_DB` | `5.0` | First attenuation step down |
 | `FINE_STEP_DB` | `0.2` | Later steps are multiples of this |
-| `ORX_TARGET_DBFS` | `-2.0` | ORx AGC target peak (window top below −1.5 dBFS, the ORx clip) |
+| `ORX_TARGET_DBFS` | `-1.0` | ORx AGC target peak |
 | `ORX_TOL_UP_DB`, `ORX_TOL_DOWN_DB` | `0.3`, `0.6` | ORx AGC band around the target |
 | `BACKOFF_DB` | `0` | Attenuation above the lock for the loop. Above 0 the ORx AGC runs again |
 | `N_ITER` | `4` | Captures, including iteration 0 (no DPD): 3 DPD passes |

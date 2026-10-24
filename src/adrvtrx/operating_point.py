@@ -86,7 +86,7 @@ def find_operating_point(
     coarse_step_db: float = 10.0,
     fine_step_db: float = 0.25,
     comp_tol_db: float = 0.3,
-    target_dbfs: float = -2.0,
+    target_dbfs: float = -1.0,
     tol_up_db: float = 0.3,
     tol_down_db: float = 0.6,
     max_iterations: int = 24,

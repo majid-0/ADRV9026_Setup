@@ -132,19 +132,16 @@ def test_a_probe_that_fails_its_build_check_leaves_the_lock_on_the_full_signals(
 # -- F4: the ORx re-level learns its step --------------------------------------------------------
 
 
-def _hot_orx3(radio, target_peak=(-1.75, -1.68)) -> tuple[int, float]:
+def _hot_orx3(radio, target_peak=(-0.25, -0.18)) -> tuple[int, float]:
     """TX2 + TX3 playing, ORX3 at gain 205 (0.8 dB per index on this path), TX3's attenuation
-    set so the ORX3 peak sits just above the window: where a 0.5 dB/index re-level bounces.
-
-    The bench case (-0.25 .. -0.18 dBFS against a -1.0 dBFS target) moved 1.5 dB down, below
-    the ORx clip (``ORX_CLIP_DBFS``): a target of -2.5 dBFS, window -3.1 .. -2.2 dBFS."""
+    set so the ORX3 peak sits just above the window: where a 0.5 dB/index re-level bounces."""
     bands = _bands()
     for b in bands:
         radio.retune_lo(b.lo, b.freq_hz)
     radio.set_tx_atten(TxChannel.TX2, 16.0)
     multiband.play_bands(radio, bands, tx_bits=12)
     radio.set_tx_atten(TxChannel.TX3, 16.0)
-    gain = 205 + int(np.floor((-1.5 - _peak(radio, 205)) / 0.81))  # 0 .. 0.8 dB below -1.5
+    gain = 205 + int(np.floor(-_peak(radio, 205) / 0.81))  # the peak 0 .. 0.8 dB below 0 dBFS
     for atten in np.arange(14.5, 17.55, 0.05):
         radio.set_tx_atten(TxChannel.TX3, float(atten))
         peak = _peak(radio, gain)
@@ -161,12 +158,12 @@ def _peak(radio, gain: int) -> float:
 
 
 def _relevel(radio, gain: int, rule, captures: int = 8) -> list[tuple[int, float]]:
-    """Capture and re-level until the peak is in the window (-3.1 .. -2.2 dBFS)."""
+    """Capture and re-level until the peak is in the window (-1.6 .. -0.7 dBFS)."""
     seen = []
     for _ in range(captures):
         peak = _peak(radio, gain)
         seen.append((gain, round(peak, 2)))
-        if -3.1 <= peak <= -2.2:
+        if -1.6 <= peak <= -0.7:
             break
         gain += rule(gain, peak)
     return seen
@@ -176,41 +173,41 @@ BOUNCE_PA = {**BENCH_PA, "bands": {"TX3": {"orx_db_per_index": 0.81}}}  # the be
 
 
 def test_a_fixed_half_db_relevel_bounces_on_a_0p8_db_per_index_orx():
-    """The first bench lock's TX3 (1.5 dB down): -1.75 dBFS at one gain, -3.37 two indices down,
-    never in (from about -1.68 dBFS and hotter, two indices of 0.81 dB fall below the window)."""
+    """The first bench lock's TX3: -0.25 dBFS at one gain, -1.87 two indices down, never in
+    (from about -0.18 dBFS and hotter, two indices of 0.81 dB fall below the window)."""
     radio = _radio(BOUNCE_PA)
     gain, _peak0 = _hot_orx3(radio)
 
     def fixed(_g, peak):
-        return relevel_index(peak, 0, target_dbfs=-2.5, band_hi=-2.2, db_per_index=0.5)
+        return relevel_index(peak, 0, target_dbfs=-1.0, band_hi=-0.7, db_per_index=0.5)
 
     seen = _relevel(radio, gain, fixed)
     assert len(seen) == 8 and {g for g, _p in seen} == {gain, gain - 2}  # the bounce
-    assert all(not -3.1 <= p <= -2.2 for _g, p in seen)
+    assert all(not -1.6 <= p <= -0.7 for _g, p in seen)
 
 
 def test_the_learnt_relevel_settles_a_0p8_db_per_index_orx_in_at_most_3_captures():
     radio = _radio(BOUNCE_PA)
     gain, _peak0 = _hot_orx3(radio)
-    step = OrxStep()
+    step = OrxStep(clip_dbfs=0.0)  # the bench's -0.25 dBFS read unclipped then (12-bit, UC98)
 
     def learnt(g, peak):
-        return step.relevel(g, peak, 0, target_dbfs=-2.5, band_lo=-3.1, band_hi=-2.2)
+        return step.relevel(g, peak, 0, target_dbfs=-1.0, band_lo=-1.6, band_hi=-0.7)
 
     seen = _relevel(radio, gain, learnt)
-    assert len(seen) <= 3 and -3.1 <= seen[-1][1] <= -2.2, seen
+    assert len(seen) <= 3 and -1.6 <= seen[-1][1] <= -0.7, seen
     assert step.db_per_index == pytest.approx(0.8, abs=0.05)
 
 
 def test_the_learnt_step_takes_the_closest_capture_when_one_index_jumps_the_window():
-    step = OrxStep()
-    kw = {"target_dbfs": -2.5, "band_lo": -2.8, "band_hi": -2.3}  # a 0.5 dB window, 1.5 dB/index
-    assert step.relevel(200, -1.7, 0, **kw) == -2  # 0.5 dB / index assumed
-    assert step.relevel(198, -4.7, 0, **kw) == 1  # overshot: learnt 1.5, then 1-index steps
+    step = OrxStep(clip_dbfs=0.0)  # -0.2 dBFS is no clip here: the step rule alone
+    kw = {"target_dbfs": -1.0, "band_lo": -1.3, "band_hi": -0.8}  # a 0.5 dB window, 1.5 dB/index
+    assert step.relevel(200, -0.2, 0, **kw) == -2  # 0.5 dB / index assumed
+    assert step.relevel(198, -3.2, 0, **kw) == 1  # overshot: learnt 1.5, then 1-index steps
     assert step.db_per_index == pytest.approx(1.5)
-    step.observe(199, -3.2, 0, band_lo=-2.8, band_hi=-2.3)
-    step.observe(200, -1.7, 0, band_lo=-2.8, band_hi=-2.3)
-    assert step.jumped and step.closest(-2.5) == (199, -3.2)
+    step.observe(199, -1.7, 0, band_lo=-1.3, band_hi=-0.8)
+    step.observe(200, -0.2, 0, band_lo=-1.3, band_hi=-0.8)
+    assert step.jumped and step.closest(-1.0) == (199, -1.7)
 
 
 def test_the_single_band_search_shares_the_learnt_relevel():
@@ -220,16 +217,16 @@ def test_the_single_band_search_shares_the_learnt_relevel():
 
     def measure():
         g = state["g"]
-        peak = -2.0 + 0.8 * (g - 203)  # 0.8 dB per index; -2.0 dBFS (the target) at 203
+        peak = -1.0 + 0.8 * (g - 203)  # 0.8 dB per index; -1.0 dBFS at 203
         peaks[g] = peak
-        return min(peak, 0.0), 0, 3.0 if -2.6 <= peak <= -1.7 else 2.0
+        return min(peak, 0.0), 0, 3.0 if -1.6 <= peak <= -0.7 else 2.0
 
     state = {"g": 204}
     res = search_tx_compression(
         lambda db: None, lambda g: state.__setitem__("g", g), measure,
         target_compression_db=3.0, start_atten_db=20.0, atten_min_db=5.0, orx_gain=204,
     )  # fmt: skip
-    assert res.converged and len(res.history) <= 3  # -1.2 (clipped), then in
+    assert res.converged and len(res.history) <= 3  # -0.2 (hot), then in by the learnt step
 
 
 # -- F5 / F6 on the fake board: one snapshot per step ------------------------------------------
@@ -280,7 +277,8 @@ def test_without_a_two_orx_snapshot_each_band_is_captured_alone():
         radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe=PROBE, snapshot=False
     )
     assert search.converged and not search.snapshot
-    assert search.captures == 2 * search.snapshots
+    assert search.captures == len(search.history)  # one capture per band read
+    assert search.snapshots < search.captures <= 2 * search.snapshots
     assert shares_orx_adc([RxChannel.ORX1, RxChannel.ORX2])
     assert not shares_orx_adc([RxChannel.ORX2, RxChannel.ORX3])
 

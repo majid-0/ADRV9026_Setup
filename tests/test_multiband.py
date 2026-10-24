@@ -15,6 +15,7 @@ from adrvtrx import RxChannel, TxChannel, multiband
 from adrvtrx.compression import search_tx_compression
 from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
+from adrvtrx.gain import ORX_CLIP_DBFS
 from adrvtrx.metrics import PA_CLIP_SLOPE
 from adrvtrx.multiband import (
     JOINT_KEYS,
@@ -79,12 +80,12 @@ class TwoBandPa:
     def measure(self, i: int):
         self.reads += 1
         # the output peak follows the drive minus the compression at the peak
-        # (-2 dBFS, the AGC target, at 20 dB, gain 210)
+        # (-1 dBFS at 20 dB, gain 210)
         a_now = self.a[i]
         self.a[i] = 20.0
         c_start = self.comp(i)
         self.a[i] = a_now
-        peak = -2.0 + (20.0 - a_now) - (self.comp(i) - c_start) + 0.5 * (self.g[i] - 210)
+        peak = -1.0 + (20.0 - a_now) - (self.comp(i) - c_start) + 0.5 * (self.g[i] - 210)
         peak = self.orx_peak.get(i, peak)
         railed = 5 if peak > 0 else 0
         slope = 0.05 if self.a[i] < self.clip_below.get(i, -1.0) else 0.4
@@ -158,16 +159,18 @@ def test_an_unleveled_orx_moves_its_gain_not_the_attenuation():
 
 
 def test_a_reading_outside_the_agc_window_counts_and_its_gain_is_corrected():
-    """F5: no clip and a peak from target - 3 up to the ORx clip: it counts (the band moves)
-    and the next step's ORx gain brings it back toward the target."""
+    """F5: no clip and a peak from target - 3 up to the ORx clip threshold: it counts (the band
+    moves) and the next step's ORx gain brings it back toward the target. Only a clipped reading
+    (a peak at or above ``ORX_CLIP_DBFS``) is re-leveled."""
     pa = TwoBandPa(noise=0.0, cross=(0.0, 0.0))
-    res = pa.search(orx_gains=[206, 210])  # band 1 reads -4 dBFS: outside the window, usable
+    res = pa.search(orx_gains=[206, 210])  # band 1 reads -3 dBFS: outside the window, usable
     first = res.history[0]
-    assert first["band"] == "TX1" and -4.1 < first["peak_dbfs"] < -3.9
+    assert first["band"] == "TX1" and -3.1 < first["peak_dbfs"] < -2.9
     assert first["counts"] and not first["leveled"] and first["move_db"] < 0  # it moved
-    assert not [h for h in res.history if h["action"].startswith("ORx gain")]  # no re-level
+    relevels = [h for h in res.history if h["action"].startswith("ORx gain")]
+    assert all(h["peak_dbfs"] >= ORX_CLIP_DBFS and not h["counts"] for h in relevels)
     second = next(h for h in res.history if h["band"] == "TX1" and h["step"] == 1)
-    assert -2.6 <= second["peak_dbfs"] <= -1.7  # leveled again by the next step's gain
+    assert -1.6 <= second["peak_dbfs"] <= -0.7  # leveled again by the next step's gain
     assert res.converged
 
 
@@ -283,7 +286,7 @@ class LinearPa:
     """Two bands whose compression is linear in the attenuations, noise-free:
     ``c = 4 + S @ (locks - a)`` (``S[i][j]``: dB of band ``i``'s compression per dB less
     attenuation on band ``j``). The ORx peak follows the drive minus the compression exactly,
-    -2 dBFS (the AGC target) at the start, ``db_per_index`` dB per gain index from index 500."""
+    -1 dBFS at the start, ``db_per_index`` dB per gain index from index 500."""
 
     def __init__(self, slopes, locks=(15.0, 16.0), start=20.0, db_per_index=0.5):
         self.S, self.locks = np.asarray(slopes, dtype=float), np.asarray(locks, dtype=float)
@@ -295,7 +298,7 @@ class LinearPa:
 
     def measure(self, i: int):
         c, c0 = self.comp(), self.comp(np.full(2, self.start))
-        peak = -2.0 + (self.start - self.a[i]) - (c[i] - c0[i]) + self.dbpi * (self.g[i] - 500)
+        peak = -1.0 + (self.start - self.a[i]) - (c[i] - c0[i]) + self.dbpi * (self.g[i] - 500)
         railed = 5 if peak > 0 else 0
         return min(peak, 0.0), railed, float(c[i]), {"top_slope": 0.5}
 
@@ -420,15 +423,17 @@ def test_the_orx_gain_follows_the_output_peak_so_no_band_relevels(locks):
     pa = LinearPa([[0.5, 0.0], [0.0, 0.5]], locks=locks)  # the typical own slope, exact
     res = pa.search()
     assert res.converged, res.reason
-    assert [h for h in res.history if h["action"].startswith("ORx gain")] == []
-    assert all(h["counts"] for h in res.history)  # every reading usable: none re-captured
+    relevels = [h for h in res.history if h["action"].startswith("ORx gain")]
+    assert all(h["peak_dbfs"] >= ORX_CLIP_DBFS for h in relevels)  # only a clipped reading
+    # every reading below the clip usable: none re-captured
+    assert all(h["counts"] for h in res.history if h["peak_dbfs"] < ORX_CLIP_DBFS)
 
 
 def test_a_railed_capture_does_not_count_even_with_the_peak_in_band():
     pa = TwoBandPa(railed_first={0: 1})
     res = pa.search()
     tx1 = [h for h in res.history if h["band"] == "TX1"]
-    assert -2.6 <= tx1[0]["peak_dbfs"] <= -1.7 and tx1[0]["railed"] == 4
+    assert -1.6 <= tx1[0]["peak_dbfs"] <= -0.7 and tx1[0]["railed"] == 4
     assert not tx1[0]["counts"] and tx1[0]["action"] == "ORx gain -1"
     assert tx1[0]["move_db"] == 0.0
     assert tx1[1]["step"] == 0 and tx1[1]["counts"] and tx1[1]["action"] == "joint"
@@ -881,12 +886,8 @@ def test_the_search_aligns_each_band_in_full_once_then_with_its_fraction(monkeyp
     radio, bands = _case_radio(), _case_bands()
     search, _refs = lock_bands(radio, bands, tx_bits=12, rx_bits=12, fs=radio.board_model.rate_hz)
     assert search.converged
-    full_reads = 0  # each band aligns in full until its first reading inside the AGC window
-    for name in ("TX1", "TX4"):
-        rows = [h for h in search.history if h["band"] == name]
-        full_reads += next(k for k, h in enumerate(rows, 1) if h["leveled"])
-    assert calls["full"] == full_reads <= 4
-    assert calls["fraction"] == len(search.history) - full_reads
+    assert calls["full"] == 2  # each band's first reading came leveled from the AGC
+    assert calls["fraction"] == len(search.history) - 2
 
 
 @pytest.mark.parametrize("bench, tol_db", [("sim", 0.005), ("rich", 0.03)])
@@ -955,7 +956,7 @@ def test_each_backoff_levels_from_the_gain_predicted_from_the_lock(monkeypatch):
     assert starts == {0: lock, 1: [g + 2 for g in lock], 2: [g + 4 for g in lock]}
     assert sum(floor_starts) == 2  # only the lock's own AGC (one per band) started at the floor
     for caps in res.captures.values():
-        assert all(c.railed == 0 and -2.6 <= c.peak_dbfs <= -1.7 for c in caps)
+        assert all(c.railed == 0 and -1.6 <= c.peak_dbfs <= -0.7 for c in caps)
 
 
 def test_capture_case_agc_starts_from_the_given_gains():
@@ -964,8 +965,8 @@ def test_capture_case_agc_starts_from_the_given_gains():
     real_set = radio.set_rx_gain
     radio.set_rx_gain = lambda ch, g: (set_gains.append((ch, g)), real_set(ch, g))[1]
     caps = capture_case(radio, bands, refs, [16.0, 16.0], rx_bits=12, fs=fs, gains=[219, 221])
-    assert set_gains[0] == (RxChannel.ORX1, 219)
-    assert (RxChannel.ORX4, 221) in set_gains and (RxChannel.ORX1, 185) not in set_gains
+    assert set_gains[0] == (RxChannel.ORX1, 215)  # 4 indices below the prediction: from below
+    assert (RxChannel.ORX4, 217) in set_gains and (RxChannel.ORX1, 185) not in set_gains
     assert all(c.railed == 0 for c in caps)
 
 
