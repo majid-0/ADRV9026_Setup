@@ -50,6 +50,7 @@ addopts = "-ra -m \"not hardware\""
 line-length = 100
 src = ["src", "tests"]
 target-version = "py39"
+extend-exclude = ["tests/reference"]  # vendored oracles (tests/reference/README.md): frozen
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4"]
@@ -57,3 +58,4 @@ select = ["E", "F", "W", "I", "UP", "B", "C4"]
 [tool.black]
 line-length = 100
 target-version = ["py39"]
+extend-exclude = "tests/reference"  # vendored oracles: frozen

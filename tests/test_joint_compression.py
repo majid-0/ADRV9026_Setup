@@ -93,7 +93,7 @@ def _joint_cfr(xs, target_db: float, n_iter: int = 4, bw: float = 0.2):
 
 
 def _reference_composite(xs, fs, offsets, oversample=4.0):
-    """``cfr_joint.composite`` (studies/cfr_interband), verbatim: the oracle."""
+    """``cfr_joint.composite`` (studies/cfr_interband; tests/reference), verbatim: the oracle."""
     n = len(xs[0])
     span = (max(offsets) - min(offsets)) + fs
     L = max(1, int(np.ceil(oversample * span / fs)))
@@ -204,16 +204,13 @@ def test_the_composite_is_cfr_joint_composite(bands):
     assert r["pe_papr_in_db"] == pytest.approx(pe, abs=1e-9) == sweep["pe_papr_in_db"]
 
 
-STUDY = Path(
-    os.environ.get(
-        "CFR_INTERBAND_DIR",
-        Path.home() / "OneDrive - aus.edu/Scalability_Final_Rev/Polynomials/studies/cfr_interband",
-    )
-)
+# ``cfr_joint.py`` is vendored verbatim from the Polynomials ``studies/cfr_interband`` study
+# into ``tests/reference``; ``CFR_INTERBAND_DIR`` points the test at another copy instead.
+STUDY = Path(os.environ.get("CFR_INTERBAND_DIR", Path(__file__).parent / "reference"))
 
 
 @pytest.mark.skipif(
-    not (STUDY / "cfr_joint.py").is_file(), reason="the cfr_interband study is not here"
+    not (STUDY / "cfr_joint.py").is_file(), reason="cfr_joint.py is not at CFR_INTERBAND_DIR"
 )
 def test_the_composite_matches_the_study_itself(bands):
     sys.path.insert(0, str(STUDY))
