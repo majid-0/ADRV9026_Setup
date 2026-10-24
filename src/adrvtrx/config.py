@@ -9,8 +9,10 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
+
+from .gain import ORX_CEILING_DEFAULT_DBFS, ORX_CLIP_MARGIN_DB, orx_clip_dbfs
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -129,6 +131,18 @@ class OrxAgcConfig:
     gain_min: int = 185
     gain_max: int = 255
     db_per_index: float = 0.50
+    clip_margin_db: float = 0.2  # a peak at or above the profile's ceiling minus this is a clip
+    start_margin_idx: int = 4  # a trim from a predicted gain starts this many indices below it
+
+
+#: The ORx saturation ceiling (dBFS) of each profile (file name), measured on the bench
+#: (``multiband_setup/diagnostics/orx_ceiling.py``): the ORx saturates there with no railed code.
+#: The config's ``[orx_ceiling]`` table adds to / overrides these; ``default`` is the ceiling of a
+#: profile not listed (:data:`~adrvtrx.gain.ORX_CEILING_DEFAULT_DBFS`).
+DEFAULT_ORX_CEILINGS_DBFS = {
+    "default": ORX_CEILING_DEFAULT_DBFS,
+    "ADRV9025Init_StdUseCase102_LinkSharing.profile": -0.35,  # bench 2026-10-21, to be confirmed
+}
 
 
 #: Per-method hardware-call limits before the watchdog treats the server as stuck.
@@ -207,6 +221,22 @@ class Config:
     orx_agc: OrxAgcConfig = field(default_factory=OrxAgcConfig)
     profile_name: str = "ADRV9025Init_StdUseCase95C_LinkSharing.profile"
     server: ServerConfig = field(default_factory=ServerConfig)
+    orx_ceiling: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ORX_CEILINGS_DBFS))
+
+    def orx_ceiling_dbfs(self, profile: str | os.PathLike[str] | None = None) -> float:
+        """The ORx saturation ceiling (dBFS) of ``profile`` (default: the config's profile), by
+        file name (case-insensitive) from ``[orx_ceiling]``; a profile not listed gets its
+        ``default`` (:data:`~adrvtrx.gain.ORX_CEILING_DEFAULT_DBFS`)."""
+        # getattr: a Config pickled by an older adrvtrx (a hardware server) has no table
+        table = getattr(self, "orx_ceiling", None) or DEFAULT_ORX_CEILINGS_DBFS
+        return orx_ceiling_for(self.profile_name if profile is None else profile, table)
+
+    def orx_clip_dbfs(self, profile: str | os.PathLike[str] | None = None) -> float:
+        """The ORx clip threshold of ``profile``: its ceiling (:meth:`orx_ceiling_dbfs`) minus
+        ``[orx_agc] clip_margin_db`` (:func:`~adrvtrx.gain.orx_clip_dbfs`)."""
+        agc = getattr(self, "orx_agc", None)
+        margin = getattr(agc, "clip_margin_db", ORX_CLIP_MARGIN_DB)
+        return orx_clip_dbfs(self.orx_ceiling_dbfs(profile), margin)
 
     @property
     def profile_path(self) -> Path:
@@ -251,6 +281,7 @@ class Config:
             orx_agc=_orx_agc_from(data.get("orx_agc", {})),
             profile_name=profile.get("name", cls.profile_name),
             server=_server_from(data.get("server", {})),
+            orx_ceiling=_orx_ceiling_from(data.get("orx_ceiling", {})),
         )
 
 
@@ -262,6 +293,39 @@ def _orx_agc_from(raw: dict[str, Any]) -> OrxAgcConfig:
     """
     known = {f.name for f in fields(OrxAgcConfig)}
     return OrxAgcConfig(**{k: v for k, v in raw.items() if k in known})
+
+
+def orx_ceiling_for(
+    profile: str | os.PathLike[str], table: dict[str, float] | None = None
+) -> float:
+    """The ORx saturation ceiling (dBFS) of ``profile`` in ``table`` (profile file name or
+    ``default`` -> dBFS; default :data:`DEFAULT_ORX_CEILINGS_DBFS`), by file name, case-insensitive;
+    a profile not listed gets ``default`` (:data:`~adrvtrx.gain.ORX_CEILING_DEFAULT_DBFS`)."""
+    table = DEFAULT_ORX_CEILINGS_DBFS if table is None else table
+    by_name = {str(k).lower(): float(v) for k, v in table.items()}
+    # PureWindowsPath: a Windows path names its file by either separator on any OS (a CI runner too)
+    name = PureWindowsPath(os.path.expandvars(str(profile))).name.lower()
+    return by_name.get(name, by_name.get("default", ORX_CEILING_DEFAULT_DBFS))
+
+
+def orx_clip_for_profile(
+    profile: str | os.PathLike[str], table: dict[str, float] | None = None
+) -> float:
+    """The ORx clip threshold (dBFS) of ``profile`` without a :class:`Config` (a PC-side check of a
+    saved capture): its ceiling (:func:`orx_ceiling_for`) minus
+    :data:`~adrvtrx.gain.ORX_CLIP_MARGIN_DB`."""
+    return orx_clip_dbfs(orx_ceiling_for(profile, table))
+
+
+def _orx_ceiling_from(raw: dict[str, Any]) -> dict[str, float]:
+    """:data:`DEFAULT_ORX_CEILINGS_DBFS` updated by the ``[orx_ceiling]`` table (profile file name
+    or ``default`` -> dBFS)."""
+    out = dict(DEFAULT_ORX_CEILINGS_DBFS)
+    for k, v in raw.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not v < 0:
+            raise ValueError(f"[orx_ceiling] {k} must be a ceiling in dBFS below 0, got {v!r}")
+        out[str(k)] = float(v)
+    return out
 
 
 def _server_from(raw: dict[str, Any]) -> ServerConfig:

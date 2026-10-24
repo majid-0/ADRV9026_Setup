@@ -15,6 +15,7 @@ from adrvtrx import RxChannel, TxChannel, multiband
 from adrvtrx.compression import search_tx_compression
 from adrvtrx.config import Config, DllConfig
 from adrvtrx.fake import FakeRadio
+from adrvtrx.gain import ORX_CLIP_DBFS
 from adrvtrx.metrics import PA_CLIP_SLOPE
 from adrvtrx.multiband import (
     JOINT_KEYS,
@@ -158,14 +159,16 @@ def test_an_unleveled_orx_moves_its_gain_not_the_attenuation():
 
 
 def test_a_reading_outside_the_agc_window_counts_and_its_gain_is_corrected():
-    """F5: no railed sample and a peak between target - 3 and 0 dBFS: it counts (the band moves)
-    and the next step's ORx gain brings it back toward the target."""
+    """F5: no clip and a peak from target - 3 up to the ORx clip threshold: it counts (the band
+    moves) and the next step's ORx gain brings it back toward the target. Only a clipped reading
+    (a peak at or above ``ORX_CLIP_DBFS``) is re-leveled."""
     pa = TwoBandPa(noise=0.0, cross=(0.0, 0.0))
     res = pa.search(orx_gains=[206, 210])  # band 1 reads -3 dBFS: outside the window, usable
     first = res.history[0]
     assert first["band"] == "TX1" and -3.1 < first["peak_dbfs"] < -2.9
     assert first["counts"] and not first["leveled"] and first["move_db"] < 0  # it moved
-    assert not [h for h in res.history if h["action"].startswith("ORx gain")]  # no re-level
+    relevels = [h for h in res.history if h["action"].startswith("ORx gain")]
+    assert all(h["peak_dbfs"] >= ORX_CLIP_DBFS and not h["counts"] for h in relevels)
     second = next(h for h in res.history if h["band"] == "TX1" and h["step"] == 1)
     assert -1.6 <= second["peak_dbfs"] <= -0.7  # leveled again by the next step's gain
     assert res.converged
@@ -420,8 +423,10 @@ def test_the_orx_gain_follows_the_output_peak_so_no_band_relevels(locks):
     pa = LinearPa([[0.5, 0.0], [0.0, 0.5]], locks=locks)  # the typical own slope, exact
     res = pa.search()
     assert res.converged, res.reason
-    assert [h for h in res.history if h["action"].startswith("ORx gain")] == []
-    assert all(h["counts"] for h in res.history)  # every reading usable: none re-captured
+    relevels = [h for h in res.history if h["action"].startswith("ORx gain")]
+    assert all(h["peak_dbfs"] >= ORX_CLIP_DBFS for h in relevels)  # only a clipped reading
+    # every reading below the clip usable: none re-captured
+    assert all(h["counts"] for h in res.history if h["peak_dbfs"] < ORX_CLIP_DBFS)
 
 
 def test_a_railed_capture_does_not_count_even_with_the_peak_in_band():
@@ -960,8 +965,8 @@ def test_capture_case_agc_starts_from_the_given_gains():
     real_set = radio.set_rx_gain
     radio.set_rx_gain = lambda ch, g: (set_gains.append((ch, g)), real_set(ch, g))[1]
     caps = capture_case(radio, bands, refs, [16.0, 16.0], rx_bits=12, fs=fs, gains=[219, 221])
-    assert set_gains[0] == (RxChannel.ORX1, 219)
-    assert (RxChannel.ORX4, 221) in set_gains and (RxChannel.ORX1, 185) not in set_gains
+    assert set_gains[0] == (RxChannel.ORX1, 215)  # 4 indices below the prediction: from below
+    assert (RxChannel.ORX4, 217) in set_gains and (RxChannel.ORX1, 185) not in set_gains
     assert all(c.railed == 0 for c in caps)
 
 

@@ -8,7 +8,8 @@ reference, optionally followed by a dict of extra readings that is recorded in
 the history (``papr_compression_db``, ``gain_compression_db``, ``top_slope``).
 
 A compression reading only counts once the ORx peak is inside the AGC band with
-no railed sample (or the signal is below the band at maximum gain). Lowering TX
+no clip (:func:`adrvtrx.gain.orx_clipped`: no railed sample, peak below the profile's
+clip threshold), or the signal is below the band at maximum gain. Lowering TX
 attenuation lowers the ORx gain by the same number of dB in that step so the ADC
 does not clip on the next capture. Attenuation never goes below ``atten_min_db``.
 
@@ -26,14 +27,28 @@ slope, are measured and recorded at every step.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from ._enums import RxChannel, TxChannel
-from .capture import aligned_capture, autolevel_for
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep, relevel_index
+from .capture import aligned_capture, autolevel_for, orx_clip_for
+from .gain import (
+    EMPTY_RETAKES,
+    EMPTY_STEP_IDX,
+    ORX_CLIP_DBFS,
+    ORX_DB_PER_INDEX,
+    ORX_GAIN_MAX,
+    ORX_GAIN_MIN,
+    AgcError,
+    OrxStep,
+    check_orx_window,
+    no_data_reason,
+    orx_clipped,
+    relevel_index,
+)
 from .metrics import gain_compression_db, window_compression_db
 from .radio import MAX_TX_ATTEN_DB
 
@@ -116,6 +131,7 @@ def search_tx_compression(
     max_iterations: int = 24,
     min_top_slope: float | None = None,
     on_step=None,
+    clip_dbfs: float = ORX_CLIP_DBFS,
 ) -> CompressionResult:
     """Walk TX attenuation until compression is within ``±comp_tol_db`` of the target.
 
@@ -141,7 +157,16 @@ def search_tx_compression(
     The multi-band search (:func:`adrvtrx.multiband.search_multiband_compression`) uses the
     same rules with other defaults (coarse 2.5 dB, fine 0.2 dB, tolerance 0.1 dB, clip guard on);
     its docstring says why.
+
+    A clipped ORx capture (:func:`~adrvtrx.gain.orx_clipped`: railed, or a peak at or above
+    ``clip_dbfs``, the profile's clip threshold) never counts and lowers the ORx gain; at the
+    minimum gain it stops the search (``fatal``). The window's top must be below ``clip_dbfs``
+    (``ValueError``). A reading with no data (peak not finite: an empty capture, the ORx was
+    overdriven) is too hot: it is recorded, the ORx gain goes
+    :data:`~adrvtrx.gain.EMPTY_STEP_IDX` indices down and it measures again, up to
+    :data:`~adrvtrx.gain.EMPTY_RETAKES` times in a row; then :class:`~adrvtrx.gain.AgcError`.
     """
+    check_orx_window(target_dbfs, tol_up_db, clip_dbfs)
     if atten_min_db > start_atten_db:
         raise ValueError(
             f"atten_min_db ({atten_min_db}) must be <= start_atten_db ({start_atten_db})"
@@ -158,14 +183,15 @@ def search_tx_compression(
         return int(min(max(int(g), gain_min), gain_max))
 
     def in_band(peak: float, railed: int) -> bool:
-        return railed == 0 and band_lo <= peak <= band_hi
+        return not orx_clipped(peak, railed, clip_dbfs) and band_lo <= peak <= band_hi
 
     def step_for(error_db: float) -> float:
         return fine_step(error_db, fine_step_db, coarse_step_db)
 
     atten = quantize_atten(max(atten_min_db, min(start_atten_db, atten_max_db)))
     gain = clamp_gain(orx_gain)
-    orx = OrxStep(db_per_index)  # the re-level learns the gain table's step
+    orx = OrxStep(db_per_index, clip_dbfs=clip_dbfs)  # the re-level learns the table's step
+    empties = 0  # readings with no data in a row
     floor = quantize_atten(atten_min_db)  # raised by the clip guard
     guard_floor = False
     coarse_pending = True
@@ -218,12 +244,24 @@ def search_tx_compression(
         reading = measure()
         peak, railed, comp = float(reading[0]), int(reading[1]), float(reading[2])
         extra = dict(reading[3]) if len(reading) > 3 and reading[3] is not None else {}
+        if not math.isfinite(peak):  # no data (an empty capture): overdriven, lower the gain
+            rec = {"atten_db": atten, "orx_gain": gain, "peak_dbfs": peak, "railed": railed,
+                   "compression_db": comp, **extra, "orx_ok": False}  # fmt: skip
+            if empties >= EMPTY_RETAKES:
+                record(rec, "ORx returned no data, stop")
+                raise AgcError(f"ORx {no_data_reason(gain)}")
+            empties += 1
+            new = clamp_gain(gain - EMPTY_STEP_IDX)
+            record(rec, f"ORx returned no data (all zeros); ORx gain {new - gain:+d}, retake")
+            gain = new
+            continue
+        empties = 0
         leveled = in_band(peak, railed)
         cold_at_max = (not leveled) and railed == 0 and peak < band_lo and gain >= gain_max
         trusted = leveled or cold_at_max
         orx.observe(gain, peak, railed, band_lo=band_lo, band_hi=band_hi, drive=atten)
         closest = orx.closest(target_dbfs) if orx.jumped and not trusted else None
-        if closest is not None and closest[0] == gain and railed == 0:
+        if closest is not None and closest[0] == gain and not orx_clipped(peak, railed, clip_dbfs):
             trusted = True  # 1-index steps jump the window: the capture closest to the target
         rec = {
             "atten_db": atten,
@@ -337,7 +375,7 @@ def search_tx_compression(
                 atten = new
                 gain = clamp_gain(gain + orx.indices(delta))
                 action = f"TX atten +{delta:.2f} dB"
-        elif (railed > 0 or peak > band_hi) and gain <= gain_min:
+        elif (orx_clipped(peak, railed, clip_dbfs) or peak > band_hi) and gain <= gain_min:
             new = quantize_atten(min(atten_max_db, atten + fine_step_db))
             record(rec, f"ORx railed at gain floor; TX atten +{new - atten:.2f} dB, stop")
             atten = new
@@ -409,12 +447,15 @@ def find_compression_point(
     and :func:`~adrvtrx.metrics.gain_compression_db` (with the AM/AM top slope) on
     the whole aligned period. ``lock_on`` picks the one the search steers on:
     ``"papr"`` or ``"gain"``. ``min_top_slope`` turns on the clip guard (see
-    :func:`search_tx_compression`). ``fs`` is the ORx rate. A fatal AGC result
-    raises :class:`~adrvtrx.gain.AgcError` after leaving the bench safe.
+    :func:`search_tx_compression`). ``fs`` is the ORx rate. A fatal AGC result, or an ORx
+    that returns no data after its retakes, raises :class:`~adrvtrx.gain.AgcError` after
+    leaving the bench safe. The clip threshold is the profile's
+    (:func:`~adrvtrx.capture.orx_clip_for`).
     """
     if lock_on not in LOCK_METRICS:
         raise ValueError(f"lock_on must be one of {LOCK_METRICS}, got {lock_on!r}")
     ref = np.asarray(ref)
+    clip = orx_clip_for(radio)
 
     radio.set_tx_atten(tx, quantize_atten(start_atten_db))
     agc = autolevel_for(
@@ -427,10 +468,15 @@ def find_compression_point(
         target_dbfs=target_dbfs,
         tol_up_db=tol_up_db,
         tol_down_db=tol_down_db,
+        clip_dbfs=clip,
     )
 
     def measure() -> tuple[float, int, float, dict]:
-        cap = aligned_capture(radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample)
+        cap = aligned_capture(
+            radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample, retakes=None
+        )  # an empty capture reads -inf: the search lowers the gain before it retakes
+        if not math.isfinite(cap.clip.peak_dbfs):
+            return cap.clip.peak_dbfs, cap.clip.railed_samples, float("nan"), {}
         papr_comp, _pin, _pout = window_compression_db(cap.x_aligned, cap.y_aligned, fs, window_s)
         gain_comp, slope = gain_compression_db(cap.x_aligned, cap.y_aligned)
         comp = gain_comp if lock_on == "gain" else papr_comp
@@ -441,7 +487,8 @@ def find_compression_point(
         }
         return cap.clip.peak_dbfs, cap.clip.railed_samples, comp, extra
 
-    result = search_tx_compression(
+    search = functools.partial(
+        search_tx_compression,
         lambda db: radio.set_tx_atten(tx, db),
         lambda g: radio.set_rx_gain(orx, g),
         measure,
@@ -458,6 +505,13 @@ def find_compression_point(
         max_iterations=max_iterations,
         min_top_slope=min_top_slope,
         on_step=on_step,
+        clip_dbfs=clip,
     )
+    try:
+        result = search()
+    except AgcError:  # the ORx returned no data after its retakes: leave the bench safe
+        radio.safe_state()
+        radio.disconnect()
+        raise
     result.lock_on = lock_on
     return result

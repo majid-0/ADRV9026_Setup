@@ -8,15 +8,19 @@ backs them off together and saves one case folder.
 ``measure(bands)``, one snapshot reading those bands). One step sets every band's attenuation and
 ORx gain and takes ONE snapshot: a capture that reads every band's ORx (``PerformRx`` returns them
 all), so a step costs one capture, not one per band (``snapshot=False``: one capture per band,
-for a pair the ``two_orx_snapshot`` bench check failed). A reading counts when it has no railed
-sample, a peak between ``target_dbfs - 3`` and 0 dBFS and a finite compression, even outside the
+for a pair the ``two_orx_snapshot`` bench check failed). A reading counts when it has no clip
+(:func:`~adrvtrx.gain.orx_clipped`: no railed sample, peak below ``clip_dbfs``, the profile's
+clip threshold), a peak from ``target_dbfs - 3`` up and a finite compression, even outside the
 ORx AGC window (its gain is still corrected for the next step), or below the window at the
 maximum gain. A reading that does not count moves only its ORx gain and the band is captured
 again (up to ``max_relevel`` times; still not counting, it keeps its attenuation that step). The
-re-level learns each ORx's dB per index (:class:`~adrvtrx.gain.OrxStep`). A railed capture, or
+re-level learns each ORx's dB per index (:class:`~adrvtrx.gain.OrxStep`). A clipped capture, or
 one hotter than the window, at the minimum ORx gain stops the search (``fatal``), that band one
-clip step (0.2 dB) up. When no band moved for two steps in a row and every band not within
-tolerance was at its limit or held at an unchanged ORx gain, the search stops. Every band's
+clip step (0.2 dB) up. A reading with no data (an empty capture: the ORx was overdriven)
+lowers its ORx gain ``EMPTY_STEP_IDX`` indices and the band is captured again, up to
+``EMPTY_RETAKES`` times in a row (not counted in ``max_relevel``); then ``AgcError``. When no
+band moved for two steps in a row and every band not within tolerance was at its limit or held
+at an unchanged ORx gain, the search stops. Every band's
 reading is one ``history`` row.
 
 The compression per band depends on every attenuation, ``c ~ c0 + J da``: ``J`` holds each
@@ -90,11 +94,31 @@ from typing import Any
 import numpy as np
 
 from ._enums import RxChannel, TxChannel, channel_name
-from .capture import aligned_capture, aligned_captures, autolevel_for, shares_orx_adc
+from .capture import (
+    EmptyCaptureError,
+    aligned_capture,
+    aligned_captures,
+    autolevel_for,
+    orx_clip_for,
+    shares_orx_adc,
+)
 from .compression import fine_step, quantize_atten
 from .conditions import save_aligned_iq
 from .config import ClocksConfig, lo_for_tx
-from .gain import ORX_DB_PER_INDEX, ORX_GAIN_MAX, ORX_GAIN_MIN, OrxStep
+from .gain import (
+    EMPTY_RETAKES,
+    EMPTY_STEP_IDX,
+    ORX_CLIP_DBFS,
+    ORX_DB_PER_INDEX,
+    ORX_GAIN_MAX,
+    ORX_GAIN_MIN,
+    ORX_START_MARGIN_IDX,
+    AgcError,
+    OrxStep,
+    check_orx_window,
+    no_data_reason,
+    orx_clipped,
+)
 from .metrics import (
     PA_CLIP_SLOPE,
     SHARE_LEVELS,
@@ -168,7 +192,7 @@ SLOPE_PRIOR = (0.31, 0.06)
 OWN_SLOPE_BOUNDS = (0.1, 1.5)
 #: The clip guard's step up, and the fatal stop's (the single-band fine step).
 CLIP_STEP_DB = 0.2
-#: A reading counts with its peak this far below ``target_dbfs`` (and up to 0 dBFS, not railed).
+#: A reading counts with its peak this far below ``target_dbfs`` (and up, not clipped).
 USABLE_BELOW_DB = 3.0
 #: The worst error "grew" (trust region) when it rose by more than this (reading noise).
 GROW_MARGIN_DB = 0.05
@@ -353,6 +377,7 @@ class _Rules:
     snapshot: bool
     turn_steps: int
     joint_clip: float | None = None  # the joint clip guard (None: off)
+    clip_dbfs: float = ORX_CLIP_DBFS  # the ORx clip threshold (the profile's)
 
     def clamp_gain(self, g: float) -> int:
         return int(min(max(int(round(g)), self.gain_min), self.gain_max))
@@ -411,14 +436,19 @@ def _evaluate(i: int, m, step: int, dt: float, rules: _Rules, state: _State) -> 
     extra = dict(rest[0]) if rest and rest[0] is not None else {}
     peak, railed, comp = float(peak), int(railed), float(comp)
     g = int(state.g[i])
-    in_window = railed == 0 and rules.band_lo <= peak <= rules.band_hi
-    usable = railed == 0 and rules.target_dbfs - USABLE_BELOW_DB <= peak <= 0.0
-    cold_at_max = railed == 0 and peak < rules.band_lo and g >= rules.gain_max
-    fatal = (railed > 0 or peak > rules.band_hi) and g <= rules.gain_min
+    data = math.isfinite(peak)  # no data (an empty capture): never counts, _read_step retakes it
+    clipped = orx_clipped(peak, railed, rules.clip_dbfs)  # railed, or a peak at the ORx clip
+    in_window = not clipped and rules.band_lo <= peak <= rules.band_hi
+    usable = not clipped and rules.target_dbfs - USABLE_BELOW_DB <= peak
+    cold_at_max = data and railed == 0 and peak < rules.band_lo and g >= rules.gain_max
+    fatal = (clipped or peak > rules.band_hi) and g <= rules.gain_min
     orx = state.orx[i]
-    orx.observe(g, peak, railed, band_lo=rules.band_lo, band_hi=rules.band_hi, drive=tuple(state.a))
-    closest = orx.closest(rules.target_dbfs) if orx.jumped else None
-    taken = closest is not None and closest[0] == g and railed == 0  # 1-index steps jump it
+    if data:
+        orx.observe(
+            g, peak, railed, band_lo=rules.band_lo, band_hi=rules.band_hi, drive=tuple(state.a)
+        )
+    closest = orx.closest(rules.target_dbfs) if orx.jumped and data else None
+    taken = closest is not None and closest[0] == g and not clipped  # 1-index steps jump it
     counts = not fatal and math.isfinite(comp) and (usable or cold_at_max or taken)
     row = {
         "step": step,
@@ -459,11 +489,19 @@ def _read_step(step: int, rules: _Rules, state: _State, measure, set_gain):
     Every capture that does not count is a history row with its re-level action; after
     ``max_relevel`` of them the last reading is returned not counting (the band holds). Returns
     ``(readings, fatal band or None)``; a fatal band's row is not recorded yet.
+
+    A reading with no data (peak not finite: an empty capture, the ORx was overdriven) is too
+    hot: its ORx gain goes :data:`~adrvtrx.gain.EMPTY_STEP_IDX` down and the band is captured
+    again (not a re-level: ``max_relevel`` is not spent), up to
+    :data:`~adrvtrx.gain.EMPTY_RETAKES` times in a row; then :class:`~adrvtrx.gain.AgcError`.
+    No reading returned is one with no data.
     """
     n = len(rules.names)
     readings: list[_Reading | None] = [None] * n
     pending = list(range(n))
-    for attempt in range(rules.max_relevel + 1):
+    empties = [0] * n  # readings with no data in a row, per band
+    attempt = 0
+    while pending:
         t0 = time.perf_counter()
         got = list(measure(list(pending)))
         dt = time.perf_counter() - t0
@@ -476,14 +514,30 @@ def _read_step(step: int, rules: _Rules, state: _State, measure, set_gain):
         if fatal:
             return readings, fatal[0]
         again = []
+        releveled = False
         for i in pending:
             r = readings[i]
+            if not math.isfinite(r.peak):  # no data: overdriven -- lower the gain, capture again
+                if empties[i] >= EMPTY_RETAKES:
+                    r.row["action"] = "ORx returned no data, stop"
+                    state.history.append(r.row)
+                    raise AgcError(f"{rules.names[i]}: ORx {no_data_reason(int(state.g[i]))}")
+                empties[i] += 1
+                k = rules.clamp_gain(state.g[i] - EMPTY_STEP_IDX) - int(state.g[i])
+                state.g[i] = int(state.g[i]) + k
+                r.row["action"] = f"ORx returned no data (all zeros); ORx gain {k:+d}, retake"
+                again.append(i)
+                state.history.append(r.row)
+                set_gain(i, int(state.g[i]))
+                continue
+            empties[i] = 0
             if r.counts:
                 continue
+            releveled = True
             orx = state.orx[i]
             closest = orx.closest(rules.target_dbfs) if orx.jumped else None
-            usable_level = r.railed == 0 and (
-                rules.target_dbfs - USABLE_BELOW_DB <= r.peak <= 0.0
+            usable_level = not orx_clipped(r.peak, r.railed, rules.clip_dbfs) and (
+                rules.target_dbfs - USABLE_BELOW_DB <= r.peak
                 or (r.peak < rules.band_lo and state.g[i] >= rules.gain_max)
             )
             if usable_level:  # level fine, compression not finite: measure again
@@ -503,8 +557,7 @@ def _read_step(step: int, rules: _Rules, state: _State, measure, set_gain):
             state.history.append(r.row)
             set_gain(i, int(state.g[i]))
         pending = again
-        if not pending:
-            break
+        attempt += 1 if releveled else 0
     return readings, None
 
 
@@ -917,6 +970,7 @@ def search_multiband_compression(
     gain_min: int = ORX_GAIN_MIN,
     gain_max: int = ORX_GAIN_MAX,
     db_per_index: float = ORX_DB_PER_INDEX,
+    clip_dbfs: float = ORX_CLIP_DBFS,
     atten_max_db: float = MAX_TX_ATTEN_DB,
     max_steps: int = 20,
     max_relevel: int = 6,
@@ -959,12 +1013,17 @@ def search_multiband_compression(
       peak, hence its 0.3 dB).
     * ``min_top_slope=PA_CLIP_SLOPE``: one band's drive can push another band's peaks into
       clipping, so the clip guard is on; single band keeps it opt-in, as it was introduced.
+
+    ``clip_dbfs`` is the ORx clip threshold (the profile's, :func:`~adrvtrx.capture.orx_clip_for`;
+    the AGC window's top must be below it). A band whose ORx returns no data after its retakes
+    raises :class:`~adrvtrx.gain.AgcError` (:func:`_read_step`).
     """
     if removed:
         k = sorted(removed)[0]
         if k in REMOVED_ARGS:
             raise ValueError(f"{k} was removed: {REMOVED_ARGS[k]}")
         raise TypeError(f"search_multiband_compression() got an unexpected keyword argument {k!r}")
+    check_orx_window(target_dbfs, tol_up_db, clip_dbfs)
     _check_method(method)
     prior = _check_prior(slope_prior)
     guard = resolve_joint_clip(lock_on, joint_clip_slope)
@@ -1004,6 +1063,7 @@ def search_multiband_compression(
         snapshot=bool(snapshot),
         turn_steps=int(turn_steps),
         joint_clip=guard,
+        clip_dbfs=float(clip_dbfs),
     )
     floor = np.array([quantize_atten(m) for m in atten_mins_db])
     for i, s in enumerate(start_attens_db):
@@ -1020,7 +1080,7 @@ def search_multiband_compression(
         floor=floor,
         clip_floor=[False] * n,
         jac=jac,
-        orx=[OrxStep(db_per_index) for _ in range(n)],
+        orx=[OrxStep(db_per_index, clip_dbfs=clip_dbfs) for _ in range(n)],
         cap=float(max_move_db),
     )
 
@@ -1414,6 +1474,7 @@ def measure_band(
     oversample: int = 2,
     window_s: float = 1e-4,
     fraction: float | None = None,
+    retakes: int | None = EMPTY_RETAKES,
 ):
     """One capture of ``orx`` (``oversample`` periods).
 
@@ -1427,14 +1488,24 @@ def measure_band(
     :func:`~adrvtrx.align.align_with_fraction` instead of the full
     :func:`~adrvtrx.align.estimate_and_align` (no upsampled refinement): the search's readings
     use it; a case capture aligns in full.
+
+    An empty capture (all zeros) is retaken at the same gain up to ``retakes`` times (still
+    empty: :class:`~adrvtrx.capture.EmptyCaptureError`); ``retakes=None`` returns it as a reading
+    with no data (peak -inf, compression NaN), for a search that lowers the gain first.
     """
     cap = aligned_capture(
-        radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample, fraction=fraction
-    )
+        radio, orx, ref, bits=rx_bits, fs=fs, oversample=oversample, fraction=fraction,
+        retakes=retakes,
+    )  # fmt: skip
     return _reading(cap, fs, window_s)
 
 
 def _reading(cap, fs: float, window_s: float):
+    if not math.isfinite(cap.clip.peak_dbfs):  # no data: nothing to measure
+        nan = float("nan")
+        extra = {"papr_compression_db": nan, "top_slope": nan, "raw": cap.iq,
+                 "y_aligned": cap.y_aligned, "delay_samples": nan}  # fmt: skip
+        return cap.clip.peak_dbfs, cap.clip.railed_samples, nan, extra
     papr, _pin, _pout = window_compression_db(cap.x_aligned, cap.y_aligned, fs, window_s)
     gain_comp, slope = gain_compression_db(cap.x_aligned, cap.y_aligned)
     extra = {
@@ -1457,12 +1528,14 @@ def measure_bands(
     oversample: int = 2,
     window_s: float = 1e-4,
     fractions: Sequence[float | None] | None = None,
+    retakes: int | None = EMPTY_RETAKES,
 ) -> list[tuple]:
     """:func:`measure_band` of several ORx from ONE snapshot (one ``PerformRx``): one reading per
-    ORx, in order (:func:`~adrvtrx.capture.aligned_captures`)."""
+    ORx, in order (:func:`~adrvtrx.capture.aligned_captures`; ``retakes`` as in
+    :func:`measure_band`)."""
     caps = aligned_captures(
         radio, list(orxs), list(refs), bits=rx_bits, fs=fs, oversample=oversample,
-        fractions=fractions,
+        fractions=fractions, retakes=retakes,
     )  # fmt: skip
     return [_reading(cap, fs, window_s) for cap in caps]
 
@@ -1481,16 +1554,21 @@ def _check_los(bands: Sequence[BandSpec], clocks) -> None:
             raise ValueError(f"{b.lo} is shared by bands at {hz} Hz and {int(b.freq_hz)} Hz")
 
 
-def _band_reader(radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fractions, learn):
+def _band_reader(
+    radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fractions, learn,
+    clip_dbfs=ORX_CLIP_DBFS,
+):  # fmt: skip
     """``measure(idx)`` for the search: one snapshot of those bands (or one capture each), with
     each band's ``fractions`` (``learn``: the fraction of a band's first reading in ``learn``'s
-    window, ``(target_dbfs, tol_up_db, tol_down_db)``, is kept)."""
+    window, ``(target_dbfs, tol_up_db, tol_down_db)``, not clipped at ``clip_dbfs``, is kept). An
+    empty capture comes back as a reading with no data: the search lowers its gain and retakes."""
 
     def measure(idx: list[int]):
         if snapshot and len(idx) > 1:
             got = measure_bands(
                 radio, [bands[i].orx for i in idx], [refs[i] for i in idx], rx_bits=rx_bits,
                 fs=fs, oversample=oversample, fractions=[fractions.get(i) for i in idx],
+                retakes=None,
             )  # fmt: skip
         else:
             got = [
@@ -1502,13 +1580,15 @@ def _band_reader(radio, bands, refs, *, rx_bits, fs, oversample, snapshot, fract
                     fs=fs,
                     oversample=oversample,
                     fraction=fractions.get(i),
+                    retakes=None,
                 )
                 for i in idx
             ]
         if learn is not None:
             target, up, down = learn
             for i, (peak, railed, _c, extra) in zip(idx, got):
-                if i not in fractions and railed == 0 and -down <= peak - target <= up:
+                leveled = not orx_clipped(peak, railed, clip_dbfs) and -down <= peak - target <= up
+                if i not in fractions and leveled:
                     fractions[i] = float(extra["delay_samples"]) % 1.0
         return got
 
@@ -1607,6 +1687,8 @@ def lock_bands(
         else:
             probe_info["reason"] = f"{built.reason}: the lock plays the full signals"
     played = refs if probes is None else probes
+    clip = float(search_kw.pop("clip_dbfs", orx_clip_for(radio)))  # the profile's ORx clip
+    check_orx_window(target_dbfs, tol_up_db, clip)
     if snapshot is None:
         snapshot = not shares_orx_adc([b.orx for b in bands])
     radio.disable_tx()
@@ -1634,16 +1716,19 @@ def lock_bands(
             tol_down_db=tol_down_db,
             gain_min=int(search_kw.get("gain_min", ORX_GAIN_MIN)),
             gain_max=int(search_kw.get("gain_max", ORX_GAIN_MAX)),
+            clip_dbfs=clip,
         )
         gains.append(int(level.final_gain_index))
         agc_s.append(round(time.perf_counter() - t0, 3))
     measure = _band_reader(
         radio, bands, played, rx_bits=rx_bits, fs=fs, oversample=oversample, snapshot=snapshot,
         fractions={}, learn=None if probes is not None else (target_dbfs, tol_up_db, tol_down_db),
+        clip_dbfs=clip,
     )  # fmt: skip
     if lock_on == "joint" or guard is not None:  # the joint figure of what plays (probe or full)
         search_kw["joint"] = joint_reader(played, [b.freq_hz for b in bands], fs)
-    search = search_multiband_compression(
+    search = _safe_search(
+        radio,
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
         measure,
@@ -1658,6 +1743,7 @@ def lock_bands(
         tol_down_db=tol_down_db,
         snapshot=snapshot,
         on_step=on_step,
+        clip_dbfs=clip,
         **search_kw,
     )
     signal = "full" if probes is None else "probe"
@@ -1672,6 +1758,17 @@ def lock_bands(
         agc_s=agc_s, swaps_s=swaps, total_s=round(time.perf_counter() - t_start, 3)
     )
     return search, refs
+
+
+def _safe_search(radio, *args, **kw) -> MultibandSearch:
+    """:func:`search_multiband_compression`; an ORx with no data after its retakes
+    (:class:`~adrvtrx.gain.AgcError`) leaves the bench safe first, as the AGC does."""
+    try:
+        return search_multiband_compression(*args, **kw)
+    except AgcError:
+        radio.safe_state()
+        radio.disconnect()
+        raise
 
 
 @dataclass
@@ -1713,6 +1810,7 @@ def capture_case(
     gains: Sequence[int] | None = None,
     gain_min: int = ORX_GAIN_MIN,
     gain_max: int = ORX_GAIN_MAX,
+    start_margin_idx: int = ORX_START_MARGIN_IDX,
 ) -> list[BandCapture]:
     """Every band at ``attens_db`` (TX playing): ORx AGC, one capture per band, then ``check``.
 
@@ -1720,16 +1818,24 @@ def capture_case(
     ``-tol_down_db``) within the gain indices ``gain_min`` .. ``gain_max``.
 
     ``check(captures)`` -> ``{band name: {"ok": bool, ...}}`` sees every band of the state at once
-    (pairing needs both). A failing band is captured again (re-leveled first when it railed), up to
+    (pairing needs both). A failing band is captured again (re-leveled first when it clipped:
+    :func:`~adrvtrx.gain.orx_clipped`, at the profile's clip threshold), up to
     ``retakes`` times;
     its last check result stays in :attr:`BandCapture.check`.
 
     ``agc=False`` captures at ``gains`` (one ORx gain index per band, set here) without leveling.
     The ORx gain cannot be read back (``RxGainGet`` returns 0 on the chip; the gain is tracked in
     software), so ``agc=False`` needs ``gains``: each :class:`BandCapture` records the gain set.
-    With ``agc=True``, ``gains`` (optional) is where each band's AGC starts its fine trim instead
-    of the gain floor (a gain predicted from the lock); a railed retake levels from the floor.
+    With ``agc=True``, ``gains`` (optional) is a gain predicted from the lock: each band's AGC
+    starts its fine trim ``start_margin_idx`` indices below it instead of at the gain floor, so it
+    approaches the window from below (a predicted gain can be a few dB hot); a clipped retake
+    levels from the floor.
+
+    An empty capture (all zeros) in the AGC lowers the gain and is retaken; the band's capture at
+    the gain set (after the AGC, or ``agc=False``) is retaken at that gain; still empty:
+    :class:`~adrvtrx.gain.AgcError` naming the band and its gain, the bench left safe.
     """
+    clip = orx_clip_for(radio)
     if gains is not None and len(gains) != len(bands):
         raise ValueError(f"gains needs one ORx gain index per band, got {list(gains)}")
     if not agc and gains is None:
@@ -1758,14 +1864,23 @@ def capture_case(
                     start_gain=None if gains is None or tries > 1 else int(gains[i]),
                     gain_min=gain_min,
                     gain_max=gain_max,
+                    clip_dbfs=clip,
+                    start_margin_idx=start_margin_idx,
                 )
                 used[b.name] = int(level.final_gain_index)
             else:
                 used[b.name] = int(gains[i])  # type: ignore[index]
                 radio.set_rx_gain(b.orx, used[b.name])
-        peak, railed, _comp, extra = measure_band(
-            radio, b.orx, ref, rx_bits=rx_bits, fs=fs, oversample=oversample
-        )
+        try:  # at the gain set: an empty capture is retaken at that gain
+            peak, railed, _comp, extra = measure_band(
+                radio, b.orx, ref, rx_bits=rx_bits, fs=fs, oversample=oversample
+            )
+        except EmptyCaptureError as exc:
+            radio.safe_state()
+            radio.disconnect()
+            raise EmptyCaptureError(
+                f"{b.name}: {exc} (ORx gain {used[b.name]})", exc.channels
+            ) from None
         metrics = period_metrics(
             ref,
             extra["y_aligned"],
@@ -1804,7 +1919,8 @@ def capture_case(
         if not failing or attempt == retakes:
             break
         for i in failing:
-            out[i] = take(i, out[i].tries + 1, relevel=out[i].railed > 0)
+            clipped = orx_clipped(out[i].peak_dbfs, out[i].railed, clip)
+            out[i] = take(i, out[i].tries + 1, relevel=clipped)
     add_joint_metrics(bands, out, fs)  # type: ignore[arg-type]
     return out  # type: ignore[return-value]
 
@@ -2011,9 +2127,10 @@ def confirm_lock(
         for c in caps
     ]  # fmt: skip
     fractions = {i: float(c.metrics["delay_samples"]) % 1.0 for i, c in enumerate(caps)}
+    clip = float(search_kw.get("clip_dbfs", orx_clip_for(radio)))  # the profile's ORx clip
     reader = _band_reader(
         radio, bands, refs, rx_bits=rx_bits, fs=fs, oversample=oversample,
-        snapshot=search.snapshot, fractions=fractions, learn=None,
+        snapshot=search.snapshot, fractions=fractions, learn=None, clip_dbfs=clip,
     )  # fmt: skip
     pending = {"first": True}
 
@@ -2022,13 +2139,15 @@ def confirm_lock(
             return [first[i] for i in idx]  # the confirmation capture is the first reading
         return reader(idx)
 
-    skip = ("max_steps", "slopes", "method", "probe", "snapshot", "confirm_steps", "joint")
+    skip = ("max_steps", "slopes", "method", "probe", "snapshot", "confirm_steps", "joint",
+            "clip_dbfs")  # fmt: skip
     kw = {k: v for k, v in search_kw.items() if k not in skip}
     if lock_on == "joint" or guard is not None:  # the full signals' joint figure
         kw["joint"] = joint_reader(refs, [b.freq_hz for b in bands], fs)
     if lock_on == "joint":  # the probe lock's level difference, kept
         kw["joint_levels_db"] = list(search.joint["levels_db"])
-    fb = search_multiband_compression(
+    fb = _safe_search(
+        radio,
         lambda i, db: radio.set_tx_atten(bands[i].tx, db),
         lambda i, gi: radio.set_rx_gain(bands[i].orx, gi),
         measure,
@@ -2041,6 +2160,7 @@ def confirm_lock(
         max_steps=int(confirm_steps) + 1,
         snapshot=search.snapshot,
         on_step=on_step,
+        clip_dbfs=clip,
         **kw,
     )
     fb.captures -= 1 if search.snapshot else len(bands)  # its first reading was not captured

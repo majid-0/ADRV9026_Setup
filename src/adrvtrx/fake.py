@@ -62,6 +62,12 @@ and ``tx_image_db`` adds the TX IQ image ``10**(tx_image_db/20) * conj(x)`` befo
 ``bands`` holds per-TX overrides of any other parameter (``{"TX4": {"smoothness": 1.2}}``), as
 a fitted preset needs.
 
+The ORx clip of the bench (UC102, 2026-10-21), off by default: with ``orx_clip_dbfs`` (e.g.
+-0.4) an ORx input carrying a TX clips I and Q at that level below full scale, so an overdriven
+capture pins its peak there with no railed code; with ``orx_clip_zeros`` = k as well, an ORx
+driven past that clip returns k captures of all zeros in a row before one with data (1: the
+overdriven capture is empty, its retake carries the pinned data).
+
 The default ``PaModel()`` is the simple memoryless Rapp (``drive = 6``, ``p = 2``,
 no memory, no frequency dependence, no drift). ``PaModel.rich()`` is a PA with
 memory whose gain-compression lock moves with frequency. Select it with
@@ -211,6 +217,8 @@ class PaModel:
     tx_skew_samples: dict[str, int] = field(default_factory=dict)  # TX name -> delay before the PA
     tx_image_db: float = -300.0  # TX IQ image (conj(x)) relative to x; -300 = none
     bands: dict[str, dict[str, Any]] = field(default_factory=dict)  # TX name -> overrides
+    orx_clip_dbfs: float | None = None  # ORx clip below full scale (bench: about -0.4); None: off
+    orx_clip_zeros: int = 0  # all-zero captures in a row of an ORx driven past orx_clip_dbfs
 
     def __post_init__(self) -> None:
         known = {f.name for f in fields(self)} - {"bands", "shared"}
@@ -418,6 +426,7 @@ class FakeBoard:
         # and each PA (a shared group) is computed once for all the ORx that see it.
         self._snapshot_start: int | None = None
         self._snapshot_pa: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
+        self._clip_zeros: dict[int, int] = {}  # ORx slot -> empty captures in a row (orx_clip)
         self.state: dict[str, Any] = {
             "programmed": False,
             "rx_mask": 0,
@@ -625,6 +634,7 @@ class FakeBoard:
         order = returned_channel_order(self.config.channels.rx_init_mask)
         data = [self._noise(n) for _ in order]
         self._snapshot_start, self._snapshot_pa = None, {}  # a new snapshot
+        driven: set[int] = set()
         for orx in (RxChannel.ORX1, RxChannel.ORX2, RxChannel.ORX3, RxChannel.ORX4):
             if not self.state["rx_mask"] & int(orx):
                 continue
@@ -633,6 +643,9 @@ class FakeBoard:
             if tx is None or slot is None or not self.state["tx_mask"] & int(tx):
                 continue
             data[slot] = data[slot] + self._loopback(tx, orx, n)
+            driven.add(slot)
+        for slot in sorted(driven):
+            data[slot] = self._orx_clip(slot, data[slot])
         rail = _full_scale(self.rx_bits)
         out = NetArrayList()
         for z in data:
@@ -641,6 +654,19 @@ class FakeBoard:
             out.extend([i, q])
         self._event("PerformRx", n=n)
         return out
+
+    def _orx_clip(self, slot: int, z: np.ndarray) -> np.ndarray:
+        """The bench's ORx clip below full scale (``PaModel.orx_clip_dbfs``, off when None): I and
+        Q held at the clip level; driven past it, ``orx_clip_zeros`` captures in a row of zeros."""
+        if self.pa.orx_clip_dbfs is None or z.size == 0:
+            return z
+        level = 10 ** (float(self.pa.orx_clip_dbfs) / 20.0) * (1 << (self.rx_bits - 1))
+        over = float(np.max(np.maximum(np.abs(z.real), np.abs(z.imag)))) > level
+        if over and self._clip_zeros.get(slot, 0) < int(self.pa.orx_clip_zeros):
+            self._clip_zeros[slot] = self._clip_zeros.get(slot, 0) + 1
+            return np.zeros_like(z)
+        self._clip_zeros[slot] = 0
+        return np.clip(z.real, -level, level) + 1j * np.clip(z.imag, -level, level)
 
     def _noise(self, n: int) -> np.ndarray:
         scale = self.pa.noise_codes * _full_scale(self.rx_bits) / _full_scale(12)

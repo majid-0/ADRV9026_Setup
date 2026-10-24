@@ -189,7 +189,7 @@ def test_a_fixed_half_db_relevel_bounces_on_a_0p8_db_per_index_orx():
 def test_the_learnt_relevel_settles_a_0p8_db_per_index_orx_in_at_most_3_captures():
     radio = _radio(BOUNCE_PA)
     gain, _peak0 = _hot_orx3(radio)
-    step = OrxStep()
+    step = OrxStep(clip_dbfs=0.0)  # the bench's -0.25 dBFS read unclipped then (12-bit, UC98)
 
     def learnt(g, peak):
         return step.relevel(g, peak, 0, target_dbfs=-1.0, band_lo=-1.6, band_hi=-0.7)
@@ -200,7 +200,7 @@ def test_the_learnt_relevel_settles_a_0p8_db_per_index_orx_in_at_most_3_captures
 
 
 def test_the_learnt_step_takes_the_closest_capture_when_one_index_jumps_the_window():
-    step = OrxStep()
+    step = OrxStep(clip_dbfs=0.0)  # -0.2 dBFS is no clip here: the step rule alone
     kw = {"target_dbfs": -1.0, "band_lo": -1.3, "band_hi": -0.8}  # a 0.5 dB window, 1.5 dB/index
     assert step.relevel(200, -0.2, 0, **kw) == -2  # 0.5 dB / index assumed
     assert step.relevel(198, -3.2, 0, **kw) == 1  # overshot: learnt 1.5, then 1-index steps
@@ -277,7 +277,8 @@ def test_without_a_two_orx_snapshot_each_band_is_captured_alone():
         radio, bands, tx_bits=12, rx_bits=12, fs=fs, probe=PROBE, snapshot=False
     )
     assert search.converged and not search.snapshot
-    assert search.captures == 2 * search.snapshots
+    assert search.captures == len(search.history)  # one capture per band read
+    assert search.snapshots < search.captures <= 2 * search.snapshots
     assert shares_orx_adc([RxChannel.ORX1, RxChannel.ORX2])
     assert not shares_orx_adc([RxChannel.ORX2, RxChannel.ORX3])
 

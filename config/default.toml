@@ -77,6 +77,8 @@ rx_gain_index = { default = 195 }   # applies to Rx1-4 and ORx1-4
 # Software ORx AGC: levels on the captured-IQ peak with a railed-sample clip veto
 # (ORx has no hardware AGC; RxDecPowerGet is range-compressed and RxGainGet reads 0,
 # so the gain index is tracked in software). See docs/development_debugging.md.
+# The ORx saturates below full scale with no railed code ([orx_ceiling]), so a peak at or above
+# the profile's ceiling minus clip_margin_db counts as a clip too: target + tol_up must stay below.
 target_dbfs    = -1.0   # desired ORx peak setpoint (dBFS)
 tol_up_db      = 0.3    # accept up to target + this toward the rail
 tol_down_db    = 0.6    # accept down to target - this toward the floor
@@ -85,6 +87,14 @@ max_iterations = 16     # Stage B fine-trim iterations before giving up
 gain_min       = 185    # usable ORx gain-table floor (clean & monotonic from here)
 gain_max       = 255    # ORx gain-table ceiling (rails hard at the very top)
 db_per_index   = 0.50   # measured ORx gain slope (dB per gain index)
+clip_margin_db = 0.2    # clip threshold = the profile's [orx_ceiling] minus this (dBFS)
+start_margin_idx = 4    # a trim from a predicted gain starts this many indices below it
+
+[orx_ceiling]
+# Where the ORx saturates (dBFS, no railed code), per profile file name; measured with
+# multiband_setup/diagnostics/orx_ceiling.py. A profile not listed gets `default`.
+default = -0.45
+"ADRV9025Init_StdUseCase102_LinkSharing.profile" = -0.35   # bench 2026-10-21 (placeholder)
 
 [server]
 # Hardware server (adrvtrx-server, docs/hw_server.md): one process owns the board,

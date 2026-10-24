@@ -11,6 +11,7 @@ from __future__ import annotations
 from adrvtrx.gain import (
     ORX_GAIN_MAX,
     ORX_GAIN_MIN,
+    ORX_START_MARGIN_IDX,
     autolevel_orx,
     verify_no_clip,
 )
@@ -212,24 +213,33 @@ def test_verify_fatal_when_rails_down_to_minimum():
 # -- start gain (a gain predicted from an earlier level) ----------------------------------------
 
 
-def test_a_start_gain_in_band_levels_in_one_capture():
+def test_a_start_gain_starts_4_indices_below_and_trims_up_into_the_window():
     orx = FakeOrx()  # 250 reads -0.86 dBFS
     res = autolevel_orx(orx.set_gain, orx.measure, start_gain=250)
+    assert ORX_START_MARGIN_IDX == 4
+    assert res.converged and res.final_gain_index == 250 and res.iterations == 2
+    assert orx.history == [246, 250]  # from below (-2.86 dBFS), never the floor
+
+
+def test_a_start_gain_with_no_margin_levels_in_one_capture():
+    orx = FakeOrx()  # 250 reads -0.86 dBFS
+    res = autolevel_orx(orx.set_gain, orx.measure, start_gain=250, start_margin_idx=0)
     assert res.converged and res.final_gain_index == 250 and res.iterations == 1
-    assert orx.history == [250]  # never the floor
+    assert orx.history == [250]
 
 
 def test_a_start_gain_trims_from_where_it_starts():
     hot = FakeOrx(ref_gain=230, ref_dbfs=-1.0, rail_gain=260)
-    res = autolevel_orx(hot.set_gain, hot.measure, start_gain=236)  # 3 dB hot
-    assert res.converged and res.final_gain_index == 230 and hot.history[0] == 236
+    res = autolevel_orx(hot.set_gain, hot.measure, start_gain=238)  # 4 dB hot
+    assert res.converged and res.final_gain_index == 230 and hot.history[0] == 234
     cold = FakeOrx(ref_gain=230, ref_dbfs=-1.0, rail_gain=260)
     res = autolevel_orx(cold.set_gain, cold.measure, start_gain=222)
-    assert res.converged and res.final_gain_index == 230 and ORX_GAIN_MIN not in cold.history
+    assert res.converged and res.final_gain_index == 230 and cold.history[0] == 218
+    assert ORX_GAIN_MIN not in cold.history
 
 
 def test_a_start_gain_that_clips_at_the_floor_is_fatal_at_once():
     orx = FakeOrx(rail_gain=ORX_GAIN_MIN)  # rails even at the minimum gain
     res = autolevel_orx(orx.set_gain, orx.measure, start_gain=ORX_GAIN_MIN + 1)
     assert res.fatal and "clips at minimum gain" in res.reason
-    assert res.iterations == 2  # one step down to the floor, then the floor check
+    assert res.iterations == 1  # 4 below the start is the floor: the floor check at once
