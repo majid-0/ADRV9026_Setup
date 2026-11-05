@@ -36,6 +36,10 @@ MAX_TX_ATTEN_DB = 41.95  # ADRV902x TxAtten table max (~42 dB)
 #: documented in this repo, so a retune waits for all of them rather than one bit.
 ALL_PLLS_LOCKED = 0xF
 
+#: Init calibrations that drive the TX output through the external loopback (the PA):
+#: run_init_cals refuses them.
+EXTERNAL_INIT_CALS = frozenset({"TX_LO_LEAKAGE_EXTERNAL", "EXTERNAL_PATH_DELAY", "DPD", "VSWR"})
+
 #: When set (the test suite sets it), :class:`Radio` refuses to load the real DLL.
 FORBID_HARDWARE_ENV = "ADRVTRX_FORBID_HARDWARE"
 
@@ -470,6 +474,111 @@ class Radio:
             f"{pll} at {int(freq_hz)} Hz: PLLs not all locked after {settle_poll} polls "
             f"(status 0x{status:X}, expected 0x{ALL_PLLS_LOCKED:X})"
         )
+
+    # -- init calibrations after a retune ------------------------------------------
+
+    def run_init_cals(
+        self,
+        cals: Sequence[str] | None = None,
+        channel_mask: int | None = None,
+        timeout_ms: int = 60_000,
+    ) -> dict:
+        """Run init calibrations again on the current LOs and return their status.
+
+        The DLL calls are ``Cals.InitCalsRun``, ``Cals.InitCalsWait`` and
+        ``Cals.InitCalsDetailedStatusGet``. A calibration error is reported, never raised.
+
+        Program time runs the full ``[init_cals]`` mask at the program-time LOs (``[lo]``,
+        1100 / 900 MHz). A retune (:meth:`retune_lo`) only moves the PLL, so the LO-dependent
+        calibrations go stale. ``cals`` names the ones to redo (``_enums.INIT_CAL_BITS`` names;
+        default ``_enums.RETUNE_INIT_CALS``: TX_LO_LEAKAGE_INTERNAL, TX_QEC_INIT, ORX_QEC_INIT).
+        ``channel_mask`` defaults to ``[init_cals] channel_mask``. Precondition (API doc): the
+        device is initialised and the RF PLLs are locked, i.e. call it after :meth:`retune_lo`.
+
+        PA safety: every TX goes to ``MAX_TX_ATTEN_DB`` and every TX and Rx/ORx channel is
+        disabled (radio off) before the run. Afterwards the Rx/ORx enables are restored. TX stays
+        off at maximum attenuation, so the caller sets its levels again. The calibrations that
+        drive the TX output into the external loopback (the PA) are refused
+        (``EXTERNAL_INIT_CALS``). The internal TX calibrations run inside the transceiver. They
+        are the same ones every :meth:`program` already runs on this bench.
+
+        Returns ``ok`` (no exception, ``errorFlag`` 0 and ``initErrCode`` 0), ``cals``,
+        ``cal_mask``, ``channel_mask``, ``error_flag`` (InitCalsWait's 3-bit flag), ``error`` (an
+        exception's text, or ""), and the detailed status: ``init_err_code`` / ``init_err_cal``
+        (object and error code), ``duration_us`` (the device's own run time) and
+        ``cals_last_run`` (the names of the calibrations last run, per channel).
+        """
+        names = [
+            str(c).strip().upper() for c in (_enums.RETUNE_INIT_CALS if cals is None else cals)
+        ]
+        if not names:
+            raise ValueError("run_init_cals: no calibration named")
+        unknown = [n for n in names if n not in _enums.INIT_CAL_BITS]
+        if unknown:
+            raise ValueError(f"run_init_cals: unknown calibration(s) {unknown}")
+        external = [n for n in names if n in EXTERNAL_INIT_CALS]
+        if external:
+            raise ValueError(
+                f"run_init_cals: {external} drive the TX output into the external loopback "
+                "(the PA): refused"
+            )
+        b = self.bridge
+        mask = 0
+        for name in names:
+            mask |= int(b.enum("adi_adrv9010_InitCalibrations_e", _enums.init_cal_member(name)))
+        chans = int(self.config.init_cals.channel_mask if channel_mask is None else channel_mask)
+        rx_before = self._en_rx
+        self.set_tx_atten(TxChannel.ALL, MAX_TX_ATTEN_DB)  # PA safe before anything runs
+        self.rx_tx_enable(0, 0)  # radio off: no TX playback, no Rx/ORx channel
+        self._tx_live = False
+        out: dict = {
+            "ok": False, "cals": names, "cal_mask": int(mask), "channel_mask": chans,
+            "error_flag": None, "error": "", "init_err_code": None, "init_err_cal": None,
+            "duration_us": None, "cals_last_run": [],
+        }  # fmt: skip
+        dev_cals = self.adrv.Cals
+        try:
+            try:
+                ic = b.Types.adi_adrv9010_InitCals_t()
+                ic.calMask = int(mask)
+                ic.channelMask = chans
+                ic.warmBoot = 0
+                rc = dev_cals.InitCalsRun(ic)
+                if isinstance(rc, int) and rc != 0:
+                    raise RuntimeError(f"InitCalsRun returned {rc}")
+                res = dev_cals.InitCalsWait(int(timeout_ms), 0)
+                rc, flag = (
+                    (int(res[0]), int(res[1]))
+                    if isinstance(res, (tuple, list))
+                    else (0, int(res or 0))
+                )
+                out["error_flag"] = flag
+                if rc != 0:
+                    raise RuntimeError(f"InitCalsWait returned {rc} (error flag {flag})")
+            except Exception as exc:  # noqa: BLE001 - reported, the caller decides
+                out["error"] = f"{type(exc).__name__}: {exc}"
+                try:
+                    dev_cals.InitCalsAbort(0)  # a timeout leaves them running: stop them
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                st = dev_cals.InitCalsDetailedStatusGet(b.Types.adi_adrv9010_InitCalStatus_t())
+                st = st[1] if isinstance(st, (tuple, list)) else st
+                out["init_err_code"] = int(st.initErrCode)
+                out["init_err_cal"] = int(st.initErrCal)
+                out["duration_us"] = int(st.calsDurationUsec)
+                out["cals_last_run"] = [_enums.init_cal_names(int(v)) for v in list(st.calsLastRun)]
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = (out["error"] + "; " if out["error"] else "") + f"status: {exc!r}"
+        finally:
+            try:
+                self.rx_tx_enable(rx_before, 0)  # Rx / ORx back as they were; TX stays off
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = (
+                    out["error"] + "; " if out["error"] else ""
+                ) + f"Rx enables not restored: {exc!r}"
+        out["ok"] = bool(not out["error"] and out["error_flag"] == 0 and not out["init_err_code"])
+        return out
 
     # -- capture / transmit (PerformRx / PerformTx) ----------------------------
 

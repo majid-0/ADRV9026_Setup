@@ -94,6 +94,7 @@ CALLS = [
     ("disable_tx", (), {}),
     ("safe_state", (), {}),
     ("force_safe", (), {}),
+    ("run_init_cals", (), {"timeout_ms": 5000}),
     ("program", (), {}),
 ]
 

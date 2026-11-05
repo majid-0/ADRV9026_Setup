@@ -81,6 +81,15 @@ makes ``Connect`` fail. ``ADRVTRX_FAKE_DELAYS`` is a JSON object of seconds
 per DLL call (for example ``{"PerformRx": 30}``) to simulate slow or stuck calls;
 its key ``PerformTx_s_per_msample`` adds a load time proportional to the buffer
 length (seconds per million samples per channel). Program clears the TX RAM.
+
+Init calibrations (``Cals.InitCalsRun`` / ``InitCalsWait`` / ``InitCalsDetailedStatusGet`` /
+``InitCalsAbort``, behind :meth:`Radio.run_init_cals`): the board keeps, per calibration, the
+LO frequencies it last ran at (``state["cal_lo_hz"]``; Program runs its ``initCals`` mask at
+the program-time LOs). :meth:`FakeBoard.cal_is_current` says whether a calibration ran at the
+LOs the board holds now, so a derived fake (``mbsetup.fake_iq``) can make a stale ORx QEC show
+an image. The fake refuses a run while any TX is enabled (the driver's own invariant). A run
+fails with ``errorFlag`` = the integer in ``<state file>.calfail`` (or ``init_cal_fail``) when
+that is set; ``ADRVTRX_FAKE_DELAYS`` key ``InitCals`` sets its duration.
 """
 
 from __future__ import annotations
@@ -98,7 +107,7 @@ from typing import Any
 
 import numpy as np
 
-from ._enums import RX_SINGLE, TX_SINGLE, RxChannel, TxChannel
+from ._enums import INIT_CAL_BITS, RX_SINGLE, TX_SINGLE, RxChannel, TxChannel, init_cal_names
 from .config import Config, lo_for_tx
 from .radio import Radio
 
@@ -148,6 +157,18 @@ class EnumValue(str):
 
     def __int__(self) -> int:
         return zlib.crc32(self.encode())
+
+
+class BitEnumValue(EnumValue):
+    """A DLL enum member whose ``int()`` is the DLL's own value (init-cal bits: masks decode)."""
+
+    def __new__(cls, text: str, value: int):
+        obj = str.__new__(cls, text)
+        obj._value = int(value)
+        return obj
+
+    def __int__(self) -> int:
+        return self._value
 
 
 class NetArray(list):
@@ -436,7 +457,14 @@ class FakeBoard:
             "lo_hz": {"LO1": 0, "LO2": 0, "AUX": 0},
             "tx_len": 0,
             "pid": None,
+            "cal_lo_hz": {},  # init-cal name -> {"LO1": hz, "LO2": hz} at its last run
+            "cal_runs": 0,  # InitCalsRun calls (Program's own run not counted)
         }
+        self.init_cal_fail: int | None = (
+            None  # errorFlag of the next runs (tests); else <state>.calfail
+        )
+        self._cal_pending: dict[str, Any] | None = None
+        self._cal_status: dict[str, Any] = {"code": 0, "cal": 0, "us": 0, "last": [0, 0, 0, 0]}
         self._load()
 
     # -- persistence -----------------------------------------------------------
@@ -537,9 +565,97 @@ class FakeBoard:
             if isinstance(value, (int, float)):
                 self.state["lo_hz"][name] = int(value)
         self.state.update(programmed=True, rx_mask=0, tx_mask=0)
+        cals = getattr(self.post_init, "initCals", None)
+        mask = getattr(cals, "calMask", None) if cals is not None else None
+        if isinstance(mask, int):  # Program runs the init cals at the program-time LOs
+            los = {k: int(self.state["lo_hz"].get(k, 0)) for k in ("LO1", "LO2")}
+            self.state["cal_lo_hz"] = {name: dict(los) for name in init_cal_names(mask)}
         self.waves.clear()
         self._event("Program")
         self._save()
+
+    # -- init calibrations -----------------------------------------------------------
+
+    def cal_is_current(self, cal: str, lo: str | None = None) -> bool:
+        """Whether init cal ``cal`` last ran at the LOs the board holds now (``lo``: that one)."""
+        ran = self.state["cal_lo_hz"].get(cal)
+        if not ran:
+            return False
+        names = (lo,) if lo else ("LO1", "LO2")
+        return all(int(ran.get(n, -1)) == int(self.state["lo_hz"].get(n, 0)) for n in names)
+
+    def _cal_fail_flag(self) -> int:
+        if self.init_cal_fail is not None:
+            return int(self.init_cal_fail)
+        if self.state_path is not None:
+            f = self.state_path.with_suffix(".calfail")
+            if f.is_file():
+                return int((f.read_text().strip() or "1"), 0)
+        return 0
+
+    def init_cals_run(self, init_cals: Any) -> int:
+        self._require_connected()
+        if not self.state["programmed"]:
+            raise RuntimeError("InitCalsRun: device not initialised (fake board not programmed)")
+        if int(self.state["tx_mask"]):
+            raise RuntimeError(
+                f"InitCalsRun with TX enabled (mask 0x{int(self.state['tx_mask']):X}): fake refuses"
+            )
+        mask, chans = int(init_cals.calMask), int(init_cals.channelMask)
+        self._cal_pending = {"mask": mask, "channels": chans, "fail": self._cal_fail_flag()}
+        self.state["cal_runs"] = int(self.state.get("cal_runs", 0)) + 1
+        self._event("InitCalsRun", mask=mask, channels=chans, cals=init_cal_names(mask),
+                    tx_mask=int(self.state["tx_mask"]), rx_mask=int(self.state["rx_mask"]),
+                    tx_atten_mdb=dict(self.state["tx_atten_mdb"]),
+                    lo_hz=dict(self.state["lo_hz"]))  # fmt: skip
+        self._save()
+        return 0
+
+    def init_cals_wait(self, timeout_ms: int, _flag: int) -> tuple[int, int]:
+        self._require_connected()
+        run = self._cal_pending
+        if run is None:
+            return 0, 0
+        self._delay("InitCals")
+        self._cal_pending = None
+        names = init_cal_names(run["mask"])
+        flag = int(run["fail"])
+        last = [run["mask"] if run["channels"] & (1 << k) else 0 for k in range(4)]
+        us = int(self.delays.get("InitCals", 0.0) * 1e6) or 1000 * len(names)
+        if flag:
+            first = next(iter(names), "")
+            self._cal_status = {
+                "code": 0x0100 | (flag & 0xFF),
+                "cal": INIT_CAL_BITS.get(first, 0),
+                "us": us,
+                "last": last,
+            }
+        else:
+            los = {k: int(self.state["lo_hz"].get(k, 0)) for k in ("LO1", "LO2")}
+            for name in names:
+                self.state["cal_lo_hz"][name] = dict(los)
+            self._cal_status = {"code": 0, "cal": 0, "us": us, "last": last}
+        self._event("InitCalsWait", timeout_ms=int(timeout_ms), error_flag=flag)
+        self._save()
+        return 0, flag
+
+    def init_cals_detailed_status_get(self, status: Any) -> tuple[int, Any]:
+        self._require_connected()
+        s = self._cal_status
+        status.initErrCode, status.initErrCal, status.calsDurationUsec = (
+            int(s["code"]),
+            int(s["cal"]),
+            int(s["us"]),
+        )
+        status.calsLastRun = list(s["last"])
+        status.calsSincePowerUp = list(s["last"])
+        return 0, status
+
+    def init_cals_abort(self, _placeholder: int) -> tuple[int, int]:
+        self._require_connected()
+        self._cal_pending = None
+        self._event("InitCalsAbort")
+        return 0, 0
 
     # -- enables / attenuation / gain ------------------------------------------------
 
@@ -768,7 +884,13 @@ class FakeBridge:
                 PllFrequencySet=b.pll_frequency_set,
                 PllFrequencyGet=b.pll_frequency_get,
                 PllStatusGet=b.pll_status_get,
-            )
+            ),
+            Cals=SimpleNamespace(
+                InitCalsRun=b.init_cals_run,
+                InitCalsWait=b.init_cals_wait,
+                InitCalsDetailedStatusGet=b.init_cals_detailed_status_get,
+                InitCalsAbort=b.init_cals_abort,
+            ),
         )
         self.link = SimpleNamespace(
             platform=SimpleNamespace(board=board_api),
@@ -777,6 +899,10 @@ class FakeBridge:
         )
 
     def enum(self, enum_type_name: str, member: str) -> EnumValue:
+        if enum_type_name == "adi_adrv9010_InitCalibrations_e":  # masks decode: the DLL's own bits
+            bit = INIT_CAL_BITS.get(member.replace("ADI_ADRV9010_", ""))
+            if bit is not None:
+                return BitEnumValue(f"{enum_type_name}.{member}", bit)
         return EnumValue(f"{enum_type_name}.{member}")
 
     def new_array(self, _type_name: str, length: int) -> list:

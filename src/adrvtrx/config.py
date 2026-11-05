@@ -146,7 +146,9 @@ DEFAULT_ORX_CEILINGS_DBFS = {
 
 
 #: Per-method hardware-call limits before the watchdog treats the server as stuck.
-DEFAULT_CALL_TIMEOUTS_S = {"default": 60.0, "program": 600.0}
+#: ``run_init_cals`` waits up to its ``timeout_ms`` (60 s by default) inside one call, plus the
+#: status read.
+DEFAULT_CALL_TIMEOUTS_S = {"default": 60.0, "program": 600.0, "run_init_cals": 300.0}
 
 
 def default_state_dir() -> Path:
