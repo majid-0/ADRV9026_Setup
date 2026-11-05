@@ -1084,7 +1084,8 @@ class HardwareServer:
             c.tx_mask = int(getattr(radio, "_en_tx", c.tx_mask))
             c.rx_mask = int(getattr(radio, "_en_rx", c.rx_mask))
             c.connected = bool(getattr(radio, "_connected", True))
-            if method in ("safe_state", "force_safe"):
+            # run_init_cals leaves every TX at max attenuation too
+            if method in ("safe_state", "force_safe", "run_init_cals"):
                 for ch in TX_SINGLE:
                     c.tx_atten_db[ch.name] = MAX_TX_ATTEN_DB
             elif method == "program":

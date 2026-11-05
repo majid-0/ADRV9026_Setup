@@ -135,6 +135,41 @@ PLL_LO_MODE = {
 }
 
 
+#: ``adi_adrv9010_InitCalibrations_e`` bit values, as the TES DLL defines them (read from
+#: ``adrvtrx_dll.dll`` by reflection, 2026-11-05). They follow the bit numbering of the calMask
+#: table of ``adi_adrv9025_InitCalsRun`` in the ADRV9025 API doc
+#: (``Resources/Adi.Adrv9025.Api/public/doc/adrv9025.chm``). :class:`~adrvtrx.radio.Radio`
+#: builds its masks from the DLL's enum. This table names the bits of a status read back
+#: (``calsLastRun``) and lets the fake board decode a mask.
+INIT_CAL_BITS: dict[str, int] = {
+    "TX_BB_FILTER": 0x1, "ADC_TUNER": 0x2, "RX_TIA": 0x4, "ORX_TIA": 0x8, "LBRX_TIA": 0x10,
+    "RX_DC_OFFSET": 0x20, "ORX_DC_OFFSET": 0x40, "LBRX_DC_OFFSET": 0x80, "FLASH_CAL": 0x100,
+    "INTERNAL_PATH_DELAY": 0x200, "TX_LO_LEAKAGE_INTERNAL": 0x400, "TX_LO_LEAKAGE_EXTERNAL": 0x800,
+    "TX_QEC_INIT": 0x1000, "LOOPBACK_RX_LO_DELAY": 0x2000, "LOOPBACK_RX_RX_QEC_INIT": 0x4000,
+    "RX_LO_DELAY": 0x8000, "RX_QEC_INIT": 0x10000, "ORX_LO_DELAY": 0x20000, "ORX_QEC_INIT": 0x40000,
+    "TX_DAC": 0x80000, "DPD": 0x100000, "EXTERNAL_PATH_DELAY": 0x200000, "VSWR": 0x400000,
+    "HD2": 0x800000,
+    "TX_ATTENUATION_DELAY": 0x1000000, "TX_ATTEN_TABLE": 0x2000000, "RX_GAIN_DELAY": 0x4000000,
+    "RX_GAIN_PHASE": 0x8000000, "CFR_INIT": 0x20000000,
+}  # fmt: skip
+
+#: The init calibrations an LO retune makes stale on the ORx / TX paths the campaigns use: TX LO
+#: leakage (internal loopback), TX QEC and ORx QEC. The default of :meth:`Radio.run_init_cals`.
+#: ``RX_QEC_INIT`` (the main Rx) is not used by the campaigns. ``LOOPBACK_RX_LO_DELAY`` (run at
+#: program time) and ``ORX_LO_DELAY`` are LO-dependent too and can be added by name.
+RETUNE_INIT_CALS = ("TX_LO_LEAKAGE_INTERNAL", "TX_QEC_INIT", "ORX_QEC_INIT")
+
+
+def init_cal_names(mask: int) -> list[str]:
+    """The names of the bits set in an init-cal mask (unknown bits as ``0x...``)."""
+    mask = int(mask)
+    out = [name for name, bit in INIT_CAL_BITS.items() if mask & bit]
+    rest = mask & ~sum(INIT_CAL_BITS.values())
+    if rest:
+        out.append(f"0x{rest:X}")
+    return out
+
+
 def init_cal_member(name: str) -> str:
     """``"TX_QEC_INIT"`` -> ``"ADI_ADRV9010_TX_QEC_INIT"`` (DLL enum member)."""
     return f"ADI_ADRV9010_{name}"
