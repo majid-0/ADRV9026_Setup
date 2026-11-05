@@ -8,7 +8,8 @@ on:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) has no Python 3.9 any more; 24.04 still does
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
